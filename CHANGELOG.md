@@ -2,6 +2,53 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.13.0 - 2026-10-01
+
+### Agent usability
+
+- MCP calls no longer time out or starve the server. `job_wait`, `job_tail`,
+  `job_stop`, and `job_start_and_wait` are asynchronous and run their blocking
+  HTTP call off the event loop; `job_wait` and `job_tail --follow` are bounded
+  to `VANTH_MCP_WAIT_SLICE` (25s) and return a resumable `still_running` result
+  instead of the client cancelling the call with `-32001`.
+- Wakes are the default for non-interactive local starts: the daemon attaches
+  the calling-session wake when a single relay matches the job's `cwd`, and
+  skips it otherwise. Opt out with `VANTH_DEFAULT_WAKE_ME=0`. `job_start`
+  documents `wake_me` first, a no-wake start returns a `wake_recommended`
+  advisory, and `doctor`/metrics report recent jobs started without a wake.
+- `vanth deliveries --clear` prunes old or undeliverable delivery records
+  (dry-run by default, `--yes` to apply), and `doctor` reports
+  `stale_pending_deliveries`.
+- The daemon writes a startup/shutdown record so a healthy daemon is not
+  mistaken for a dead one.
+
+### Reliability
+
+- Wakes pending forever: deliveries that are never claimed now expire to
+  durable dead letters after `VANTH_DELIVERY_TTL_SECONDS` (6h); manual retry
+  re-arms a delivery without reopening the leak.
+- Relay poll: `database is locked` under concurrent jobs is retried with
+  backoff and rollback-under-lock; the liveness write is throttled to a
+  heartbeat and clamped.
+- Event-capture contention is tracked per job, so an unrelated job's retry can
+  no longer emit a spurious `write_contended` for this one.
+- Periodic PASSIVE WAL checkpoint plus TRUNCATE on close; `stop` retries a
+  lingering process tree before raising.
+- Schema 20: add an index on `jobs(created_at)`.
+
+### Production hardening (carried from the unreleased 1.12.3 cycle)
+
+- Correctness and durability fixes across snapshots, backups, artifact
+  GC/catalog fencing, pipe draining and descendant reaping, secret masking
+  (including Windows text translation), long/oversized log lines, log
+  write/disk-full failures, concurrent interactive sends, EOF-marker crash
+  recovery, atomic terminal-state persistence, Windows process cleanup, blob
+  repair, cross-volume materialization, and a non-stealable GC fence.
+- Durable local start idempotency with request-conflict detection, bounded
+  stdout in start-and-wait, structured failure reasons and next actions, a
+  start preview, and health diagnostics for artifact corruption, pipe draining,
+  and event-ingestion contention.
+
 ## 1.12.3 - 2026-09-23
 
 ### Agent usability

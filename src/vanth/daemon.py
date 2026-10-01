@@ -710,7 +710,7 @@ _JOB_START_FIELDS = {
     "command", "cwd", "name", "env", "timeout_seconds", "notify_on",
     "wake_targets", "origin_thread_id", "tags", "notes", "interactive",
     "trigger", "policy", "secret_env", "pool", "priority",
-    "remote_id", "idempotency_key",
+    "remote_id", "idempotency_key", "wake_default",
 }
 
 
@@ -1424,6 +1424,9 @@ def main() -> None:
         threading.Thread(target=_remote_wake_sync_loop, name="remote-wake-sync", daemon=True).start()
     daemon_url = f"http://{host}:{port}"
     write_daemon_metadata(home, daemon_url)
+    # Always leave a startup record: otherwise a healthy daemon that logs no
+    # warnings is indistinguishable from a dead one by its (stale) log file.
+    logger.info("vanthd started url=%s home=%s pid=%s", daemon_url, home, os.getpid())
 
     previous = {}
     signal_names = [signal.SIGINT, signal.SIGTERM]
@@ -1437,6 +1440,7 @@ def main() -> None:
     try:
         httpd.serve_forever()
     finally:
+        logger.info("vanthd stopping")
         if manager is not None:
             manager.begin_shutdown()
         httpd.wait_for_requests(float(os.environ.get("VANTH_SHUTDOWN_TIMEOUT", "10")))

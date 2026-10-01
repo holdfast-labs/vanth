@@ -7,6 +7,8 @@ were unreachable through every surface even though the controller-side
 dispatch of the tools that close those gaps.
 """
 
+import asyncio
+
 import pytest
 
 from vanth import server as server_mod
@@ -33,7 +35,7 @@ def client(monkeypatch):
 
 
 def test_job_tail_remote_reads_the_remote_log(client):
-    server_mod.job_tail("job_1", remote_id="r1", stream="stderr", max_bytes=4096, offset=128)
+    asyncio.run(server_mod.job_tail("job_1", remote_id="r1", stream="stderr", max_bytes=4096, offset=128))
     _method, path, params = client.calls[-1]
     assert path == "/remotes/r1/jobs/job_1/tail"
     assert params["stream"] == "stderr"
@@ -41,18 +43,23 @@ def test_job_tail_remote_reads_the_remote_log(client):
     assert params["offset"] == 128
 
 
-def test_job_tail_remote_refuses_options_it_cannot_honour(client):
+def test_job_tail_remote_refuses_options_it_cannot_honour(client, monkeypatch):
     """`follow`/`grep` cannot work on a remote byte range; silently ignoring them
-    would leave the caller thinking a live log was being followed."""
+    would leave the caller thinking a live log was being followed. Validation
+    must happen before any daemon I/O."""
+    def _boom():
+        raise AssertionError("get_client must not be called before remote option validation")
+
+    monkeypatch.setattr(server_mod, "get_client", _boom)
     with pytest.raises(ValueError, match="follow is not supported"):
-        server_mod.job_tail("job_1", remote_id="r1", follow=True)
+        asyncio.run(server_mod.job_tail("job_1", remote_id="r1", follow=True))
     with pytest.raises(ValueError, match="grep is not supported"):
-        server_mod.job_tail("job_1", remote_id="r1", grep="error")
+        asyncio.run(server_mod.job_tail("job_1", remote_id="r1", grep="error"))
     assert client.calls == []
 
 
 def test_job_tail_without_remote_id_is_unchanged(client):
-    server_mod.job_tail("job_1", follow=True, timeout_seconds=3)
+    asyncio.run(server_mod.job_tail("job_1", follow=True, timeout_seconds=3))
     _method, path, params = client.calls[-1]
     assert path == "/jobs/job_1/tail"
     assert params["follow"] is True

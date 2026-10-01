@@ -191,6 +191,17 @@ When wake targets are supplied (including `wake_me`), the response also carries
 `false` when one does not, `null` when there is no relay-delivered target), so
 the caller can confirm exactly which session will be woken. A non-empty
 `notify_on` with no `wake_targets` adds a `warnings` entry — it notifies nobody.
+With no wake target at all, the response adds a `wake_recommended` advisory
+pointing at `wake_me`.
+
+By default, a local `job_start` from the MCP server asks the daemon to attach
+the calling-session `wake_me` target when the caller supplied no wake, the job is
+not interactive/remote/preview, its `timeout_seconds` is unset or at least
+`VANTH_DEFAULT_WAKE_MIN_SECONDS` (default 60), and its `cwd` matches the caller's
+directory. It is best-effort: the daemon skips it silently when no live plugin
+relay resolves, so it never fails a start. Disable with `VANTH_DEFAULT_WAKE_ME=0`
+in the MCP server's (agent process) environment; only that process reads it (the
+daemon does not).
 
 With `trigger` set, the job is created `queued` (no `worker_pid`) and the
 response carries `"trigger"` plus a message like `"Job queued; will start when
@@ -264,9 +275,12 @@ Returns `job_id` and the current `status`, plus `wait` and `summary`:
 
 The summary includes `stderr_excerpt`, capped at 2048 bytes. If the bounded
 wait expires, the response reports the timeout and the job continues running;
-use the returned `job_id` with `job_wait` or `job_status` to continue. Set the
-MCP client's own tool-call timeout longer than `wait_timeout_seconds` so the
-client does not cancel the call first.
+use the returned `job_id` with `job_wait` or `job_status` to continue. A single
+call never blocks longer than `VANTH_MCP_WAIT_SLICE` (default 25 s): if
+`wait_timeout_seconds` exceeds that, the call returns
+`{"wait": {"result": "still_running"}, "job_id": ...}` before the MCP client's
+own request timeout and you re-call to keep waiting. Do not raise the client's
+timeout.
 
 Use this tool for short local commands whose result is useful immediately. For
 long-running work, use `job_start` with `wake_me` or `wake_targets` so a wake
@@ -611,7 +625,7 @@ Bounded stdout/stderr log tail with byte offsets.
 | `max_bytes` | `int` | `8192` | Max bytes to read |
 | `offset` | `int?` | `None` | Byte offset to start from; `None` = last `max_bytes` bytes |
 | `follow` | `bool` | `false` | Block for new output until the job ends or `timeout_seconds` elapses |
-| `timeout_seconds` | `int?` | `None` | Follow mode cap; `None` = until the job is terminal |
+| `timeout_seconds` | `int` | `5` | Follow mode cap; `None` = until the job is terminal. A follow is capped at `VANTH_MCP_WAIT_SLICE` (default 25 s) |
 | `grep` | `string?` | `None` | Server-side substring filter; only lines containing it are returned |
 
 **Response**
@@ -624,7 +638,10 @@ Bounded stdout/stderr log tail with byte offsets.
 `truncated` is true when the requested window was clipped to the log size or
 the byte cap. Use `next_offset` to page forward. With `follow: true`, repeated
 blocks append as output lands; the call returns when the job is terminal or
-`timeout_seconds` is hit. With `grep`, `content` holds only the matching lines
+`timeout_seconds` is hit. A follow never blocks longer than the MCP-safe slice
+(`VANTH_MCP_WAIT_SLICE`, default 25 s), so it returns partial content rather
+than being cancelled with `-32001`; resume from the returned `next_offset`.
+With `grep`, `content` holds only the matching lines
 (and `size` reflects the full log, not the filtered window).
 
 ---
@@ -642,7 +659,7 @@ immediately — do not poll.
 | `job_id` | `string` | required | Job to wait on |
 | `filters` | `string[]` | required | Event types to wait for (e.g. `["checkpoint","failed","completed"]`) |
 | `since_event_id` | `string?` | `None` | Only events newer than this one |
-| `timeout_seconds` | `int` | `3600` | 0–86400 |
+| `timeout_seconds` | `int` | `3600` | 0–86400; a single call is capped at `VANTH_MCP_WAIT_SLICE` (default 25 s) |
 | `return_progress` | `bool` | `false` | Include the job's latest progress block in the response |
 | `metric_ge` | `object?` | `None` | `{metric: threshold}` — return when the latest stored value reaches the threshold |
 
@@ -669,6 +686,20 @@ value of the `loss` metric series is `>= 0.5`:
 Timeout: `{"result": "timeout", "job_id": ..., "status": ..., "message": "No matching event before timeout"}`.
 Daemon shutdown: `{"result": "shutdown", "job_id": ..., "message": "Vanth is shutting down"}`.
 
+When `timeout_seconds` exceeds `VANTH_MCP_WAIT_SLICE` (default 25 s), the call
+returns `still_running` before the MCP client's own request timeout instead of
+blocking and being cancelled with `-32001`:
+
+```json
+{ "result": "still_running", "job_id": "job_abc123", "status": "running",
+  "waited_seconds": 25, "requested_timeout_seconds": 3600,
+  "message": "No matching event within the MCP wait slice; call job_wait again ..." }
+```
+
+Call `job_wait` again to keep waiting (the daemon wakes the wait immediately,
+so re-calls are cheap), or use `wake_me`/`wake_targets` on the job so completion
+resumes the session without polling.
+
 ---
 
 ## `job_stop`
@@ -693,6 +724,12 @@ Stop a running job by terminating its process tree.
 The job becomes `cancelled` only after the workload tree actually terminated;
 otherwise the stop is retryable (and a `RuntimeError` "Failed to stop workload
 process tree" is returned).
+
+A stop waits at most `VANTH_MCP_WAIT_SLICE` (default 25 s) for the tree to
+terminate. If the grace period is longer, it returns
+`{"result": "still_running", "job_id": ..., "message": "Stop requested; ..."}`
+instead of being cancelled with `-32001`; the daemon keeps stopping, so re-check
+with `job_status` or wait for the `cancelled` event.
 
 The resulting `cancelled` event carries `data: {"actor": "tool", "reason": ...}`;
 `job_status` also exposes `stop_actor` / `stop_reason`. Actors are `tool` (an

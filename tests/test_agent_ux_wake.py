@@ -3,7 +3,7 @@ import json
 import sys
 import threading
 
-from vanth.server import JobManager
+from vanth.server import JobManager, now_iso
 
 import shellcmd
 
@@ -136,3 +136,150 @@ def test_mcp_job_start_wake_me_payload(monkeypatch):
     explicit = [{"type": "local_command", "events": ["checkpoint"], "command": ["echo", "hi"]}]
     server_mod.job_start(command="echo hi", wake_me=True, wake_targets=explicit)
     assert captured["payload"]["wake_targets"] == explicit
+
+
+def test_start_extras_recommends_a_wake_when_none(tmp_path):
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        extras = manager._start_extras(None, None)
+        assert "wake_recommended" in extras
+        with_target = manager._start_extras(
+            [{"type": "opencode_thread", "session_id": "ses_x", "events": ["completed"]}], None
+        )
+        assert "wake_recommended" not in with_target
+    finally:
+        manager.close()
+
+
+def test_recent_jobs_without_wake_counts_polling_only_jobs(tmp_path):
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        stamp = now_iso()
+        for job_id in ("job_a", "job_b"):
+            manager.db.execute(
+                "INSERT INTO jobs(job_id,command,status,created_at,updated_at,stdout_path,stderr_path,events_path) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (job_id, "c", "completed", stamp, stamp, "o", "e", "ev"),
+            )
+        manager.db.execute(
+            "INSERT INTO wake_targets(target_id,job_id,type,events_json,config_json,created_at) "
+            "VALUES ('t1','job_a','opencode_thread','[\"completed\"]','{}',?)",
+            (stamp,),
+        )
+        manager.db.commit()
+        assert manager._recent_jobs_without_wake() == 1
+    finally:
+        manager.close()
+
+
+def test_default_wake_me_sets_wake_default_flag(monkeypatch):
+    import vanth.server as server_mod
+
+    class FakeClient:
+        def __init__(self):
+            self.payload = None
+
+        def post(self, path, payload):
+            self.payload = payload
+            return {"job_id": "job_x", "status": "running"}
+
+        def confirm_local_start(self, result):
+            return result
+
+    client = FakeClient()
+    monkeypatch.setattr(server_mod, "get_client", lambda: client)
+    monkeypatch.delenv("VANTH_DEFAULT_WAKE_ME", raising=False)
+
+    # Default + long local job in the caller's directory: daemon asked for a wake.
+    server_mod.job_start(command="sleep 1", timeout_seconds=3600)
+    assert client.payload["wake_default"] is True
+    assert not client.payload["wake_targets"]
+
+    # Short job: not worth a wake.
+    client.payload = None
+    server_mod.job_start(command="echo hi", timeout_seconds=10)
+    assert client.payload["wake_default"] is False
+
+    # Different working directory: relay resolution could hit an unrelated session.
+    client.payload = None
+    server_mod.job_start(command="sleep 1", timeout_seconds=3600, cwd=__import__("tempfile").mkdtemp())
+    assert client.payload["wake_default"] is False
+
+    # Explicit wake_me builds a concrete target (not the default flag).
+    client.payload = None
+    server_mod.job_start(command="sleep 1", timeout_seconds=3600, wake_me=True)
+    assert client.payload["wake_default"] is False
+    assert len(client.payload["wake_targets"]) == 1
+
+    # Opt out.
+    monkeypatch.setenv("VANTH_DEFAULT_WAKE_ME", "0")
+    client.payload = None
+    server_mod.job_start(command="sleep 1", timeout_seconds=3600)
+    assert client.payload["wake_default"] is False
+
+
+def test_wake_default_is_best_effort_daemon_side(tmp_path):
+    import os
+
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        # No live relay: the default wake is dropped, but the start still succeeds.
+        result = asyncio.run(manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600))
+        assert result["job_id"]
+        assert manager._wake_targets_for_job(result["job_id"]) == []
+
+        # With a live relay for the directory, the default wake attaches.
+        manager.relay_register(
+            client_id="c1",
+            client_type="opencode_thread",
+            destinations=[{"client_type": "opencode_thread", "session_id": "ses_x", "directory": os.getcwd()}],
+        )
+        result2 = asyncio.run(manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600))
+        targets = manager._wake_targets_for_job(result2["job_id"])
+        assert targets and targets[0].get("session_id") == "ses_x"
+
+        # A second session in the same directory is ambiguous: best-effort skips
+        # rather than waking the wrong sibling session.
+        manager.relay_register(
+            client_id="c2",
+            client_type="opencode_thread",
+            destinations=[{"client_type": "opencode_thread", "session_id": "ses_y", "directory": os.getcwd()}],
+        )
+        result3 = asyncio.run(manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600))
+        assert manager._wake_targets_for_job(result3["job_id"]) == []
+    finally:
+        manager.close()
+
+
+def test_wake_default_excluded_from_idempotency_hash(tmp_path):
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        first = asyncio.run(manager.start(cmd("echo hi"), idempotency_key="key-abcdefgh", timeout_seconds=3600))
+        replay = asyncio.run(
+            manager.start(cmd("echo hi"), idempotency_key="key-abcdefgh", timeout_seconds=3600, wake_default=True)
+        )
+        assert replay["job_id"] == first["job_id"]
+        assert replay.get("idempotent_replay") is True
+    finally:
+        manager.close()
+
+
+def test_job_start_and_wait_opts_out_of_default_wake(monkeypatch):
+    import vanth.server as server_mod
+
+    captured = {}
+
+    def fake_job_start(**kwargs):
+        captured.update(kwargs)
+        return {"job_id": "job_x", "status": "running"}
+
+    monkeypatch.setattr(server_mod, "job_start", fake_job_start)
+    monkeypatch.setattr(server_mod, "job_run_summary", lambda *a, **k: {"status": "running"})
+    monkeypatch.setattr(
+        server_mod, "get_client", lambda: type("C", (), {"post": lambda *a, **k: {"result": "timeout", "status": "running"}})()
+    )
+
+    asyncio.run(server_mod.job_start_and_wait("sleep", wait_timeout_seconds=5))
+
+    assert captured["wake_targets"] == []
+

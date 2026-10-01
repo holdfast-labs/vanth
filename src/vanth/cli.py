@@ -1674,10 +1674,15 @@ def cmd_deliveries(argv: list[str], home: Path, *, json_out: bool = False) -> in
     status: str | None = None
     job_id: str | None = None
     limit = 20
+    limit_explicit = False
+    clear = False
+    yes = False
+    stale_only = False
+    older_than: int | None = None
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg in {"--status", "--job", "--limit"}:
+        if arg in {"--status", "--job", "--limit", "--older-than"}:
             i += 1
             if i >= len(argv):
                 print(f"vanth deliveries: {arg} requires a value", file=sys.stderr)
@@ -1687,12 +1692,25 @@ def cmd_deliveries(argv: list[str], home: Path, *, json_out: bool = False) -> in
                 status = value
             elif arg == "--job":
                 job_id = value
+            elif arg == "--older-than":
+                try:
+                    older_than = int(value)
+                except ValueError:
+                    print(f"vanth deliveries: invalid --older-than value {value!r}", file=sys.stderr)
+                    return 2
             else:
                 try:
                     limit = int(value)
+                    limit_explicit = True
                 except ValueError:
                     print(f"vanth deliveries: invalid --limit value {value!r}", file=sys.stderr)
                     return 2
+        elif arg == "--clear":
+            clear = True
+        elif arg == "--yes":
+            yes = True
+        elif arg == "--stale-only":
+            stale_only = True
         else:
             print(f"vanth deliveries: unknown option {arg!r}", file=sys.stderr)
             return 2
@@ -1700,6 +1718,37 @@ def cmd_deliveries(argv: list[str], home: Path, *, json_out: bool = False) -> in
     client = VanthClient(home=home)
     try:
         client.ensure()
+        if clear:
+            # Prune old/undeliverable records so the `failed`/`dead_letters`
+            # counters are actionable. Require a filter; --yes applies.
+            if status is None and job_id is None and older_than is None and not stale_only:
+                print("vanth deliveries: --clear requires --status, --job, --older-than, or --stale-only", file=sys.stderr)
+                return 2
+            # Prune uses the server default page size (not the 20-row listing
+            # default) so a --yes run clears a useful batch; the remainder is
+            # reported so the operator can re-run.
+            clear_limit = limit if limit_explicit else 1000
+            payload = client.post("/deliveries/clear", {
+                "status": status, "job_id": job_id, "older_than_seconds": older_than,
+                "stale_only": stale_only, "limit": clear_limit, "dry_run": not yes,
+            })
+            if not _expect_ok(payload):
+                print(f"vanth deliveries: daemon error: {payload.get('error') or payload}", file=sys.stderr)
+                return 1
+            if json_out:
+                print(json.dumps(payload, indent=2, default=str))
+                return 0
+            drained = payload.get("drained") or 0
+            matched = payload.get("matched") or 0
+            if yes:
+                message = f"vanth deliveries: cleared {drained} of {matched} matching record(s)"
+                if matched > drained:
+                    message += " (re-run with --yes to clear the rest)"
+                print(message)
+            else:
+                print(f"vanth deliveries: would clear up to {min(matched, clear_limit)} of {matched} "
+                      "matching record(s) (re-run with --yes to apply)")
+            return 0
         payload = client.get("/deliveries", {"status": status, "job_id": job_id, "limit": limit})
     except Exception as exc:
         print(f"vanth deliveries: failed to reach daemon: {exc}", file=sys.stderr)
@@ -2071,7 +2120,7 @@ def _usage() -> str:
         "  stop           stop a running job\n"
         "  sleep          start a background sleep job\n"
         "  wake           add a wake target to a job after it started (--now to fire once)\n"
-        "  deliveries     list wake deliveries (--status failed shows why)\n"
+        "  deliveries     list wake deliveries; --clear prunes them\n"
         "  artifacts      list a job's artifacts\n"
         "  backup         write one archive of jobs + artifacts + events\n"
         "  restore        restore a backup archive (requires --yes)\n"
@@ -2199,7 +2248,8 @@ _COMMAND_HELP: dict[str, str] = {
             "  example: vanth send job_abc123 --line hello\n",
     "sleep": "usage: vanth sleep <seconds>\n"
              "  Start a background job that sleeps for a positive number of seconds.\n",
-    "deliveries": "usage: vanth deliveries [--status delivered|failed|pending] [--job-id ID] [--json]\n"
+    "deliveries": "usage: vanth deliveries [--status delivered|failed|pending] [--job ID] [--limit N] [--json]\n"
+                  "       vanth deliveries --clear [--status S] [--job ID] [--older-than SECONDS] [--stale-only] [--yes]\n"
                   "  Wake deliveries, so a nonzero `failed` count is actionable.\n",
     "wake": "usage: vanth wake <job-id> [--now] [--type TYPE] [--events a,b]\n"
             "                  [--cwd DIR] [--config JSON|@FILE|-] [--target JSON|@FILE|-]\n"

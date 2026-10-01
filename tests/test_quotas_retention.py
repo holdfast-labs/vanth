@@ -191,9 +191,15 @@ def test_doctor_reports_quota_and_retention(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_RETENTION_DRY_RUN", "1")
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("import time; time.sleep(3)")))
+        started = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
         try:
+            # Wait for the runner to promote to 'running'; under heavy load the
+            # launch can lag, so poll rather than assert immediately.
+            deadline = time.monotonic() + 15
             report = manager.doctor()
+            while report["running_jobs"] != 1 and time.monotonic() < deadline:
+                time.sleep(0.05)
+                report = manager.doctor()
             assert report["running_jobs"] == 1
             assert report["max_running_jobs"] == 4
             assert report["retention"] == {

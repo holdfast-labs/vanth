@@ -14,7 +14,7 @@ import (
 const DefaultBusyTimeoutMS = 30000
 
 // LatestSchemaVersion is the current schema version (matches migrations.py).
-const LatestSchemaVersion = 19
+const LatestSchemaVersion = 20
 
 // Open opens the database read-write and applies the shared connection policy.
 func Open(path string) (*sql.DB, error) {

@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 19
+LATEST_SCHEMA_VERSION = 20
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -129,6 +129,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_fire_at);
         CREATE INDEX IF NOT EXISTS idx_jobs_schedule ON jobs(schedule_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_pool_status ON jobs(pool, status);
+        CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at);
         CREATE TABLE IF NOT EXISTS decisions (
           decision_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, prompt TEXT NOT NULL,
           options_json TEXT NOT NULL, choice TEXT, status TEXT NOT NULL,
@@ -140,7 +141,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
           idempotency_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
           job_id TEXT NOT NULL, created_at TEXT NOT NULL
         );
-        PRAGMA user_version=19;
+        PRAGMA user_version=20;
         """
     )
 
@@ -368,6 +369,9 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                     "job_id TEXT NOT NULL, created_at TEXT NOT NULL)"
                 )
                 db.execute("PRAGMA user_version=19")
+            if version < 20:
+                db.execute("CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at)")
+                db.execute("PRAGMA user_version=20")
             db.commit()
         except Exception:
             db.rollback()

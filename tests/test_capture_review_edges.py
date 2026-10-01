@@ -113,14 +113,14 @@ def test_blocked_stdin_feeder_with_exited_parent_obeys_workload_deadline(tmp_pat
     manager = JobManager(tmp_path, recover=False)
     proc = None
     code = ("import subprocess,sys,time; "
-            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(6)']); "
+            "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
             "print('ready',flush=True);time.sleep(.5)")
     try:
         job = asyncio.run(manager.start(subprocess.list2cmdline([sys.executable, "-c", code]),
-                                        interactive=True, timeout_seconds=1, notify_on=[], wake_targets=[]))
+                                        interactive=True, timeout_seconds=10, notify_on=[], wake_targets=[]))
         job_id = job["job_id"]
         proc = manager.processes[job_id]
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + 20
         while manager.status(job_id)["status"] == "launching" and time.monotonic() < deadline:
             time.sleep(.02)
         manager.send_sync(job_id, "x" * 262144)

@@ -422,3 +422,30 @@ def test_launch_claim_clears_stale_workload_pid(tmp_path):
         assert row["runner_heartbeat_at"] is None
     finally:
         manager.close()
+
+
+def test_close_checkpoints_and_truncates_wal(tmp_path):
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path / "state", recover=False)
+    for i in range(500):
+        manager.db.execute(
+            "INSERT INTO events(event_id,job_id,seq,type,created_at) VALUES (?,?,?,?,?)",
+            (f"evt_{i}", "job_x", i, "log", now_iso()),
+        )
+    manager.db.commit()
+    wal = tmp_path / "state" / "jobs.sqlite-wal"
+    assert wal.exists() and wal.stat().st_size > 0
+
+    manager.close()
+
+    # A clean close truncates the WAL (file removed or zero-length).
+    assert (not wal.exists()) or wal.stat().st_size == 0
+
+
+def test_checkpoint_wal_runs_without_error(tmp_path):
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        manager._checkpoint_wal()
+    finally:
+        manager.close()

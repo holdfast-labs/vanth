@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import secrets
@@ -62,6 +63,36 @@ DEFAULT_MAX_LOG_BYTES = 10 * 1024 * 1024
 _UNSET = object()
 DEFAULT_MAX_ERROR_BYTES = 4096
 TERMINAL_STATUSES = {"completed", "failed", "timeout", "cancelled", "orphaned"}
+# last_error prefix for wakes the dispatch loop abandoned because no relay ever
+# connected (see ``expire_stale_deliveries``); treated as a dead letter signal.
+EXPIRED_DELIVERY_ERROR = "expired:"
+# Upper bound for the relay-poll liveness-write interval, kept well under the
+# relay stale (90s) and subscription TTL (300s) windows.
+_MAX_RELAY_POLL_HEARTBEAT = 30.0
+
+
+def _env_flag_default_on(name: str) -> bool:
+    """True unless the env var is set to an explicit falsy value."""
+    value = os.environ.get(name, "").strip().lower()
+    if value == "":
+        return True
+    return value not in {"0", "false", "no", "off"}
+
+
+def _same_directory(a: str | None, b: str | None) -> bool:
+    if not a or not b:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except (OSError, ValueError):
+        return False
+
+
+def _default_wake_min_seconds() -> int:
+    try:
+        return max(0, int(os.environ.get("VANTH_DEFAULT_WAKE_MIN_SECONDS", "60")))
+    except ValueError:
+        return 60
 # Who requested a stop, carried on the resulting terminal event (review #9).
 # "tool" = an MCP tool call, "user" = the human CLI/API, "watchdog" =
 # recovery/heartbeat reconciliation, "timeout" = the runner's timeout,
@@ -618,6 +649,11 @@ class JobManager:
         self._log_truncated: set[tuple[str, str]] = set()
         self._capture_failed: set[str] = set()
         self.sqlite_contentions = 0
+        # Retries of the event-capture persist, per job (drives write_contended
+        # for that job); kept separate from sqlite_contentions so unrelated
+        # _retry_locked callers (terminal transitions, deliveries, relay polls)
+        # and other jobs cannot mis-attribute contention.
+        self.event_contentions_by_job: dict[str, int] = {}
         self._contention_reported: set[str] = set()
         self._metric_ingest_keys: set[str] = set()
         self._delivery_threads: set[threading.Thread] = set()
@@ -656,6 +692,8 @@ class JobManager:
         self.dispatcher_thread: threading.Thread | None = None
         self.alert_thread: threading.Thread | None = None
         self._started_monotonic = time.monotonic()
+        self._last_delivery_expiry = 0.0
+        self._last_wal_checkpoint = 0.0
         # Operator alerts: edge-triggered condition state + throttle (review B3).
         self._alert_state: dict[str, bool] = {}
         self._last_alert_check: float | None = None
@@ -881,21 +919,27 @@ class JobManager:
         if self._closed:
             raise RuntimeError("JobManager is closed")
 
-    def _retry_locked(self, fn, *args, attempts: int = 5):
+    def _retry_locked(self, fn, *args, attempts: int = 5, event_job: str | None = None, **kwargs):
         """Run fn, retrying transient SQLite write-lock contention.
 
         The per-process db_lock serializes threads inside one process, but
         runners and the daemon are separate processes sharing one database.
         A short retry loop keeps a transient ``database is locked`` from
         killing a runner thread or abandoning a critical write.
+
+        Rollback on failure belongs to the transaction's own body (under
+        ``db_lock``); doing it here would run unlocked on the shared connection
+        and could discard another thread's in-flight transaction.
         """
         for attempt in range(attempts):
             try:
-                return fn(*args)
+                return fn(*args, **kwargs)
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc).lower() or attempt == attempts - 1:
                     raise
                 self.sqlite_contentions += 1
+                if event_job is not None:
+                    self.event_contentions_by_job[event_job] = self.event_contentions_by_job.get(event_job, 0) + 1
                 time.sleep(0.02 * (attempt + 1))
         raise RuntimeError("unreachable")  # pragma: no cover
 
@@ -911,8 +955,34 @@ class JobManager:
                 self._maybe_auto_cleanup()
                 self._expire_decisions()
                 self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
+                # Sweep at most once a minute: the UPDATE takes the write lock, so
+                # running it on every 0.2s pass would add needless contention.
+                delivery_ttl = self._delivery_ttl_seconds()
+                if delivery_ttl > 0 and time.monotonic() - self._last_delivery_expiry >= min(delivery_ttl, 60):
+                    self._last_delivery_expiry = time.monotonic()
+                    self.expire_stale_deliveries(ttl_seconds=delivery_ttl)
+                # Reclaim WAL space periodically. Auto-checkpoint can be starved by
+                # a long-lived read snapshot, letting the -wal file grow without
+                # bound; PASSIVE never blocks a concurrent reader/writer.
+                if time.monotonic() - self._last_wal_checkpoint >= self._wal_checkpoint_seconds():
+                    self._last_wal_checkpoint = time.monotonic()
+                    self._checkpoint_wal()
             except Exception:
                 self.logger.exception("maintenance iteration failed")
+
+    def _checkpoint_wal(self) -> None:
+        try:
+            with self.db_lock:
+                self.db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        except sqlite3.Error as exc:
+            self.logger.warning("wal checkpoint failed: %s", exc)
+
+    def _wal_checkpoint_seconds(self) -> float:
+        try:
+            value = float(os.environ.get("VANTH_WAL_CHECKPOINT_SECONDS", "300"))
+        except ValueError:
+            return 300.0
+        return value if value > 0 else 300.0
 
     def _watch_policies(self) -> None:
         """Evaluate per-job policy blocks (dead-man's switch + failure reactions).
@@ -2039,17 +2109,39 @@ class JobManager:
                 continue
             self._alert_state[key] = condition["active"]
 
+    def _recent_jobs_without_wake(self, window_seconds: int = 86400) -> int:
+        """Jobs created in the window with no wake target (polling-only).
+
+        A visibility signal, not an error: agents that never attach a wake must
+        use ``job_wait``/``job_status`` and can miss outcomes across turns.
+        """
+        if window_seconds <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=window_seconds)).isoformat().replace("+00:00", "Z")
+        with self.db_lock:
+            return int(
+                self.db.execute(
+                    "SELECT COUNT(*) FROM jobs j WHERE j.created_at >= ? AND NOT EXISTS "
+                    "(SELECT 1 FROM wake_targets w WHERE w.job_id = j.job_id)",
+                    (cutoff,),
+                ).fetchone()[0]
+            )
+
     def _dead_letter_count(self) -> int:
-        """Truly exhausted deliveries (failed with attempts >= target max_attempts).
+        """Truly exhausted deliveries, plus wakes the dispatch loop expired.
 
         A bare ``status='failed'`` also matches transient failures awaiting retry
-        and administrative drains, so it overcounts (review P2).
+        and administrative drains, so it overcounts (review P2). ``attempts >=
+        max_attempts`` covers retry exhaustion; ``last_error`` beginning with
+        ``expired:`` covers a wake no relay ever picked up (attempts stays 0).
         """
         with self.db_lock:
             return int(
                 self.db.execute(
                     "SELECT COUNT(*) FROM deliveries WHERE status='failed' "
-                    "AND attempts >= COALESCE(json_extract(payload_json, '$.target.max_attempts'), 1)"
+                    "AND (attempts >= COALESCE(json_extract(payload_json, '$.target.max_attempts'), 1) "
+                    "OR last_error LIKE ?)",
+                    (f"{EXPIRED_DELIVERY_ERROR}%",),
                 ).fetchone()[0]
             )
 
@@ -2163,6 +2255,14 @@ class JobManager:
                 if remaining:
                     thread.join(timeout=remaining)
             with self.db_lock:
+                try:
+                    # Reclaim the WAL on a clean shutdown, but don't let a
+                    # lingering cross-process reader stall close() for the full
+                    # busy_timeout: shorten it for this final checkpoint.
+                    self.db.execute("PRAGMA busy_timeout=1000")
+                    self.db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                except sqlite3.Error:
+                    pass
                 self.db.close()
             for handler in self.logger.handlers[:]:
                 handler.close()
@@ -2366,8 +2466,8 @@ class JobManager:
                         self.db.rollback()
                         raise
             started = time.monotonic()
-            contentions = self.sqlite_contentions
-            events = self._retry_locked(persist)
+            contentions = self.event_contentions_by_job.get(job_id, 0)
+            events = self._retry_locked(persist, event_job=job_id)
             elapsed = time.monotonic() - started
             for event in events:
                 if event.get("persisted") is not False:
@@ -2375,13 +2475,13 @@ class JobManager:
             with self._condition(job_id):
                 self._condition(job_id).notify_all()
             with self.db_lock:
-                report = (self.sqlite_contentions > contentions or elapsed > 1) and job_id not in self._contention_reported
+                retry_count = self.event_contentions_by_job.get(job_id, 0) - contentions
+                report = (retry_count > 0 or elapsed > 1) and job_id not in self._contention_reported
                 if report:
                     self._contention_reported.add(job_id)
             if report:
                 self._emit_safely(job_id, "write_contended", message="Captured events waited for SQLite persistence",
-                                  data={"retry_count": self.sqlite_contentions - contentions,
-                                        "write_seconds": round(elapsed, 3)}, level="warning")
+                                  data={"retry_count": retry_count, "write_seconds": round(elapsed, 3)}, level="warning")
 
     def _append_event_mirror(self, event: dict[str, Any], job_id: str) -> None:
         try:
@@ -2509,6 +2609,20 @@ class JobManager:
             self.logger.debug("persisted %d metric points job_id=%s event_id=%s", len(rows), event["job_id"], event["event_id"])
 
     def _claim_delivery(self, delivery_id: str, *, claim_client_id: str | None = None) -> dict[str, Any] | None:
+        # Retry the whole BEGIN IMMEDIATE transaction on transient cross-process
+        # contention. The rollback runs while holding db_lock (so it can never
+        # discard another thread's in-flight transaction) and before the retry.
+        def attempt() -> dict[str, Any] | None:
+            with self.db_lock:
+                try:
+                    return self._claim_delivery_locked(delivery_id, claim_client_id=claim_client_id)
+                except sqlite3.Error:
+                    self.db.rollback()
+                    raise
+
+        return self._retry_locked(attempt)
+
+    def _claim_delivery_locked(self, delivery_id: str, *, claim_client_id: str | None = None) -> dict[str, Any] | None:
         with self.db_lock:
             self.db.execute("BEGIN IMMEDIATE")
             now = now_iso()
@@ -2871,6 +2985,31 @@ class JobManager:
             self.db.commit()
         return {"result": "ok", "client_id": client_id}
 
+    def _relay_heartbeat_seconds(self) -> float:
+        try:
+            value = float(os.environ.get("VANTH_RELAY_POLL_HEARTBEAT_SECONDS", "5"))
+        except ValueError:
+            return 5.0
+        # Clamp below the stale/TTL windows so a large value can never make an
+        # actively polling relay look dead or expire its own subscription.
+        if not math.isfinite(value) or value <= 0:
+            return 5.0
+        return min(value, _MAX_RELAY_POLL_HEARTBEAT)
+
+    def _touch_relay_subscription(self, client_id: str) -> None:
+        # Called only when the stored last_poll_at is already stale, so the
+        # UPDATE is unconditional here (the caller gates it).
+        with self.db_lock:
+            try:
+                self.db.execute(
+                    "UPDATE relay_subscriptions SET last_poll_at=? WHERE client_id=?",
+                    (now_iso(), client_id),
+                )
+                self.db.commit()
+            except sqlite3.Error:
+                self.db.rollback()
+                raise
+
     def relay_poll(self, client_id: str, timeout_seconds: float = 30.0) -> list[dict[str, Any]]:
         """Long-poll for due codex_desktop deliveries addressed to this client.
 
@@ -2886,7 +3025,8 @@ class JobManager:
         """
         self._ensure_open()
         client_row = self._row(
-            "SELECT client_id, client_type, destinations_json FROM relay_subscriptions WHERE client_id=?", (client_id,)
+            "SELECT client_id, client_type, destinations_json, last_poll_at FROM relay_subscriptions WHERE client_id=?",
+            (client_id,),
         )
         if not client_row:
             raise ValueError(f"Unknown relay client_id: {client_id}")
@@ -2910,13 +3050,13 @@ class JobManager:
                 value = item.get(key)
                 if isinstance(value, str) and value:
                     identities.add(value)
-        # Update last_poll_at for liveness tracking.
-        with self.db_lock:
-            self.db.execute(
-                "UPDATE relay_subscriptions SET last_poll_at=? WHERE client_id=?",
-                (now_iso(), client_id),
-            )
-            self.db.commit()
+        # Update last_poll_at for liveness tracking, but only once per heartbeat
+        # interval: a no-match UPDATE still takes the write lock, so skipping it
+        # entirely when the stored value is fresh is what actually reduces
+        # write-lock pressure. The write is retried on transient contention.
+        heartbeat_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=self._relay_heartbeat_seconds())).isoformat().replace("+00:00", "Z")
+        if not client_row["last_poll_at"] or client_row["last_poll_at"] < heartbeat_cutoff:
+            self._retry_locked(self._touch_relay_subscription, client_id)
         deadline = time.monotonic() + max(1.0, min(timeout_seconds, 60.0))
         poll_interval = float(os.environ.get("VANTH_RELAY_POLL_INTERVAL", "0.5"))
         while True:
@@ -3069,6 +3209,40 @@ class JobManager:
             self.db.commit()
         return changed
 
+    def _delivery_ttl_seconds(self) -> int:
+        try:
+            return int(os.environ.get("VANTH_DELIVERY_TTL_SECONDS", "21600"))
+        except ValueError:
+            return 21600
+
+    def expire_stale_deliveries(self, ttl_seconds: int = 21600) -> int:
+        """Fail deliveries that were never dispatched within ``ttl_seconds``.
+
+        A relay-addressed wake (``opencode_thread``/``codex_*``) is only handed
+        to a client when one polls with a matching destination. If no relay ever
+        completes it the row would otherwise stay ``pending`` forever with no
+        error, no retry, and no alarm. ``attempts = 0`` identifies rows that were
+        never claimed by a relay (the daemon-side dispatch returns without
+        claiming relay targets); ``relay_release`` can also return a row to 0, so
+        the same 6h age limit applies uniformly. Called from the dispatch loop so
+        those wakes resolve to ``failed`` and surface in dead-letter/doctor counts
+        instead of leaking. Returns the number of rows expired.
+        """
+        if ttl_seconds <= 0:
+            return 0
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=ttl_seconds)).isoformat().replace("+00:00", "Z")
+        with self.db_lock:
+            changed = self.db.execute(
+                "UPDATE deliveries SET status='failed', last_error=?, next_attempt_at=NULL, "
+                "claim_token=NULL, claimed_at=NULL, lease_expires_at=NULL, claim_client_id=NULL "
+                "WHERE status IN ('pending','retrying') AND attempts=0 AND created_at < ?",
+                (f"{EXPIRED_DELIVERY_ERROR} no relay ever completed this wake within {ttl_seconds}s", cutoff),
+            ).rowcount
+            self.db.commit()
+        if changed:
+            self.logger.info("expired %d never-dispatched delivery(ies) older than %ds", changed, ttl_seconds)
+        return changed
+
     async def start(
         self,
         command: str,
@@ -3089,9 +3263,12 @@ class JobManager:
         priority: int = 0,
         schedule_id: str | None = None,
         idempotency_key: str | None = None,
+        wake_default: bool = False,
         dry_run: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
+        if not isinstance(wake_default, bool):
+            raise ValueError("wake_default must be a boolean")
         request_hash = None
         if cwd is not None:
             if not isinstance(cwd, str) or not cwd.strip():
@@ -3154,6 +3331,20 @@ class JobManager:
             raise ValueError("interactive must be a boolean")
         if origin_thread_id is not None and not isinstance(origin_thread_id, str):
             raise ValueError("origin_thread_id must be a string")
+        # Best-effort default wake: attach an opencode_thread wake for the
+        # caller's project only when a live plugin relay resolves; otherwise
+        # skip silently (never fail the start). Explicit wake targets below are
+        # still validated strictly.
+        if wake_default and wake_targets is None:
+            candidate = [{
+                "type": "opencode_thread",
+                "events": ["completed", "failed", "timeout", "cancelled", "orphaned"],
+                "cwd": cwd or os.getcwd(),
+            }]
+            session_id = self._sole_relay_session(cwd or os.getcwd())
+            if session_id:
+                candidate[0]["session_id"] = session_id
+                wake_targets = candidate
         # Shape-check the container/elements BEFORE identity resolution, which
         # calls dict(target) and would raise a bare TypeError on a null/non-object
         # element (misclassified as a 500 instead of a field-level 400).
@@ -4343,6 +4534,14 @@ class JobManager:
     def _start_extras(self, wake_targets: list[dict[str, Any]] | None, notify_on: list[str] | None) -> dict[str, Any]:
         """Wake identity echo + advisory warnings for a start response."""
         extras = self._wake_start_info(wake_targets or [])
+        if not wake_targets:
+            # Purely advisory; does not change the start. Agents overwhelmingly
+            # default to polling, so nudge toward a wake at the point of launch.
+            # Names job_start because a rerun does not itself accept wake args.
+            extras["wake_recommended"] = (
+                "No wake target attached: completion will not resume a session. Pass wake_me=True "
+                "(or a wake_targets entry) on job_start when you need to be woken instead of polling."
+            )
         if notify_on and not wake_targets:
             # notify_on is only a default for a wake target's events; on its own
             # it notifies nobody. Stored (not an error) for compatibility, but
@@ -4414,6 +4613,40 @@ class JobManager:
                 if best is None or stamp > best[0]:
                     best = (stamp, session_id)
         return best[1] if best else None
+
+    def _sole_relay_session(self, directory: str | None) -> str | None:
+        """The single OpenCode session registered for ``directory``, else None.
+
+        Used only for the *best-effort default* wake: with several agents on one
+        cwd (a directory-less registration matches any cwd too) the newest
+        session is not necessarily the caller's, so an ambiguous match is
+        skipped rather than waking the wrong session. Explicit ``wake_me`` keeps
+        the newest-match behavior via ``_latest_relay_session``.
+        """
+        try:
+            rows = self.db.execute(
+                "SELECT destinations_json FROM relay_subscriptions WHERE client_type='opencode_thread'"
+            ).fetchall()
+        except sqlite3.Error:
+            return None
+        wanted = (directory if isinstance(directory, str) else "").rstrip("\\/").lower()
+        sessions: set[str] = set()
+        for row in rows:
+            try:
+                destinations = json.loads(row["destinations_json"] or "[]")
+            except (TypeError, ValueError):
+                continue
+            for item in destinations if isinstance(destinations, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                session_id = item.get("session_id")
+                if not isinstance(session_id, str) or not session_id:
+                    continue
+                item_dir = (item.get("directory") or "").rstrip("\\/").lower()
+                if wanted and item_dir and item_dir != wanted:
+                    continue
+                sessions.add(session_id)
+        return sessions.pop() if len(sessions) == 1 else None
 
     def _resolve_relay_sessions(self, targets: list[dict[str, Any]] | None, directory: str | None) -> None:
         """Fill in a missing ``opencode_thread`` session id from live relays.
@@ -5793,12 +6026,17 @@ class JobManager:
         if not row:
             raise ValueError(f"Unknown delivery_id: {delivery_id}")
         with self.db_lock:
+            # Refresh ``created_at`` (the age the TTL predicate reads) rather than
+            # bumping attempts: a relay-addressed wake with no subscriber is never
+            # claimed, so attempts must stay 0 for the TTL to still apply. Bumping
+            # it would exempt this row from expiry and re-open the leak.
             changed = self.db.execute(
                 """
-                UPDATE deliveries SET status='retrying', next_attempt_at=NULL, last_error=NULL
+                UPDATE deliveries SET status='retrying', next_attempt_at=NULL, last_error=NULL,
+                    created_at=?
                 WHERE delivery_id=? AND status IN ('failed','retrying')
                 """,
-                (delivery_id,),
+                (now_iso(), delivery_id),
             ).rowcount
             self.db.commit()
             row = self._row("SELECT * FROM deliveries WHERE delivery_id=?", (delivery_id,))
@@ -6093,6 +6331,7 @@ class JobManager:
             emit("vanth_db_size_bytes", db_size),
             emit("vanth_stale_delivery_leases", stale_leases),
             emit("vanth_dead_letters", self._dead_letter_count()),
+            emit("vanth_jobs_without_wake", self._recent_jobs_without_wake()),
         ]
         for status, count in sorted(delivery_counts.items()):
             lines.append(emit("vanth_deliveries", count, status=status))
@@ -6189,6 +6428,13 @@ class JobManager:
             row["status"]: row["count"]
             for row in self.db.execute("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status").fetchall()
         }
+        stale_delivery_ttl = self._delivery_ttl_seconds()
+        stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_delivery_ttl)).isoformat().replace("+00:00", "Z")
+        stale_pending_deliveries = self.db.execute(
+            "SELECT COUNT(*) FROM deliveries WHERE status IN ('pending','retrying') AND attempts=0 AND created_at < ?",
+            (stale_cutoff,),
+        ).fetchone()[0]
+        recent_jobs_without_wake = self._recent_jobs_without_wake()
         relay_client_ids = self._relay_client_ids()
         undeliverable_wakes = 0
         for row in self.db.execute("SELECT type, config_json FROM wake_targets").fetchall():
@@ -6232,6 +6478,15 @@ class JobManager:
                     "detail": "these wakes can never fire; inspect with `vanth deliveries --status pending`",
                 }
             )
+        if stale_pending_deliveries:
+            warnings.append(
+                {
+                    "type": "stale_pending_deliveries",
+                    "count": stale_pending_deliveries,
+                    "detail": (f"wakes older than {stale_delivery_ttl}s that no relay completed "
+                               "(expired automatically by the dispatch loop)"),
+                }
+            )
         missing = sorted(required - tables)
         if missing:
             warnings.append({"type": "missing_tables", "tables": missing})
@@ -6265,7 +6520,8 @@ class JobManager:
         ).fetchall():
             target = json.loads(row["payload_json"] or "{}").get("target", {})
             max_attempts = int(target.get("max_attempts", 1))
-            if int(row["attempts"]) < max_attempts:
+            expired = (row["last_error"] or "").startswith(EXPIRED_DELIVERY_ERROR)
+            if int(row["attempts"]) < max_attempts and not expired:
                 continue
             dead_lettered.append(
                 {
@@ -6299,6 +6555,8 @@ class JobManager:
             "tables": sorted(tables),
             "delivery_counts": delivery_counts,
             "pending_deliveries": delivery_counts.get("pending", 0),
+            "stale_pending_deliveries": stale_pending_deliveries,
+            "recent_jobs_without_wake": recent_jobs_without_wake,
             "undeliverable_wakes": undeliverable_wakes,
             "codex": {"command": codex_bin, "available": codex_available},
             "opencode": {"command": opencode_bin, "available": opencode_available},
@@ -6307,7 +6565,8 @@ class JobManager:
             "maintenance_alive": maintenance_alive,
             "relays": self.relay_status(),
             "stale_delivery_leases": stale_leases,
-            "dead_letter_count": len(dead_lettered),
+            # Unbounded count; ``dead_lettered`` below is only the most recent 20.
+            "dead_letter_count": self._dead_letter_count(),
             "dead_lettered": dead_lettered,
             "running_jobs": running_jobs,
             "max_running_jobs": self.max_running_jobs,
@@ -6731,7 +6990,16 @@ class JobManager:
         self._readers_done(job_id)
         self.processes.pop(job_id, None)
         if failures:
-            raise RuntimeError(f"Failed to stop process tree(s): {failures}")
+            # The job is already terminal (cancelled); a lingering tree is a
+            # host problem, not a failed stop. Retry the stragglers once more with
+            # a fresh grace window, log what survived, then report.
+            still = [
+                pid for pid in failures
+                if self._pid_alive(pid) and not self._terminate_pid(pid, True, time.monotonic() + 2.0)
+            ]
+            if still:
+                self.logger.warning("job %s cancelled but process tree did not exit: %s", job_id, still)
+                raise RuntimeError(f"Failed to stop process tree(s): {still}")
         return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
 
     def add_wake_target(self, job_id: str, target: dict[str, Any]) -> dict[str, Any]:
@@ -7230,12 +7498,20 @@ client: VanthClient | None = None
 mcp = FastMCP("vanth")
 
 
+_client_lock = threading.Lock()
+
+
 def get_client() -> VanthClient:
     global client
-    if client is None:
-        client = VanthClient()
-        client.ensure()
-    return client
+    # Tools now run their blocking work in worker threads, so the lazy global
+    # must be initialized under a lock: two concurrent first calls could
+    # otherwise both construct a client and both run ensure() (double daemon
+    # spawn / port-conflict RuntimeError).
+    with _client_lock:
+        if client is None:
+            client = VanthClient()
+            client.ensure()
+        return client
 
 
 def tool_error(message: str) -> dict[str, Any]:
@@ -7265,7 +7541,10 @@ def job_start(
     wake_me: bool = False,
     dry_run: bool = False,
 ) -> dict[str, Any]:
-    """Core: Start a background job and return its job ID; use ``job_wait`` or ``job_status`` to track it.
+    """Core: Start a background job. For anything that may outlive this turn,
+    pass ``wake_me=True`` so completion resumes this session instead of polling
+    (``job_wait`` still tracks it meanwhile). Use ``job_wait``/``job_status`` to
+    check progress.
 
     For a direct local job, this call also waits up to three seconds for the
     workload's ``started`` event. ``startup_confirmed`` reports whether that
@@ -7343,6 +7622,22 @@ def job_start(
         or os.environ.get("CODEX_THREAD_ID")
     )
     cwd = cwd or os.getcwd()
+    # Default: ask the daemon to attach the calling-session wake to an
+    # agent-started local job that did not ask for one, so completion resumes the
+    # session instead of relying on polling. Best-effort: the daemon skips it when
+    # no live relay resolves, so it never fails a start. Skipped for
+    # short/interactive/remote/preview jobs and when the job runs outside the
+    # caller's directory. Opt out with VANTH_DEFAULT_WAKE_ME=0.
+    wake_default = (
+        not wake_me
+        and wake_targets is None
+        and not interactive
+        and remote_id is None
+        and not dry_run
+        and (timeout_seconds is None or timeout_seconds >= _default_wake_min_seconds())
+        and _env_flag_default_on("VANTH_DEFAULT_WAKE_ME")
+        and _same_directory(cwd, os.getcwd())
+    )
     copied_targets: list[dict[str, Any]] | None = None
     if wake_me and wake_targets is None:
         # Mirror the CLI shorthand: the events MUST be present (a wake target
@@ -7380,35 +7675,44 @@ def job_start(
             "priority": priority,
             "remote_id": remote_id,
             "idempotency_key": idempotency_key,
+            "wake_default": wake_default,
         },
     )
     return client.confirm_local_start(started) if not remote_id and not dry_run else started
 
 
 @mcp.tool()
-def job_start_and_wait(command: str, cwd: str | None = None, name: str | None = None,
-                       env: dict[str, str] | None = None, timeout_seconds: int | None = None,
-                       wait_timeout_seconds: int = 20, tags: list[str] | None = None,
-                       notes: str | None = None, secret_env: list[str] | None = None,
-                       idempotency_key: str | None = None) -> dict[str, Any]:
+async def job_start_and_wait(command: str, cwd: str | None = None, name: str | None = None,
+                             env: dict[str, str] | None = None, timeout_seconds: int | None = None,
+                             wait_timeout_seconds: int = 20, tags: list[str] | None = None,
+                             notes: str | None = None, secret_env: list[str] | None = None,
+                             idempotency_key: str | None = None) -> dict[str, Any]:
     """Run a short local job, wait for a terminal outcome, and return its summary.
 
-    The wait lasts 1..300 seconds; if it times out the job keeps running and its
-    ``job_id`` is returned for a later ``job_wait``. Use ``job_start`` with a wake
-    target for long work. ``timeout_seconds`` is the job's runtime limit, while
-    ``wait_timeout_seconds`` only bounds this tool call.
+    The wait lasts 1..300 seconds; if it does not reach a terminal event in an
+    MCP-safe slice (``VANTH_MCP_WAIT_SLICE``, default 25 s) it returns
+    ``{"wait": {"result": "still_running"}}`` and the ``job_id`` so the caller
+    can call ``job_wait`` again. The job keeps running either way. Use
+    ``job_start`` with a wake target for long work. ``timeout_seconds`` is the
+    job's runtime limit, while ``wait_timeout_seconds`` only bounds this call.
     """
     if isinstance(wait_timeout_seconds, bool) or not isinstance(wait_timeout_seconds, int) or not 1 <= wait_timeout_seconds <= 300:
         raise ValueError("wait_timeout_seconds must be between 1 and 300")
-    started = job_start(command=command, cwd=cwd, name=name, env=env,
-                        timeout_seconds=timeout_seconds, tags=tags, notes=notes,
-                        secret_env=secret_env, idempotency_key=idempotency_key)
+    started = await asyncio.to_thread(
+        job_start, command=command, cwd=cwd, name=name, env=env,
+        timeout_seconds=timeout_seconds, tags=tags, notes=notes,
+        secret_env=secret_env, idempotency_key=idempotency_key,
+        # This tool already returns the outcome; opting out of the default wake
+        # (wake_targets=[]) avoids a redundant terminal wake firing later.
+        wake_targets=[],
+    )
     job_id = started.get("job_id")
     if not job_id:
         return started
-    waited = job_wait(job_id, ["completed", "failed", "timeout", "cancelled", "orphaned"],
-                      timeout_seconds=wait_timeout_seconds)
-    summary = job_run_summary(job_id, include_stderr_excerpt=True, include_stdout_excerpt=True)
+    waited = await job_wait(job_id, ["completed", "failed", "timeout", "cancelled", "orphaned"],
+                            timeout_seconds=wait_timeout_seconds)
+    summary = await asyncio.to_thread(job_run_summary, job_id,
+                                      include_stderr_excerpt=True, include_stdout_excerpt=True)
     return {"job_id": job_id, "status": summary["status"], "wait": waited, "summary": summary}
 
 
@@ -7624,10 +7928,47 @@ def job_clear_deliveries(
     )
 
 
+_MAX_MCP_WAIT_SLICE = 45.0
+
+
+def _mcp_wait_slice_seconds() -> float:
+    """Client-safe ceiling (seconds) for a single blocking MCP call.
+
+    MCP clients cap a tool call at their own request timeout (the reference
+    TypeScript SDK default is 60 s). A blocking tool must return before that or
+    the client reports ``-32001`` and the result is lost; long waits are made
+    resumable instead of blocking past this budget. Override with
+    ``VANTH_MCP_WAIT_SLICE``; the value is clamped to ``_MAX_MCP_WAIT_SLICE`` so
+    the socket deadline (slice + margin) stays under the client budget.
+    """
+    try:
+        value = float(os.environ.get("VANTH_MCP_WAIT_SLICE", "25"))
+    except ValueError:
+        return 25.0
+    if not math.isfinite(value) or value <= 0:
+        return 25.0
+    return min(value, _MAX_MCP_WAIT_SLICE)
+
+
+def _job_wait_blocking(client: VanthClient, job_id: str, filters: list[str], since_event_id: str | None,
+                       timeout_seconds: int, return_progress: bool,
+                       metric_ge: dict[str, float] | None, remote_id: str | None) -> dict[str, Any]:
+    # Blocking HTTP call. Always invoked via asyncio.to_thread so it never stalls
+    # the MCP stdio event loop: a stalled loop makes every queued tool call
+    # (job_status, job_tail) time out behind the wait. The +5 margin covers the
+    # response round-trip only; the daemon returns at the deadline.
+    return client.post(
+        f"/jobs/{job_id}/wait",
+        {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds,
+         "return_progress": return_progress, "metric_ge": metric_ge, "remote_id": remote_id},
+        timeout=float(timeout_seconds) + 5,
+    )
+
+
 @mcp.tool()
-def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
-             follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None,
-             remote_id: str | None = None) -> dict[str, Any]:
+async def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
+                   follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None,
+                   remote_id: str | None = None) -> dict[str, Any]:
     """Read a job's captured output.
 
     With ``remote_id`` the log is read from that paired host over the remote
@@ -7637,30 +7978,40 @@ def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset:
     if remote_id:
         # A remote read is a single byte range: refuse the options it cannot
         # honour instead of silently ignoring them (callers would otherwise
-        # believe they were following a live log).
+        # believe they were following a live log). Validate BEFORE touching the
+        # daemon so a rejection never performs I/O or spawns a daemon.
         if follow:
             raise ValueError("follow is not supported when reading a remote job's log; poll job_tail instead")
         if grep is not None:
             # `is not None`, not truthiness: grep="" was supplied and cannot be
             # honoured, so it must not be silently dropped.
             raise ValueError("grep is not supported when reading a remote job's log; filter the returned content")
-        return get_client().get(
+        client = get_client()
+        return await asyncio.to_thread(
+            client.get,
             f"/remotes/{remote_id}/jobs/{job_id}/tail",
             {"stream": stream, "offset": offset or 0, "size": max_bytes},
-            timeout=float(timeout_seconds) + 30,
+            # A remote byte-range read has no reason to exceed the MCP slice;
+            # cap the socket deadline so one call stays under the client budget.
+            timeout=min(float(timeout_seconds), _mcp_wait_slice_seconds()) + 5,
         )
-    # Long-poll: the client deadline must exceed the server-side follow window
-    # (default 5s, but callers can ask for much longer), not the 30s default.
-    return get_client().get(
+    # Bound a follow to the MCP-safe slice so the client does not time out; the
+    # caller resumes from ``next_offset``.
+    effective_timeout = float(timeout_seconds)
+    if follow and effective_timeout > _mcp_wait_slice_seconds():
+        effective_timeout = max(1.0, _mcp_wait_slice_seconds())
+    client = get_client()
+    return await asyncio.to_thread(
+        client.get,
         f"/jobs/{job_id}/tail",
         {"stream": stream, "max_bytes": max_bytes, "offset": offset,
-         "follow": follow, "timeout_seconds": timeout_seconds, "grep": grep},
-        timeout=float(timeout_seconds) + 30,
+         "follow": follow, "timeout_seconds": effective_timeout, "grep": grep},
+        timeout=effective_timeout + 5,
     )
 
 
 @mcp.tool()
-def job_wait(
+async def job_wait(
     job_id: str,
     filters: list[str],
     since_event_id: str | None = None,
@@ -7680,40 +8031,76 @@ def job_wait(
     events instead of blocking. Returns ``{"result": "timeout"}`` when
     ``timeout_seconds`` elapses.
 
+    A single call blocks at most ``VANTH_MCP_WAIT_SLICE`` seconds (default 25),
+    well under an MCP client's own request timeout. If the event has not fired
+    by then, the result is ``{"result": "still_running", "job_id": ...,
+    "status": ...}`` and the caller should call ``job_wait`` again (or
+    ``job_status``); the job keeps running. Never raise the client's timeout to
+    make a long wait work — just re-call.
+
     With ``remote_id`` the wait polls ``RemoteControl.status`` every 0.2s until
     the remote reports a terminal status or the timeout elapses (a real
     cross-machine event push arrives in Phase 4); ``since_event_id``,
     ``return_progress`` and ``metric_ge`` are ignored in that mode.
     """
-    # Long-poll: the client deadline must exceed the server-side wait budget
-    # (default 3600s), not the 30s default.
-    return get_client().post(
-        f"/jobs/{job_id}/wait",
-        {"filters": filters, "since_event_id": since_event_id, "timeout_seconds": timeout_seconds,
-         "return_progress": return_progress, "metric_ge": metric_ge, "remote_id": remote_id},
-        timeout=float(timeout_seconds) + 30,
+    slice_seconds = _mcp_wait_slice_seconds()
+    capped = timeout_seconds is not None and timeout_seconds > slice_seconds
+    effective = max(1, int(slice_seconds)) if capped else timeout_seconds
+    result = await asyncio.to_thread(
+        _job_wait_blocking, get_client(), job_id, filters, since_event_id, effective,
+        return_progress, metric_ge, remote_id,
     )
+    # Only offer a resumable wait while the job can still produce the event. A
+    # terminal job whose narrow filter never matched must stay a plain timeout,
+    # or an agent would re-call forever on a status that can never change.
+    if capped and result.get("result") == "timeout" and result.get("status") not in TERMINAL_STATUSES:
+        return {
+            "result": "still_running",
+            "job_id": job_id,
+            "status": result.get("status"),
+            "waited_seconds": effective,
+            "requested_timeout_seconds": timeout_seconds,
+            "message": ("No matching event within the MCP wait slice; call job_wait again to keep "
+                        "waiting, or job_status for the current state."),
+        }
+    return result
 
 
 @mcp.tool()
-def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10,
-             reason: str | None = None,
-             remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
+async def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10,
+                   reason: str | None = None,
+                   remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
     """Stop a running job.
 
     ``reason`` optionally records why the caller is stopping it; the resulting
     ``cancelled`` event carries ``{"actor": "tool", "reason": ...}`` so the kill
     is attributable after the fact.
     """
-    # The daemon may legitimately wait out the whole grace period, so the client
-    # deadline must cover it (not the 30s default).
-    return get_client().post(
-        f"/jobs/{job_id}/stop",
-        {"signal": signal, "kill_after_seconds": kill_after_seconds,
-         "actor": "tool", "reason": reason,
-         "remote_id": remote_id, "idempotency_key": idempotency_key},
-        timeout=float(kill_after_seconds) + 30,
-    )
+    # The daemon waits out the grace period, so the socket deadline covers it —
+    # but never past the MCP client's own request timeout. Offloaded so it does
+    # not stall other tool calls, and bounded so a long grace period returns an
+    # acknowledgement instead of `-32001` (the daemon keeps stopping regardless).
+    client = get_client()
+    budget = _mcp_wait_slice_seconds()
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                client.post,
+                f"/jobs/{job_id}/stop",
+                {"signal": signal, "kill_after_seconds": kill_after_seconds,
+                 "actor": "tool", "reason": reason,
+                 "remote_id": remote_id, "idempotency_key": idempotency_key},
+                timeout=budget + 1,
+            ),
+            timeout=budget,
+        )
+    except (asyncio.TimeoutError, TimeoutError):
+        return {
+            "result": "still_running",
+            "job_id": job_id,
+            "message": ("Stop requested; the process tree is still terminating. Re-check with "
+                        "job_status or job_wait for the cancelled event."),
+        }
 
 
 @mcp.tool()

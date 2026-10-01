@@ -8,6 +8,7 @@ import sys
 import pytest
 import shellcmd
 
+from vanth.migrations import LATEST_SCHEMA_VERSION
 from vanth.server import JobManager
 
 
@@ -133,7 +134,7 @@ def test_migration_from_v18_preserves_jobs_and_adds_retry_ledger(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         assert manager.status(started["job_id"])["status"] == "queued"
-        assert manager.db.execute("PRAGMA user_version").fetchone()[0] == 19
+        assert manager.db.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
         assert manager.db.execute("SELECT COUNT(*) FROM local_start_requests").fetchone()[0] == 0
     finally:
         manager.close()

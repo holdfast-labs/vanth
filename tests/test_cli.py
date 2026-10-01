@@ -239,3 +239,42 @@ def test_restart_starts_fresh_daemon(tmp_path):
         except Exception:
             pass
         proc.wait(timeout=10)
+
+
+def test_cmd_deliveries_clear_requires_a_filter_and_prunes(monkeypatch, capsys):
+    calls = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def ensure(self):
+            pass
+
+        def get(self, path, params=None):
+            return {"result": "ok", "deliveries": []}
+
+        def post(self, path, payload=None, **kwargs):
+            calls["path"] = path
+            calls["payload"] = payload
+            return {"result": "ok", "matched": 3, "drained": 0 if payload["dry_run"] else 3, "dry_run": payload["dry_run"]}
+
+    monkeypatch.setattr(cli, "VanthClient", lambda **kwargs: FakeClient())
+
+    # No filter: refuse (avoids an accidental full drain).
+    assert cli.cmd_deliveries(["--clear"], home=".", json_out=False) == 2
+
+    # Dry run by default, with a useful page size (not the 20-row listing default).
+    assert cli.cmd_deliveries(["--clear", "--status", "failed"], home=".", json_out=False) == 0
+    assert calls["path"] == "/deliveries/clear"
+    assert calls["payload"]["status"] == "failed"
+    assert calls["payload"]["dry_run"] is True
+    assert calls["payload"]["limit"] == 1000
+
+    # --limit overrides.
+    assert cli.cmd_deliveries(["--clear", "--status", "failed", "--limit", "5"], home=".", json_out=False) == 0
+    assert calls["payload"]["limit"] == 5
+
+    # --yes applies.
+    assert cli.cmd_deliveries(["--clear", "--status", "failed", "--yes"], home=".", json_out=False) == 0
+    assert calls["payload"]["dry_run"] is False

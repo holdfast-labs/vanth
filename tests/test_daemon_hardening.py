@@ -349,3 +349,19 @@ def test_signal_handler_accepts_signum_frame():
     daemon._stop_httpd(15, None)
     daemon.shutdown_event.clear()
     daemon._stop_httpd()
+
+
+def test_daemon_writes_a_startup_log_line(tmp_path):
+    proc, port = start_daemon(tmp_path)
+    try:
+        log_path = tmp_path / "state" / "logs" / "daemon.log"
+        deadline = time.monotonic() + 5
+        text = ""
+        while time.monotonic() < deadline:
+            text = log_path.read_text(encoding="utf-8", errors="replace")
+            if "vanthd started" in text:
+                break
+            time.sleep(0.05)
+        assert "vanthd started" in text
+    finally:
+        stop_daemon(proc)

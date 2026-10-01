@@ -32,13 +32,26 @@ When MCP is unavailable, use the `vanth start` CLI fallback. Make jobs emit
 in the `vanth-monitor` dashboard; and let long jobs resume you via wake targets
 instead of you checking in.
 
+For a short local command with a known time bound, `job_start_and_wait` combines
+the start, bounded wait, and run summary in one call. Use `job_start` plus a
+wake target for long-running work that should continue while you do something
+else, or when you need to handle intermediate events such as checkpoints.
+
+Local starts accept an optional durable `idempotency_key`: retry identical
+settings with the same key to recover the original job after a lost response or
+daemon restart. The CLI form is `vanth start --idempotency-key KEY -- <command>`.
+Changed settings with an existing key are rejected. `vanth start --dry-run -- <command>`
+(MCP: `job_start(..., dry_run=True)`) previews the resolved shell,
+working directory, wake destination, and policy without launching work.
+Start-and-wait results include bounded stdout and stderr excerpts.
+
 ### Wake me when it finishes
 
 ```cmd
 vanth start --wake-me -- <command>
 ```
 
-The MCP equivalent is `job_start(command="...", wake_me=True)`. `--wake-me`
+The MCP form for this core workflow is `job_start(command="...", wake_me=True)`. `--wake-me`
 defaults to all terminal outcomes (`completed`, `failed`, `timeout`, `cancelled`,
 `orphaned`); use `--wake-me=completed,failed,checkpoint` to override the event
 list. Never use the relay client id `opencode-<pid>-<rand>` as `session_id`: use
@@ -87,9 +100,9 @@ MCP call or command such as `vanth list` will start the daemon on demand.
 
 2. **Refresh and verify the client connection.** MCP clients usually load server
    configuration at startup. Restart or reload the client after setup, then
-   confirm its tool picker/list includes `job_start`, `job_wait`, and
-   `job_doctor`. In OpenCode, `opencode mcp list` checks the connection. If the
-   server is missing, run `vanth status` and `vanth doctor`; for a source
+   confirm its tool picker/list includes `job_start`, `job_start_and_wait`,
+   `job_wait`, and `job_doctor`. In OpenCode, `opencode mcp list` checks the
+   connection. If the server is missing, run `vanth status` and `vanth doctor`; for a source
    checkout, make sure the client config launches `uv run vanth` from the repo.
 
 3. **Check health**:
@@ -116,12 +129,35 @@ Once the MCP client is connected, this is the whole loop:
 | Goal | MCP tools |
 |---|---|
 | Start a job | `job_start` |
+| Start and collect a bounded result | `job_start_and_wait` (short local jobs) |
 | Wait for progress or completion | `job_wait` |
 | Inspect output or status | `job_status`, `job_run_summary`, `job_tail`, `job_events` |
 | Stop or retry work | `job_stop`, `job_rerun` |
 | Diagnose a wake | `job_deliveries`, `job_delivery_attempts`, `job_retry_delivery` |
 
 The complete MCP reference is [docs/agent-tools.md](docs/agent-tools.md).
+
+`job_start` itself confirms acceptance and returns a job ID. For a direct local
+job it also waits briefly for the workload's `started` event and reports
+`startup_confirmed`; this confirms process launch, not successful completion.
+Queued jobs return `queued` immediately. Use `job_wait` for later progress or
+completion, rather than to find out whether the initial start was accepted.
+
+For a bounded command that should finish before the tool call returns:
+
+```text
+job_start_and_wait(
+  command="uv run python -m compileall -q src",
+  wait_timeout_seconds=60,
+)
+# -> job ID, status, wait result, and run summary
+```
+
+`wait_timeout_seconds` is 1–300 seconds; if the wait expires, the job keeps
+running. Set the MCP client's own tool-call timeout longer than this wait
+budget. For long jobs, start with `job_start(..., wake_me=True)` (or explicit
+`wake_targets`) and let the wake resume the session; use `job_wait` when you
+need progress or checkpoint events while the job runs.
 
 ```text
 job_start(
@@ -164,26 +200,32 @@ disables). It does not exit during a blocking tool call. `vanth doctor
 
 ### Human CLI
 
-`vanth` doubles as a human-facing operations CLI. Operational commands
-autostart the daemon on demand; bare `vanth status` is read-only and reports
-`DOWN` when it is stopped. `vanth status <job-id>` inspects a job and may start
-the daemon. Every flag-based command supports `--json` where noted for scripts.
+`vanth` provides core job operations and daemon administration from the command
+line. The MCP server exposes the full agent tool surface; many advanced
+delivery, coordination, metrics, and artifact operations have no direct CLI
+command.
+Operational CLI commands autostart the daemon on demand; bare `vanth status` is
+read-only and reports `DOWN` when it is stopped. `vanth status <job-id>` inspects
+a job and may start the daemon. Every flag-based command supports `--json` where
+noted for scripts.
 
 | Command | Purpose |
 |---|---|
 | `vanth --version` / `vanth version` | Print the installed version |
 | `vanth status [<job-id>]` | Bare command: read-only daemon up/down, pid, schema, running jobs, deliveries. With a job id: inspect that job's status/exit/runtime/last event (may start daemon). (`--json`) |
-| `vanth doctor` | Full health report (same as `job_doctor`, human-readable; `--json`) |
+| `vanth doctor` | Print the health report (human-readable; `--json` for JSON output) |
 | `vanth restart` | Gracefully stop + start the daemon (jobs survive) |
 | `vanth setup [opencode] [codex] [claude] [desktop] [--remove] [--yes]` | Register/unregister the MCP server in your clients' configs |
 | `vanth start [options] [--] <command...>` | Start a background job without MCP. Options: `--name`, `--cwd`, `--timeout`, `--env K=V`, `--wake JSON`, `--wake-me[=EVENTS]`, `--interactive`, `--priority`, `--pool`, `--tag`, `--notes`, `--secret-env`, `--trigger JSON`, `--policy JSON`; `--` passes command flags verbatim |
+| `vanth rerun <job_id>` | Rerun a job with its saved configuration (core counterpart of `job_rerun`) |
+| `vanth send <job_id> [--line] [--eof] [<text|->]` | Send raw input to an interactive job; `--line` appends a newline, `-` reads stdin, and text may be omitted with `--eof` (core counterpart of `job_send`) |
 | `vanth sleep <seconds>` | Start a trivial sleep job |
 | `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`); defaults to in-flight (launching/queued/running/…), `--all` shows finished jobs; running jobs show DURATION and AGE |
 | `vanth deliveries [--status S] [--job JOB_ID] [--limit N] [--json]` | List wake deliveries, attempts, and last errors |
-| `vanth wake <job_id> [--now] [--type T] [--events a,b] [--cwd DIR] [--config JSON] [--target JSON]` | Add a wake target to a job **after it started** (in-flight or finished). Fires on future events; `--now` surfaces a synthetic wake immediately. CLI counterpart of `job_add_wake_target` / `job_wake_now` |
-| `vanth api` | Print the loopback HTTP surface and authentication details |
+| `vanth wake <job_id> [--now] [--type T] [--events a,b] [--cwd DIR] [--config JSON] [--target JSON]` | Add a wake target to a job **after it started** (in-flight or finished). Fires on future events; `--now` surfaces a synthetic wake immediately. CLI forms of the core `job_add_wake_target` / `job_wake_now` operations |
+| `vanth api` | Print a loopback HTTP route summary and authentication details |
 | `vanth logs <job_id>` (`tail` alias) | Show a job's output (`--stream stdout\|stderr\|all`, `--offset`, `--max-bytes`, `--grep`, `--json`) |
-| `vanth wait <job_id>` | Block until an event fires (the CLI `job_wait`): defaults to terminal outcomes (`completed`, `failed`, `timeout`, `cancelled`, `orphaned`); `--events` narrows the set. Also accepts `--timeout SECONDS`, `--since-event-id ID`. Exits 0 on an event, 3 on timeout |
+| `vanth wait <job_id>` | Block until an event fires (core counterpart of `job_wait`): defaults to terminal outcomes (`completed`, `failed`, `timeout`, `cancelled`, `orphaned`); `--events` narrows the set. Also accepts `--timeout SECONDS`, `--since-event-id ID`. Exits 0 on an event, 3 on timeout |
 | `vanth diff <job_id> <other>` | Compare two jobs' run specs |
 | `vanth stop <job_id>` | Stop a running job (`--signal`, `--kill-after`) |
 | `vanth artifacts <job_id>` | List a job's artifacts (`--limit`, `--json`) |
@@ -195,11 +237,14 @@ the daemon. Every flag-based command supports `--json` where noted for scripts.
 | `vanth help <command>` | Show command-specific help; `vanth --help` lists commands |
 
 Run `vanth --help` for the command list. Command-specific help is available
-with `vanth <command> --help` for `status`, `doctor`, `list`, `start`, `logs`,
-`wait`, `stop`, `sleep`, `deliveries`, `wake`, `artifacts`, `diff`, `api`,
-`remote`, `backup`, `restore`, `prune`, `restart`, `setup`, `autostart`, and
-`version`. Job-id arguments accept an **unambiguous prefix**, and an unknown id
-suggests near matches.
+with `vanth <command> --help` for `status`, `doctor`, `list`, `start`, `rerun`,
+`send`, `logs`, `wait`, `stop`, `sleep`, `deliveries`, `wake`, `artifacts`,
+`diff`, `api`, `remote`, `backup`, `restore`, `prune`, `restart`, `setup`,
+`autostart`, and `version`. Job-id arguments accept an **unambiguous prefix**;
+an unknown id suggests near matches.
+
+`vanth start --json` includes `startup_confirmed` for direct local jobs, with
+the same brief confirmation as MCP `job_start`. Queued jobs return immediately.
 
 For `vanth start`, `<command...>` begins at the first non-option argument. A
 single argument is used verbatim (so a whole quoted command string works);
@@ -522,6 +567,7 @@ events.
 | Tool | Purpose |
 |---|---|
 | `job_start` | Launch a command as a detached job |
+| `job_start_and_wait` | Start a short local job, wait for a bounded time, and return its summary |
 | `job_rerun` | Re-launch a job, optionally overriding `command`/`env`/`cwd`/`timeout_seconds`/`name`/`tags`/`notes`/`interactive` |
 | `job_send` | Feed stdin to an interactive job (`interactive=True` first) |
 | `job_wait` | Block until a matching event (or timeout) — the preferred way to await jobs (`return_progress` optional) |
@@ -566,6 +612,27 @@ events — `progress`, `metric`, `checkpoint`, `completed`, and more — that th
 daemon persists durably, the dashboard charts, and wake deliveries carry to
 agents. See `vanth/agent_events.py` for the Python helpers and
 `vanth/agent_logger.py` for the loguru integration.
+
+### job_start_and_wait — start and collect a bounded result
+
+```text
+job_start_and_wait(
+  command="python -m compileall -q src",
+  wait_timeout_seconds=60,
+)
+```
+
+This convenience tool combines `job_start`, a bounded `job_wait`, and
+`job_run_summary`. It returns the job ID and status plus `wait` and `summary`.
+Parameters: `command`, `cwd`, `name`, `env`,
+`timeout_seconds`, `wait_timeout_seconds` (default 20; 1–300), `tags`, `notes`,
+and `secret_env`. It returns `job_id`, `status`, `wait`, and `summary` (or a
+start error). The summary includes a bounded `stderr_excerpt` of up to 2048
+bytes. If the wait expires, the job keeps running. Set the MCP client's own
+tool-call timeout longer than `wait_timeout_seconds`. Use it for short local
+commands whose result is useful immediately. For work that may outlast the
+wait bound, use `job_start` with `wake_me=True` or `wake_targets`; for
+intermediate progress or checkpoints, use `job_start` followed by `job_wait`.
 
 ### job_start
 
@@ -819,12 +886,14 @@ across all groups.
 ### job_run_summary — did it work?
 
 ```text
-job_run_summary(job_id="job_...")
+job_run_summary(job_id="job_...", include_stderr_excerpt=True)
 ```
 
 One call returns status, name, runtime, exit code, latest progress, notes,
 per-metric overview (latest/first/min/max/count), and attached artifacts — the
-fastest way for an agent to report on a finished job.
+fastest way for an agent to report on a finished job. The optional
+`include_stderr_excerpt` flag adds `stderr_excerpt` (up to 2048 bytes); it is
+omitted by default.
 
 ### job_artifact_add / job_artifacts — attach outputs
 
@@ -1265,11 +1334,24 @@ Key knobs in one glance:
   backups/         pre-migration snapshots AND `vanth backup` archives
 ```
 
-`vanth backup` archives `jobs.sqlite`, `artifacts.sqlite`, the `artifacts-store/`
+`vanth backup` archives `jobs.sqlite`, `artifacts.sqlite`, `remote.sqlite`, the `artifacts-store/`
 blobs and the `events/` mirrors into one verified zip (`manifest.json` with a
 SHA-256 per file); `vanth restore <archive> --yes` verifies, snapshots the
-current state, and swaps it back (refuses while the daemon looks running, and
-refuses a backup from a newer schema unless `--force`).
+current state, and swaps it back while holding the home lock. Restore refuses a
+live daemon or detached job even with `--force`, and aborts if its safety backup
+fails. A backup from a newer schema requires `--force`.
+
+Archive entries are hashed from the exact bytes written to the ZIP; live
+append-only files are bounded to their size at open. Restore removes stale
+SQLite WAL/SHM sidecars before replacing database snapshots.
+
+Production checks include the chaos matrix and `uv run python scripts/soak.py --duration 60`;
+the sustained harness verifies events, sequences, runner exits,
+latency, and RSS in isolated state. CI and releases run these checks across all
+three platforms. Manual CI supports a ten-minute soak; real SSH testing is
+opt-in against a disposable host ([setup](docs/real-ssh-validation.md)).
+`vanth doctor --verify-artifacts` adds a bounded artifact integrity check;
+inspect `artifact_integrity.complete` to distinguish a full scan from a partial one.
 
 ### Health, readiness, and diagnosis
 
@@ -1311,12 +1393,15 @@ after snapshotting the current state. Run `vanth backup` while the daemon is up
 
 ---
 
-## HTTP API (equivalent of the MCP tools)
+## HTTP API
 
 The loopback API base URL is the `url` in `<VANTH_HOME>/daemon.json` and the
 token is stored at `<VANTH_HOME>/token`. Every route except `GET /health` needs
-`Authorization: Bearer <token>`. Run `vanth api` for the current surface and
-route details.
+`Authorization: Bearer <token>`. The routes below are a selected index, not a
+complete list of MCP tools or HTTP routes. Run `vanth api` for a route summary;
+see [docs/agent-tools.md](docs/agent-tools.md) for the full MCP
+agent surface. Some MCP tools have no corresponding CLI command or one-to-one
+HTTP route.
 
 | Method | Path | Purpose |
 |---|---|---|
@@ -1338,6 +1423,7 @@ route details.
 | GET | `/jobs/{id}/tail` | Log tail (`stream`, `max_bytes`, `offset`) |
 | POST | `/jobs/{id}/wait` | Wait for an event |
 | POST | `/jobs/{id}/stop` | Stop a job |
+| POST | `/jobs/{id}/send` | Send stdin to an interactive job |
 | POST | `/jobs/{id}/pause` / `/resume` | Hold / release a queued job |
 | GET | `/schedules` | List schedules |
 | POST | `/schedules` | Create a schedule |
@@ -1350,6 +1436,7 @@ route details.
 | GET | `/deliveries/{id}/attempts` | Attempt history |
 | POST | `/deliveries/{id}/mark` | Mark a delivery |
 | POST | `/deliveries/{id}/retry` | Retry a delivery |
+| POST | `/deliveries/clear` | Preview or drain matching wake deliveries (`dry_run`, filters, and limit) |
 | POST | `/cleanup` | Cleanup (`older_than_seconds`, `dry_run`) |
 | GET | `/doctor` | Health report |
 | GET | `/health` | Unauthenticated liveness |
@@ -1365,9 +1452,10 @@ route details.
 
 ## Remote execution
 
-Running jobs on another host is **beta** (POSIX targets). Pairing is interactive,
-so it lives in the CLI; everything after that is available from MCP, the CLI, or
-HTTP.
+Running jobs on another host is **beta** (POSIX targets). The CLI handles
+pairing and host administration (`list`, `doctor`, `remove`, `pending`, and
+`retry`). MCP and HTTP expose host discovery and diagnostics, remote job
+operations, and remote artifact operations.
 
 ```bash
 vanth remote pair user@host        # one-time; writes ~/.vanth/remote.sqlite

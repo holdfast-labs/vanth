@@ -31,6 +31,7 @@ import os
 import errno
 import secrets
 import shutil
+import tempfile
 import stat
 import sys
 import time
@@ -847,18 +848,29 @@ class ArtifactOperations:
                 raise ValueError(f"destination already exists: {dest}")
             lease_state = [time.monotonic()]
             self._lease_tick(op["op_id"], token, lease_state, force=True)
-            staged = self.blobs.stage(self.blobs.blob_path(sha256))
-            self._lease_tick(op["op_id"], token, lease_state)
             # Fail-closed parent sweep BEFORE mkdir (Sol review): creating
             # directories must never happen through a symlink/reparse
             # ancestor that the sweep is about to reject.
             self._verify_dest_parents(dest)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            # Immediate pre-rename revalidation (review P1-11): a parent
-            # swapped for a symlink/reparse point after earlier checks aborts
-            # here instead of writing through it.
-            self._verify_dest_parents(dest)
-            self._publish_staged_file(staged, dest, overwrite=overwrite)
+            # Staging beside the destination makes atomic rename work across
+            # drives/filesystems and leaves the old destination intact on failure.
+            with tempfile.NamedTemporaryFile(prefix=".vanth-materialize-", dir=dest.parent, delete=False) as handle:
+                staged = Path(handle.name)
+            try:
+                digest = hashlib.sha256()
+                with self.blobs.blob_path(sha256).open("rb") as source, staged.open("wb") as output:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        output.write(chunk)
+                        digest.update(chunk)
+                        self._lease_tick(op["op_id"], token, lease_state)
+                if digest.hexdigest() != sha256:
+                    raise ValueError(f"blob content does not match manifest during materialization: {sha256}")
+                self._lease_tick(op["op_id"], token, lease_state)
+                self._verify_dest_parents(dest)
+                self._publish_staged_file(staged, dest, overwrite=overwrite)
+            finally:
+                staged.unlink(missing_ok=True)
             self._verify_dest_parents(dest.parent)
             self._lease_tick(op["op_id"], token, lease_state, force=True)
             result = {

@@ -1,6 +1,6 @@
 """Heavy opt-in chaos and synthetic workload matrix for Vanth v1 release gates.
 
-Run deliberately, not in ordinary CI:
+Run deliberately; the dedicated resilience and release CI jobs run this matrix:
 
     uv run python scripts/chaos_matrix.py            # full matrix
     uv run python scripts/chaos_matrix.py --only burst  # one scenario
@@ -138,13 +138,27 @@ class BurstScenario(Scenario):
                 counts = {row["type"]: row["c"] for row in rows}
                 assert counts["metric"] == self.events * 2, (job_id, counts)
                 assert counts["started"] == 1 and counts["completed"] == 1, (job_id, counts)
+                assert set(counts) <= {"metric", "started", "completed", "write_contended"}, (job_id, counts)
+                assert counts.get("write_contended", 0) <= 1, (job_id, counts)
                 seqs = [row["seq"] for row in manager.db.execute(
                     "SELECT seq FROM events WHERE job_id=? ORDER BY seq", (job_id,)
                 ).fetchall()]
-                assert seqs == list(range(1, self.events * 2 + 3)), job_id
-                total += self.events * 2 + 2
+                assert seqs == list(range(1, len(seqs) + 1)), job_id
+                assert len(seqs) == self.events * 2 + 2 + counts.get("write_contended", 0), job_id
+                total += len(seqs)
             print(f"  {self.jobs} jobs x {self.events} events = {total} durable rows, unique seq verified")
         finally:
+            # A failed release check must not leave its detached runners alive.
+            # Use original Popen handles rather than enumerating other jobs.
+            for job_id, proc in list(manager.processes.items()):
+                if proc.poll() is None:
+                    try:
+                        manager.stop_sync(job_id, signal="kill", kill_after_seconds=0,
+                                          actor="tool", reason="burst scenario cleanup")
+                        proc.wait(timeout=3)
+                    except Exception:
+                        proc.kill()
+                        proc.wait(timeout=3)
             manager.close()
             shutil.rmtree(home, ignore_errors=True)
 

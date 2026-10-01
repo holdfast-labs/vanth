@@ -336,3 +336,39 @@ def test_job_cleanup_preserves_managed_content(home):
     ).fetchone()
     assert json.loads(version["manifest_json"])["sha256"] == published["sha256"]
     assert ops.blobs.blob_path(published["sha256"]).read_bytes() == data
+
+
+def test_file_materialize_stages_on_destination_filesystem(home, tmp_path, monkeypatch):
+    ops = make_ops(home)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"cross filesystem bytes")
+    published = ops.put_file("cross.bin", data=source.read_bytes(), idempotency_key="cross-put")
+    dest = tmp_path / "other-volume" / "result.bin"
+    original = ops._publish_staged_file
+
+    def require_same_parent(staged, destination, **kwargs):
+        assert staged.parent == destination.parent
+        return original(staged, destination, **kwargs)
+
+    monkeypatch.setattr(ops, "_publish_staged_file", require_same_parent)
+    ops.materialize(published["version_id"], dest, idempotency_key="cross-mat")
+    assert dest.read_bytes() == source.read_bytes()
+    assert list(dest.parent.glob(".vanth-materialize-*")) == []
+
+
+def test_file_materialize_failure_preserves_destination_and_cleans_staging(home, tmp_path, monkeypatch):
+    ops = make_ops(home)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"new bytes")
+    published = ops.put_file("failed.bin", data=source.read_bytes(), idempotency_key="failed-mat-put")
+    dest = tmp_path / "result.bin"
+    dest.write_bytes(b"existing bytes")
+
+    def fail_publish(*args, **kwargs):
+        raise OSError("injected rename failure")
+
+    monkeypatch.setattr(ops, "_publish_staged_file", fail_publish)
+    with pytest.raises(OSError, match="injected"):
+        ops.materialize(published["version_id"], dest, overwrite=True, idempotency_key="failed-mat")
+    assert dest.read_bytes() == b"existing bytes"
+    assert list(dest.parent.glob(".vanth-materialize-*")) == []

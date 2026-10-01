@@ -61,49 +61,31 @@ class LocalBlobStore:
     # -- publication / GC fence --------------------------------------------
 
     class _Fence:
-        """OS-level exclusion between blob publication and GC deletion.
+        """OS-backed exclusion across publication and GC, released on crash.
 
-        Both windows hold the same O_CREAT|O_EXCL lock file under the store
-        root: publication holds it from the first ``os.replace`` into blobs
-        until its catalog commit; GC holds it across unlink. This closes the
-        race where GC deleted a blob a concurrent publisher had just made
-        reachable (review P1-9). A stale fence older than ``stale_seconds``
-        is broken once (crashed holder)."""
+        Keep the lock inode permanently: deleting it permits a new holder to
+        lock a different inode while an old holder still owns the original.
+        """
 
         def __init__(self, path: Path, *, timeout: float = 30.0, stale_seconds: float = 900.0):
+            from ..daemon import DaemonLock
+
             self.path = Path(path)
             self.timeout = timeout
-            self.stale_seconds = stale_seconds
-            self._fd = None
+            self._lock = DaemonLock(self.path)
 
         def __enter__(self) -> "_Fence":
-            import time as _time
+            import time
 
-            deadline = _time.monotonic() + self.timeout
-            while True:
-                try:
-                    self._fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                    os.write(self._fd, str(os.getpid()).encode())
-                    return self
-                except FileExistsError:
-                    try:
-                        age = _time.time() - self.path.stat().st_mtime
-                        if age > self.stale_seconds:
-                            self.path.unlink(missing_ok=True)
-                            continue
-                    except OSError:
-                        pass
-                    if _time.monotonic() > deadline:
-                        raise TimeoutError(f"artifact gc fence held too long: {self.path}")
-                    _time.sleep(0.05)
+            deadline = time.monotonic() + self.timeout
+            while not self._lock.acquire():
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"artifact gc fence held too long: {self.path}")
+                time.sleep(0.05)
+            return self
 
         def __exit__(self, *exc) -> None:
-            if self._fd is not None:
-                try:
-                    os.close(self._fd)
-                finally:
-                    self.path.unlink(missing_ok=True)
-                self._fd = None
+            self._lock.release()
 
     def gc_fence(self) -> "LocalBlobStore._Fence":
         return LocalBlobStore._Fence(self.root / ".vanth-gc-fence.lock")
@@ -153,7 +135,7 @@ class LocalBlobStore:
 
         Returns ``{"sha256", "size_bytes", "blob_path"}``. Identical bytes
         deduplicate: an existing blob at the target path wins and the staged
-        copy is discarded.
+        copy is discarded. Corrupt existing content is atomically replaced.
         """
         if not _is_sha256(expected_sha256):
             raise ValueError("expected_sha256 must be a 64-char lowercase hex string")
@@ -164,7 +146,7 @@ class LocalBlobStore:
             raise ValueError(f"staged content hash mismatch: expected {expected_sha256}, got {actual}")
         size = staged.stat().st_size
         target = self.blob_path(expected_sha256)
-        if target.exists():
+        if target.is_file() and _hash_file(target) == expected_sha256:
             staged.unlink(missing_ok=True)
         else:
             target.parent.mkdir(parents=True, exist_ok=True)

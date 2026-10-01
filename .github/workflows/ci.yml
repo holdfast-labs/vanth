@@ -3,18 +3,19 @@ name: Vanth CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_real_ssh:
+        description: Run live SSH smoke against the configured disposable host
+        type: boolean
+        default: false
+      run_long_soak:
+        description: Run a ten-minute sustained soak on each platform
+        type: boolean
+        default: false
 
 jobs:
-  # NOTE: the python job runs on pull_request only (not push) because the
-  # windows-latest runner intermittently flakes on
-  # test_stop_after_restart_kills_runner_and_workload (pid teardown timing after
-  # stop_sync). Linux and macOS are covered too: the suite builds workload
-  # command strings with tests/shellcmd.py (shlex.join on POSIX, list2cmdline on
-  # Windows) so the platform shell executes them correctly everywhere. macOS is
-  # limited to one Python version to limit runner cost; Windows and Linux cover
-  # both.
   python:
-    if: github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -41,13 +42,13 @@ jobs:
         run: |
           wheels=(dist/*.whl)
           test -e "${wheels[0]}"
-          uv run --isolated --no-project --with "${wheels[0]}" python -c "import vanth; print(vanth.__file__)"
+          uv run --no-cache --isolated --no-project --with "${wheels[0]}" python -c "import vanth; print(vanth.__file__)"
       - name: Smoke bundled monitor console script
         shell: bash
         run: |
           wheels=(dist/*.whl)
           test -e "${wheels[0]}"
-          uv run --isolated --no-project --with "${wheels[0]}" vanth-monitor --version
+          uv run --no-cache --isolated --no-project --with "${wheels[0]}" vanth-monitor --version
 
   go:
     strategy:
@@ -64,6 +65,11 @@ jobs:
       - run: gofmt -l .
       - run: go vet ./...
       - run: go test ./...
+      - name: Race detector
+        if: runner.os == 'Linux'
+        env:
+          CGO_ENABLED: '1'
+        run: go test -race ./...
       - name: Cross-language fixture conformance
         run: |
           uv run python scripts/generate_go_fixture.py testdata
@@ -86,7 +92,11 @@ jobs:
 
   resilience:
     name: Resilience chaos matrix
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v10.1.0
@@ -97,3 +107,52 @@ jobs:
           go-version: '1.25'
       - run: uv sync --dev
       - run: uv run python scripts/chaos_matrix.py
+      - run: uv run python scripts/soak.py --duration 60 --report soak-report.json
+
+  long-soak:
+    name: Opt-in ten-minute soak
+    if: github.event_name == 'workflow_dispatch' && inputs.run_long_soak
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: '3.12'
+      - run: uv sync --dev
+      - run: uv run python scripts/soak.py --duration 600 --report soak-report.json
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: soak-${{ matrix.os }}
+          path: soak-report.json
+
+  real-ssh:
+    name: Opt-in disposable SSH smoke
+    if: github.event_name == 'workflow_dispatch' && inputs.run_real_ssh
+    runs-on: ubuntu-latest
+    env:
+      VANTH_SMOKE_SSH_TARGET: ${{ vars.VANTH_SMOKE_SSH_TARGET }}
+      VANTH_SMOKE_SSH_FINGERPRINT: ${{ vars.VANTH_SMOKE_SSH_FINGERPRINT }}
+      VANTH_SMOKE_SSH_PYTHON: ${{ vars.VANTH_SMOKE_SSH_PYTHON }}
+      VANTH_SMOKE_SSH_HELPER: ${{ vars.VANTH_SMOKE_SSH_HELPER }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: '3.12'
+      - run: uv sync --dev
+      - name: Install disposable bootstrap identity
+        env:
+          BOOTSTRAP_KEY: ${{ secrets.VANTH_SMOKE_SSH_BOOTSTRAP_KEY }}
+        run: |
+          test -n "$VANTH_SMOKE_SSH_TARGET"
+          test -n "$BOOTSTRAP_KEY"
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          printf '%s\n' "$BOOTSTRAP_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+      - run: uv run pytest tests/remote/test_live_ssh.py -q -rs

@@ -804,7 +804,9 @@ class Handler(BaseHTTPRequestHandler):
                 report = get_manager().doctor()
                 ok(self, report, 200 if report["ok"] else 503)
             elif parsed.path == "/doctor":
-                ok(self, get_manager().doctor())
+                ok(self, get_manager().doctor(
+                    query.get("verify_artifacts", ["false"])[0].lower() in {"1", "true", "yes"}
+                ))
             elif parsed.path == "/metrics":
                 text(self, get_manager().metrics_text())
             elif parsed.path == "/remotes":
@@ -928,7 +930,11 @@ class Handler(BaseHTTPRequestHandler):
                     int(query.get("limit", ["1000"])[0]),
                 ))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/summary"):
-                ok(self, get_manager().run_summary(parsed.path.split("/")[2]))
+                ok(self, get_manager().run_summary(
+                    parsed.path.split("/")[2],
+                    query.get("include_stderr_excerpt", ["false"])[0].lower() in {"1", "true", "yes"},
+                    query.get("include_stdout_excerpt", ["false"])[0].lower() in {"1", "true", "yes"},
+                ))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/diff"):
                 ok(self, get_manager().diff_spec(
                     parsed.path.split("/")[2],
@@ -1032,22 +1038,17 @@ class Handler(BaseHTTPRequestHandler):
                 return
             parsed = urllib.parse.urlparse(self.path)
             decision_route = _decision_route(parsed.path)
-            if parsed.path == "/jobs":
+            if parsed.path in {"/jobs", "/jobs/preview"}:
                 _validate_job_start_payload(payload)
                 remote_id = payload.pop("remote_id", None)
+                if parsed.path == "/jobs/preview":
+                    if remote_id:
+                        raise ValueError("start preview is supported for local jobs only")
+                    ok(self, asyncio.run(get_manager().start(**payload, dry_run=True)))
+                    return
                 if remote_id:
                     ok(self, _remote_submit(remote_id, "job.start", _remote_payload(payload)))
                 else:
-                    if payload.get("idempotency_key") is not None:
-                        # Local starts have no durable dedup store yet. Silently
-                        # dropping the key would violate the caller's retry
-                        # contract (a retry could execute the workload twice),
-                        # so refuse it explicitly until it is really supported.
-                        raise ValueError(
-                            "idempotency_key is not supported for local job starts; "
-                            "omit it (remote starts accept it)"
-                        )
-                    payload.pop("idempotency_key", None)
                     # Field shapes are validated at the manager boundary, so a
                     # TypeError here is a genuine bug, not user error: report it
                     # as a 500 and log a traceback rather than echoing an

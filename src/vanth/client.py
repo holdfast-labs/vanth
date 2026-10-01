@@ -167,3 +167,55 @@ class VanthClient:
                 return json.loads(response.read().decode())
         except urllib.error.HTTPError as exc:
             return json.loads(exc.read().decode())
+
+    def confirm_local_start(self, started: dict[str, Any]) -> dict[str, Any]:
+        """Briefly confirm a directly launched workload while preserving its job ID."""
+        job_id = started.get("job_id")
+        status = started.get("status")
+        if not job_id or status == "queued":
+            return started
+
+        def preserve_failure_details() -> None:
+            try:
+                snapshot = self.get(f"/jobs/{job_id}/status", timeout=1)
+                for field in ("failure_reason", "recommended_next_action"):
+                    if snapshot.get(field):
+                        started.setdefault(field, snapshot[field])
+            except Exception:
+                pass
+
+        if status in {"failed", "lost", "timeout", "cancelled", "orphaned"}:
+            started["startup_confirmed"] = False
+            preserve_failure_details()
+            reason = "job_failed" if started.get("idempotent_replay") else "startup_failed"
+            started.setdefault("failure_reason", reason if status == "failed" else status)
+            started.setdefault("recommended_next_action", f"Inspect job_status and job_tail for {job_id} before rerunning")
+            return started
+        if status not in {"running", "launching", "completed"}:
+            return started
+        try:
+            acknowledged = self.post(
+                f"/jobs/{job_id}/wait",
+                {"filters": ["started", "failed", "timeout", "cancelled", "orphaned", "completed"],
+                 "timeout_seconds": 3},
+                timeout=33,
+            )
+            started["startup_confirmed"] = (
+                acknowledged.get("result") == "event"
+                and acknowledged.get("event", {}).get("type") == "started"
+            )
+            if acknowledged.get("result") == "event":
+                started["status"] = acknowledged.get("status", status)
+                if started["status"] in {"failed", "lost", "timeout", "cancelled", "orphaned"}:
+                    preserve_failure_details()
+                    reason = "workload_failed" if started["startup_confirmed"] else "startup_failed"
+                    if started["status"] != "failed":
+                        reason = started["status"]
+                    started.setdefault("failure_reason", acknowledged.get("failure_reason") or reason)
+                    started.setdefault("recommended_next_action", f"Inspect job_status and job_tail for {job_id} before rerunning")
+            elif acknowledged.get("result") != "timeout":
+                started.setdefault("warnings", []).append("Startup confirmation was unavailable; use job_status")
+        except Exception:
+            started["startup_confirmed"] = False
+            started.setdefault("warnings", []).append("Startup confirmation was unavailable; use job_status")
+        return started

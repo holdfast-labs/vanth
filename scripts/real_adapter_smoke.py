@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -60,27 +61,49 @@ def opencode_command() -> list[str]:
     return ["opencode"]
 
 
+def assert_reply(result: dict[str, Any], delivery_id: str, adapter: str) -> None:
+    """Check assistant output only: echoed prompts and metadata cannot pass."""
+    replies = []
+    if adapter == "codex":
+        for item in (result.get("turn") or {}).get("items", []):
+            if item.get("type") == "agentMessage":
+                replies.append(item.get("text", ""))
+    else:
+        for line in result.get("stdout", "").splitlines():
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if event.get("type") == "text":
+                replies.append((event.get("part") or {}).get("text", ""))
+    if not any(isinstance(reply, str) and reply.strip() == delivery_id for reply in replies):
+        raise RuntimeError(f"{adapter} assistant did not reply with the expected delivery_id")
+
+
 def smoke_codex(thread_id: str) -> dict[str, Any]:
     from vanth.codex_bridge import send_message_to_thread
 
+    delivery_id = uuid.uuid4().hex[:16]
     prompt = (
         "vanth release smoke (opt-in). Reply with the delivery_id from this "
         "message exactly. Do not run tools.\n"
-        f"delivery_id: {__import__('uuid').uuid4().hex[:16]}"
+        f"delivery_id: {delivery_id}"
     )
     result = send_message_to_thread(
         thread_id, prompt, codex_command=codex_command(), timeout_seconds=int(os.environ.get("VANTH_SMOKE_TIMEOUT", "90"))
     )
-    return {"adapter": "codex", "thread_id": thread_id, "result": result}
+    assert_reply(result, delivery_id, "codex")
+    return {"delivery_id": delivery_id, "adapter": "codex", "thread_id": thread_id, "result": result}
 
 
 def smoke_opencode(session_id: str) -> dict[str, Any]:
     from vanth.opencode_bridge import send_message_to_session
 
+    delivery_id = uuid.uuid4().hex[:16]
     prompt = (
         "vanth release smoke (opt-in). Reply with the delivery_id from this "
         "message exactly. Do not run tools.\n"
-        f"delivery_id: {__import__('uuid').uuid4().hex[:16]}"
+        f"delivery_id: {delivery_id}"
     )
     result = send_message_to_session(
         session_id,
@@ -88,7 +111,8 @@ def smoke_opencode(session_id: str) -> dict[str, Any]:
         opencode_command=opencode_command(),
         timeout_seconds=int(os.environ.get("VANTH_SMOKE_TIMEOUT", "90")),
     )
-    return {"adapter": "opencode", "session_id": session_id, "result": result}
+    assert_reply(result, delivery_id, "opencode")
+    return {"delivery_id": delivery_id, "adapter": "opencode", "session_id": session_id, "result": result}
 
 
 def main() -> int:

@@ -446,7 +446,7 @@ def test_cli_per_command_help_does_not_report_unknown_option(daemon):
         assert f"usage: vanth {command}" in result.stdout
 
     root_help = run_cli(tmp_path / "state", "--help", port=port)
-    assert "api            list loopback HTTP routes" in root_help.stdout
+    assert "api" in root_help.stdout and "loopback HTTP" in root_help.stdout
 
 
 def test_remote_tail_route_validates_and_reaches_the_remote(daemon):

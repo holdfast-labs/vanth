@@ -12,6 +12,58 @@ from pathlib import Path
 from .server import JobManager, now_iso
 
 
+def _contain_windows_runner() -> int:
+    """Keep this runner and its descendants in a kill-on-close Windows Job.
+
+    Join before spawning, so even immediately exiting children inherit membership.
+    The non-inheritable handle intentionally lives until OS process teardown, after
+    terminal persistence; closing it earlier would terminate this runner too.
+    Nested jobs work on supported Windows versions (Windows 8 / Server 2012+).
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class BasicLimits(ctypes.Structure):
+        _fields_ = [("process_time", ctypes.c_longlong), ("job_time", ctypes.c_longlong),
+                    ("flags", wintypes.DWORD), ("minimum_working_set", ctypes.c_size_t),
+                    ("maximum_working_set", ctypes.c_size_t), ("active_processes", wintypes.DWORD),
+                    ("affinity", ctypes.c_size_t), ("priority", wintypes.DWORD),
+                    ("scheduling", wintypes.DWORD)]
+
+    class Limits(ctypes.Structure):
+        _fields_ = [("basic", BasicLimits), ("io", ctypes.c_ulonglong * 6),
+                    ("process_memory", ctypes.c_size_t), ("job_memory", ctypes.c_size_t),
+                    ("peak_process_memory", ctypes.c_size_t), ("peak_job_memory", ctypes.c_size_t)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+    kernel.SetInformationJobObject.restype = wintypes.BOOL
+    kernel.GetCurrentProcess.argtypes = []
+    kernel.GetCurrentProcess.restype = wintypes.HANDLE
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+    handle = kernel.CreateJobObjectW(None, None)
+    if not handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    limits = Limits()
+    # Ordinary workloads inherit containment; explicit detached Vanth runners use
+    # CREATE_BREAKAWAY_FROM_JOB so their durable jobs survive this runner's exit.
+    limits.basic.flags = 0x2000 | 0x0800  # KILL_ON_JOB_CLOSE | BREAKAWAY_OK
+    if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+        error = ctypes.get_last_error()
+        kernel.CloseHandle(handle)
+        raise ctypes.WinError(error)
+    if not kernel.AssignProcessToJobObject(handle, kernel.GetCurrentProcess()):
+        error = ctypes.get_last_error()
+        kernel.CloseHandle(handle)
+        raise ctypes.WinError(error)
+    return handle
+
+
 def _fail_start(manager: JobManager, job_id: str, exc: Exception, claim_token: str | None = None) -> int:
     message = f"Job runner failed to start: {exc}"
     try:
@@ -22,8 +74,8 @@ def _fail_start(manager: JobManager, job_id: str, exc: Exception, claim_token: s
         # claim that fails to start preserves its budgeted retry intent (review
         # rc33 P1-6): the pending deadline is restored so restart policy still
         # relaunches after the backoff.
-        if manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token):
-            manager._emit(job_id, "failed", message=message, data={"error": str(exc)}, level="error", source="runner")
+        if manager._terminal_event(job_id, "failed", 1, claim_token=claim_token,
+                                   message=message, data={"error": str(exc)}, level="error", source="runner"):
             manager._restore_pending_restart_after(job_id, claim_token)
     finally:
         manager.close()
@@ -88,7 +140,8 @@ def _abort_workload(
         # Record the failed publish if we still own the claim. If recovery
         # already moved the row to a terminal state, this is a guarded no-op.
         # Preserve any budgeted restart intent (review rc33 P1-6).
-        if manager._transition_terminal(job_id, "failed", 1, claim_token=claim_token):
+        if manager._terminal_event(job_id, "failed", 1, claim_token=claim_token,
+                                   message="Workload launch could not be published", level="error", source="runner"):
             manager._restore_pending_restart_after(job_id, claim_token)
     if spec_name:
         try:
@@ -176,7 +229,7 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
         ]
         creationflags = 0
         if sys.platform == "win32":
-            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
+            creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
         proc = subprocess.Popen(
             spec["command"],
             cwd=spec.get("cwd"),
@@ -270,6 +323,7 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
         )
         feeder_thread.start()
     timeout_seconds = spec.get("timeout_seconds")
+    deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     try:
         exit_code = proc.wait(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
@@ -278,24 +332,22 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
             feeder_thread.join(timeout=1)
         manager._kill_process(proc, force=True)
         exit_code = proc.wait()
-        manager._readers_done(job_id)
+        manager._readers_done(job_id, timeout=1)
         manager._finish(job_id, "timeout", exit_code, claim_token=claim_token)
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=1)
         manager.close()
         return exit_code
-    if proc.stdin is not None:
-        try:
-            proc.stdin.close()
-        except (BrokenPipeError, OSError):
-            pass
     feeder_stop.set()
     if feeder_thread:
         feeder_thread.join(timeout=1)
     status = manager._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))["status"]
     if status != "cancelled":
-        manager._readers_done(job_id)
-        manager._finish(job_id, "completed" if exit_code == 0 else "failed", exit_code, claim_token=claim_token)
+        drained = manager._readers_done(job_id, timeout=max(0, deadline - time.monotonic()) if deadline else 30)
+        status = "timeout" if not drained and deadline else (
+            "completed" if exit_code == 0 and job_id not in manager._capture_failed else "failed"
+        )
+        manager._finish(job_id, status, exit_code, claim_token=claim_token)
     heartbeat_stop.set()
     heartbeat_thread.join(timeout=1)
     manager.close()
@@ -303,6 +355,18 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
 
 
 def main() -> None:
+    if sys.platform == "win32":
+        try:
+            _contain_windows_runner()
+        except OSError as exc:
+            manager = JobManager(sys.argv[1], recover=False)
+            claim = None
+            try:
+                name = sys.argv[3] if len(sys.argv) > 3 else f"{sys.argv[2]}.json"
+                claim = json.loads((manager.specs_dir / name).read_text(encoding="utf-8")).get("claim_token")
+            except (OSError, ValueError):
+                pass
+            raise SystemExit(_fail_start(manager, sys.argv[2], exc, claim))
     raise SystemExit(run(sys.argv[1], sys.argv[2], sys.argv[3] if len(sys.argv) > 3 else None))
 
 

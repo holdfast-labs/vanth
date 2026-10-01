@@ -93,6 +93,9 @@ class _RecordingVanth:
         _RecordingVanth.captured = {"path": path, **payload}
         return {"result": "ok", "job_id": "job_1", "status": "running"}
 
+    def confirm_local_start(self, result):
+        return result
+
 
 def test_start_passes_the_extended_flags(monkeypatch, capsys):
     """`job_start` accepts priority/pool/tags/notes/secret_env/trigger/policy;
@@ -257,3 +260,11 @@ def test_start_reads_trigger_json_from_stdin(monkeypatch, capsys):
     rc = cli.main(["start", "--trigger", "-", "--", "echo", "hi"])
     assert rc == 0, capsys.readouterr().err
     assert _RecordingVanth.captured["trigger"] == {"job_id": "job_x", "status": "completed"}
+
+
+def test_exact_old_job_does_not_depend_on_recent_list():
+    class OldClient:
+        def get(self, path, params=None):
+            assert path == "/jobs/job_old/status"
+            return {"job_id": "job_old", "status": "completed"}
+    assert cli._resolve_job_id(OldClient(), "job_old") == ("job_old", "")

@@ -96,6 +96,49 @@ def test_status_down_when_no_daemon(tmp_path):
     assert "DOWN" in result.stdout
 
 
+def test_rerun_cli_posts_only_requested_overrides(monkeypatch, tmp_path, capsys):
+    source_id = "job_abc123456789"
+    response = {"job_id": "job_new987654321", "status": "queued"}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            self.posted = None
+
+        def ensure(self):
+            pass
+
+        def get(self, path, params=None):
+            assert path == "/jobs"
+            return {"jobs": [{"job_id": source_id}]}
+
+        def confirm_local_start(self, result):
+            return result
+
+        def post(self, path, payload):
+            self.posted = (path, payload)
+            return response
+
+    client = FakeClient()
+    monkeypatch.setattr(cli, "VanthClient", lambda **kwargs: client)
+    assert cli.cmd_rerun(
+        ["job_abc", "--name", "retry", "--env", "MODE=fast", "--env", "EMPTY=", "--tag", "again", "--timeout", "45"],
+        tmp_path,
+        json_out=True,
+    ) == 0
+    assert client.posted == (
+        f"/jobs/{source_id}/rerun",
+        {"name": "retry", "timeout_seconds": 45, "env": {"MODE": "fast", "EMPTY": ""}, "tags": ["again"]},
+    )
+    assert json.loads(capsys.readouterr().out) == response
+
+
+def test_rerun_cli_validates_override_arguments(tmp_path, capsys):
+    assert cli.cmd_rerun([], tmp_path) == 2
+    assert "missing job id" in capsys.readouterr().err
+    assert cli.cmd_rerun(["job_abc", "--timeout", "0"], tmp_path) == 2
+    assert "--timeout must be >= 1" in capsys.readouterr().err
+
+
 def test_doctor_ok(daemon):
     tmp_path, _, port = daemon
     result = run_cli(tmp_path / "state", "doctor", port=port)

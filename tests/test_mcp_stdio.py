@@ -82,6 +82,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                             },
                         )
                     )
+                    assert start["startup_confirmed"] is True
                     progress = content(
                         await session.call_tool(
                             "job_wait",
@@ -122,6 +123,47 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                     assert view["jobs"][0]["job_id"] == start["job_id"]
                     assert "jobs" in doctor["tables"]
                     assert "AGENT_EVENT" in tail["content"]
+
+                    # A short job can be launched, awaited, and diagnosed in one call.
+                    quick = content(await session.call_tool(
+                        "job_start_and_wait",
+                        {"command": shellcmd.join([sys.executable, "-c", "print('done')"]),
+                         "wait_timeout_seconds": 5},
+                        read_timeout_seconds=timedelta(seconds=10),
+                    ))
+                    assert quick["status"] == "completed"
+                    assert quick["wait"]["result"] == "event"
+                    assert quick["summary"]["exit_code"] == 0
+
+                    failure = content(await session.call_tool(
+                        "job_start_and_wait",
+                        {"command": shellcmd.join([sys.executable, "-c",
+                                                   "import sys; sys.stderr.write('E'*2100 + ' final marker'); sys.exit(7)"]),
+                         "wait_timeout_seconds": 5},
+                        read_timeout_seconds=timedelta(seconds=10),
+                    ))
+                    assert failure["status"] == "failed"
+                    assert failure["summary"]["exit_code"] == 7
+                    assert failure["summary"]["stderr_excerpt"].endswith("final marker")
+                    assert len(failure["summary"]["stderr_excerpt"].encode()) <= 2048
+                    plain_summary = content(await session.call_tool(
+                        "job_run_summary", {"job_id": failure["job_id"]},
+                    ))
+                    assert "stderr_excerpt" not in plain_summary
+                    verbose_summary = content(await session.call_tool(
+                        "job_run_summary", {"job_id": failure["job_id"], "include_stderr_excerpt": True},
+                    ))
+                    assert verbose_summary["stderr_excerpt"].endswith("final marker")
+
+                    waiting = content(await session.call_tool(
+                        "job_start_and_wait",
+                        {"command": shellcmd.join([sys.executable, "-c", "import time; time.sleep(5)"]),
+                         "wait_timeout_seconds": 1},
+                        read_timeout_seconds=timedelta(seconds=10),
+                    ))
+                    assert waiting["wait"]["result"] == "timeout"
+                    assert waiting["status"] in {"running", "launching"}
+                    assert waiting["job_id"]
         finally:
             daemon.terminate()
             daemon.wait(timeout=5)

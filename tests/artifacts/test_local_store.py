@@ -124,3 +124,81 @@ def test_ownership_marker_written_and_mismatch_refused(home, tmp_path):
 
 def test_default_store_root_under_home(home):
     assert default_store_root(home) == home / "artifacts-store"
+
+
+def test_republish_repairs_corrupt_blob_atomically(store, monkeypatch):
+    import os
+
+    data = b"valid reusable content"
+    sha = hashlib.sha256(data).hexdigest()
+    store.publish_staged(store.stage(data), sha)
+    target = store.blob_path(sha)
+    target.write_bytes(b"corrupt")
+    staged = store.stage(data)
+    original = os.replace
+
+    def check_atomic(source, destination):
+        assert target.read_bytes() == b"corrupt"
+        assert Path(source).read_bytes() == data
+        return original(source, destination)
+
+    monkeypatch.setattr(os, "replace", check_atomic)
+    store.publish_staged(staged, sha)
+    assert store.verify_blob(sha)
+    assert not staged.exists()
+
+
+def test_failed_blob_repair_retains_staged_bytes(store, monkeypatch):
+    import os
+
+    data = b"valid retry content"
+    sha = hashlib.sha256(data).hexdigest()
+    store.publish_staged(store.stage(data), sha)
+    target = store.blob_path(sha)
+    target.write_bytes(b"corrupt")
+    staged = store.stage(data)
+
+    def fail_replace(*args, **kwargs):
+        raise OSError("injected publication failure")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(OSError, match="injected"):
+        store.publish_staged(staged, sha)
+    assert staged.read_bytes() == data
+    assert target.read_bytes() == b"corrupt"
+
+
+def test_gc_fence_never_steals_aged_live_holder(store):
+    import os
+    import time
+
+    path = store.root / ".vanth-gc-fence.lock"
+    with LocalBlobStore._Fence(path):
+        os.utime(path, (time.time() - 10000,) * 2)
+        with pytest.raises(TimeoutError):
+            with LocalBlobStore._Fence(path, timeout=0.01, stale_seconds=0):
+                pytest.fail("live holder must retain exclusion regardless of age")
+    # The lock inode remains stable, and a successor owns it after release.
+    assert path.exists()
+    with LocalBlobStore._Fence(path, timeout=0.01):
+        with pytest.raises(TimeoutError):
+            with LocalBlobStore._Fence(path, timeout=0.01):
+                pytest.fail("second holder must not bypass successor")
+
+
+def test_gc_fence_is_released_when_holder_process_crashes(store):
+    import subprocess
+    import sys
+
+    path = store.root / ".vanth-gc-fence.lock"
+    code = (
+        "import os,sys; from pathlib import Path; "
+        "from vanth.artifacts.local_store import LocalBlobStore; "
+        "fence=LocalBlobStore._Fence(Path(sys.argv[1])); "
+        "fence.__enter__(); os._exit(17)"
+    )
+    child = subprocess.run([sys.executable, "-c", code, str(path)], capture_output=True, timeout=15)
+    assert child.returncode == 17, child.stderr.decode(errors="replace")
+    assert path.exists()
+    with LocalBlobStore._Fence(path, timeout=0.1):
+        pass

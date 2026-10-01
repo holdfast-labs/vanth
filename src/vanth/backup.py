@@ -18,10 +18,12 @@ import shutil
 import sqlite3
 import tempfile
 import zipfile
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .migrations import LATEST_SCHEMA_VERSION
+from .process_watch import process_alive
 
 BACKUP_FORMAT = "vanth-backup/1"
 _SQLITE_FILES = ("jobs.sqlite", "artifacts.sqlite", "remote.sqlite")
@@ -38,12 +40,22 @@ def _max_member_bytes() -> int:
         return _DEFAULT_MAX_MEMBER_BYTES
 
 
-def _sha256_file(path: Path) -> str:
+def _archive_file(archive: zipfile.ZipFile, source: Path, name: str) -> dict[str, object]:
     digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+    size = 0
+    with source.open("rb") as handle, archive.open(name, "w", force_zip64=True) as member:
+        # Bound a live append-only stream to its size at open; producers must
+        # not keep the backup chasing a moving EOF forever.
+        remaining = os.fstat(handle.fileno()).st_size
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            member.write(chunk)
             digest.update(chunk)
-    return digest.hexdigest()
+            size += len(chunk)
+            remaining -= len(chunk)
+    return {"path": name, "sha256": digest.hexdigest(), "size": size}
 
 
 def _snapshot_sqlite(source: Path, destination: Path) -> None:
@@ -75,7 +87,16 @@ def create_backup(home: str | Path, *, out: str | Path | None = None, include_lo
     skip = {temporary.resolve(), destination.resolve(), (home / "backups").resolve()}
     files: list[dict[str, object]] = []
 
-    with tempfile.TemporaryDirectory(prefix="vanth-backup-") as staging, zipfile.ZipFile(
+    # Freeze artifact publication/physical GC across catalog snapshot and
+    # blob copying. Reuse the existing store fence without claiming ownership
+    # or creating an unused artifact store.
+    artifact_root = home / _ARTIFACT_TREE
+    fence = nullcontext()
+    if artifact_root.is_dir():
+        from .artifacts.local_store import LocalBlobStore
+
+        fence = LocalBlobStore._Fence(artifact_root / ".vanth-gc-fence.lock")
+    with fence, tempfile.TemporaryDirectory(prefix="vanth-backup-") as staging, zipfile.ZipFile(
         temporary, "w", zipfile.ZIP_DEFLATED
     ) as archive:
         staging_path = Path(staging)
@@ -85,8 +106,7 @@ def create_backup(home: str | Path, *, out: str | Path | None = None, include_lo
                 continue
             snapshot = staging_path / name
             _snapshot_sqlite(source, snapshot)
-            archive.write(snapshot, name)
-            files.append({"path": name, "sha256": _sha256_file(snapshot), "size": snapshot.stat().st_size})
+            files.append(_archive_file(archive, snapshot, name))
             snapshot.unlink()
 
         for tree in (*_TREE_DIRS, _ARTIFACT_TREE):
@@ -101,8 +121,7 @@ def create_backup(home: str | Path, *, out: str | Path | None = None, include_lo
                     continue
                 if path.resolve() in skip:
                     continue
-                archive.write(path, relative.as_posix())
-                files.append({"path": relative.as_posix(), "sha256": _sha256_file(path), "size": path.stat().st_size})
+                files.append(_archive_file(archive, path, relative.as_posix()))
 
         if include_logs:
             root = home / "logs"
@@ -110,8 +129,8 @@ def create_backup(home: str | Path, *, out: str | Path | None = None, include_lo
                 for path in sorted(root.rglob("*")):
                     if path.is_file():
                         relative = path.relative_to(home)
-                        archive.write(path, relative.as_posix())
-                        files.append({"path": relative.as_posix(), "sha256": _sha256_file(path), "size": path.stat().st_size})
+                        if path.resolve() not in skip:
+                            files.append(_archive_file(archive, path, relative.as_posix()))
 
         manifest = {
             "format": BACKUP_FORMAT,
@@ -156,16 +175,40 @@ def restore_backup(home: str | Path, archive: str | Path, *, force: bool = False
     if not archive.is_file():
         raise ValueError(f"backup archive not found: {archive}")
 
-    if not force:
-        # Use the REAL home lock (not daemon.json existence): a live daemon holds
-        # it, so acquire failing means "running". Force bypasses for recovery.
-        from .daemon import DaemonLock
+    from .daemon import DaemonLock
 
-        lock = DaemonLock(home / "daemon.lock")
-        if not lock.acquire():
-            raise ValueError("daemon appears to be running (home lock held); stop it first, or pass force=True")
+    lock = DaemonLock(home / "daemon.lock")
+    if not lock.acquire():
+        raise ValueError("daemon appears to be running (home lock held); stop it first (force cannot bypass a live daemon)")
+    try:
+        _refuse_live_jobs(home)
+        return _restore_locked(home, archive, force=force)
+    finally:
         lock.release()
 
+
+def _refuse_live_jobs(home: Path) -> None:
+    """Detached runners survive daemon shutdown; inspect without opening a manager."""
+    database = home / "jobs.sqlite"
+    if not database.is_file():
+        return
+    connection = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
+        pids = [name for name in ("worker_pid", "pid") if name in columns]
+        if not pids:
+            return  # Legacy/marker databases may have no jobs table or PID fields.
+        identity = "job_id" if "job_id" in columns else "rowid"
+        where = " WHERE status IN ('running','launching','orphaned')" if "status" in columns else ""
+        for row in connection.execute(f"SELECT {identity}, {','.join(pids)} FROM jobs{where}"):
+            for pid in row[1:]:
+                if pid and process_alive(int(pid)):
+                    raise ValueError(f"job {row[0]} still has a live runner/workload (PID {pid}); stop jobs before restore")
+    finally:
+        connection.close()
+
+
+def _restore_locked(home: Path, archive: Path, *, force: bool) -> dict[str, object]:
     with zipfile.ZipFile(archive) as bundle:
         try:
             manifest = json.loads(bundle.read("manifest.json"))
@@ -190,10 +233,7 @@ def restore_backup(home: str | Path, archive: str | Path, *, force: bool = False
 
     # Snapshot current state so a restore is itself reversible.
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    try:
-        create_backup(home, out=home / "backups" / f"pre-restore-{timestamp}.zip")
-    except Exception:
-        pass
+    create_backup(home, out=home / "backups" / f"pre-restore-{timestamp}.zip")
 
     home.mkdir(parents=True, exist_ok=True)
     # Drop the managed trees the archive repopulates so stale files cannot
@@ -209,6 +249,11 @@ def restore_backup(home: str | Path, archive: str | Path, *, force: bool = False
             temporary = target.with_name(target.name + ".restore-tmp")
             with bundle.open(name) as source, temporary.open("wb") as destination_handle:
                 shutil.copyfileobj(source, destination_handle)
+            # No daemon may start until restore releases the home lock. Old
+            # WAL pages must never replay over the restored database.
+            if name in _SQLITE_FILES:
+                for suffix in ("-wal", "-shm"):
+                    target.with_name(target.name + suffix).unlink(missing_ok=True)
             os.replace(temporary, target)  # atomic per file
             restored += 1
     return {"result": "ok", "archive": str(archive), "files_restored": restored, "schema_version": schema}

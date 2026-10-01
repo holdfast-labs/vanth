@@ -120,6 +120,9 @@ def test_mcp_job_start_wake_me_payload(monkeypatch):
             captured["payload"] = payload
             return {"job_id": "job_x", "status": "running"}
 
+        def confirm_local_start(self, result):
+            return result
+
     monkeypatch.setattr(server_mod, "get_client", lambda: FakeClient())
     server_mod.job_start(command="echo hi", wake_me=True)
     assert captured["path"] == "/jobs"

@@ -24,9 +24,15 @@ core job tools for the usual start, wait, inspect, and recover loop; the rest
 are optional surfaces for delivery management, scheduling, metrics, artifacts,
 and remote execution.
 
+MCP is Vanth's full agent surface. The CLI covers core job operations and
+administration, with counterparts called out below where available; those
+commands may have different arguments or output from the MCP tools. Advanced
+delivery management, scheduling, metrics, and versioned artifact workflows are
+MCP-first and do not all have CLI counterparts.
+
 | Need | Tools | Reference |
 |---|---|---|
-| Start and control work | `job_start`, `job_rerun`, `job_send`, `job_stop`, `job_pause`, `job_resume` | [Start](#job_start), [rerun](#job_rerun), [interactive stdin](#job_send), [stop](#job_stop) |
+| Start and control work | `job_start`, `job_start_and_wait`, `job_rerun`, `job_send`, `job_stop`, `job_pause`, `job_resume` | [Start](#job_start), [bounded start and wait](#job_start_and_wait), [rerun](#job_rerun), [interactive stdin](#job_send), [stop](#job_stop) |
 | Wait and inspect | `job_wait`, `job_status`, `job_status_batch`, `job_list`, `job_view`, `job_tail`, `job_events`, `job_run_summary`, `job_diff` | [status](#job_status), [list](#job_list), [events](#job_events), [wait](#job_wait), [summary](#job_run_summary) |
 | Wake a session | `job_add_wake_target`, `job_wake_now`; `daemon_wake` is a deprecated alias | [Wake targets](#job_add_wake_target) |
 | Diagnose deliveries | `job_deliveries`, `job_mark_delivery`, `job_retry_delivery`, `job_delivery_attempts`, `job_clear_deliveries` | [Delivery tools](#job_deliveries) |
@@ -95,9 +101,11 @@ credentials in prompts or logs. Remote push/pull use the paired-host broker and
 require an `idempotency_key` for safe retries.
 
 `job_wait` can return current progress, and `job_tail` can follow output; these
-options are documented in their sections. Wake tools also have Python
-counterparts, but the MCP names are the external names shown above. The
-implementation adapters named `mcp_*` are not exposed to agents.
+options are documented in their sections. Where a CLI counterpart is listed,
+it provides the corresponding core operation, not necessarily the same
+parameter or response contract. Wake tools also have Python counterparts, but
+the MCP names are the external names shown above. The implementation adapters
+named `mcp_*` are not exposed to agents.
 
 ---
 
@@ -124,6 +132,27 @@ client or daemon restarts.
 | `interactive` | `bool` | `false` | Open stdin for `job_send` |
 | `trigger` | `object?` | `None` | DAG gate `{"job_id": A, "status": "completed"}` and/or readiness `probe` (see below) |
 | `secret_env` | `string[]?` | `None` | Env var NAMES whose values are masked (`***`) in captured logs/events (local jobs) |
+| `idempotency_key` | `string?` | `None` | Optional durable local retry key (8..128 letters/digits/underscore/hyphen); identical retries recover the original job, changed settings are rejected |
+| `dry_run` | `bool` | `False` | Validate and return a local start preview without creating a job or executing the command |
+
+CLI equivalents: `vanth start --idempotency-key KEY -- <command>` and
+`vanth start --dry-run -- <command>`. CLI and MCP default to the caller's working
+directory. Explicit directories expand `~` and resolve to absolute paths.
+Retry keys survive daemon restarts and job cleanup; a key belonging to a cleaned
+job is rejected instead of launching duplicate work. Use a new key for new work.
+
+`job_start_and_wait` accepts the same local retry key and returns bounded
+`stdout_excerpt` (8 KiB) and `stderr_excerpt` (2 KiB) in its summary. Optional
+excerpt flags are also available on `job_run_summary`. Failures in status and summaries include
+`failure_reason` and `recommended_next_action`; direct local reruns use the same
+startup confirmation as starts.
+
+`job_doctor(verify_artifacts=True)` / `vanth doctor --verify-artifacts` distinguish
+missing and corrupt blobs. The scan is bounded to 100 recent versions, 1,000
+blobs, 16 MiB of manifests (1 MiB each), 64 MiB of blob content, and three seconds;
+`artifact_integrity.complete=false` means a partial scan.
+Persisted pipe-drain, capture-failure, and contention diagnostics are returned
+with job IDs. Historical capture/contention warnings are advisory.
 
 **Response**
 
@@ -132,6 +161,7 @@ client or daemon restarts.
   "job_id": "job_abc123",
   "status": "running",
   "worker_pid": 4242,
+  "startup_confirmed": true,
   "stdout_path": "C:/Users/you/.vanth/logs/job_abc123.stdout.log",
   "stderr_path": "C:/Users/you/.vanth/logs/job_abc123.stderr.log",
   "events_path": "C:/Users/you/.vanth/events/job_abc123.jsonl",
@@ -139,9 +169,21 @@ client or daemon restarts.
 }
 ```
 
-CLI counterparts: `vanth start --wake-me -- <command>` (or
+For a direct local job, `job_start` waits up to three seconds for the runner's
+`started` event before returning. `startup_confirmed=true` means the workload
+process was spawned; it does not mean the command succeeded. If confirmation
+does not arrive in that bound, the job remains tracked and the response returns
+`startup_confirmed=false` with its `job_id`; use `job_status` or `job_wait` to
+follow it. A queued job returns `queued` immediately because its gates may take
+arbitrarily long. Remote starts return the remote submission response without
+local startup confirmation.
+
+CLI core counterpart: `vanth start --wake-me -- <command>` (or
 `--wake-me=completed,failed,checkpoint` to override events) and
 `vanth sleep <seconds>` for a trivial sleep job.
+
+`vanth start` covers the core local start workflow; MCP also exposes optional
+job fields and agent integrations documented above.
 
 When wake targets are supplied (including `wake_me`), the response also carries
 `wake_targets` (each resolved target with its `session_id`/`thread_id`) and
@@ -186,6 +228,53 @@ dispatcher pass. Timeout cancellation is attributed on the `cancelled` event
 
 ---
 
+## `job_start_and_wait`
+
+Start a short local job, wait for its result for a bounded time, and return a
+run summary in the same MCP call. It accepts the applicable core `job_start`
+options; it does not support remote execution, wake targets, interactive stdin,
+or triggers.
+
+**Parameters**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `command` | `string` | required | Shell command to run locally |
+| `cwd` | `string?` | `None` | Working directory |
+| `name` | `string?` | `None` | Human-readable label |
+| `env` | `map<string,string>?` | `{}` | Extra environment |
+| `timeout_seconds` | `int?` | `None` | Job runtime limit; `None` = no runtime timeout |
+| `wait_timeout_seconds` | `int` | `20` | Bounded wait duration, 1–300 seconds |
+| `tags` | `string[]?` | `None` | Arbitrary labels, filterable in `job_list` |
+| `notes` | `string?` | `None` | Free-form annotation shown in the monitor |
+| `secret_env` | `string[]?` | `None` | Env var names whose values are masked in captured logs/events |
+
+**Response**
+
+Returns `job_id` and the current `status`, plus `wait` and `summary`:
+
+```json
+{
+  "job_id": "job_abc123",
+  "status": "completed",
+  "wait": { "result": "event", "event": { "type": "completed", "...": "..." } },
+  "summary": { "job_id": "job_abc123", "status": "completed", "stderr_excerpt": "..." }
+}
+```
+
+The summary includes `stderr_excerpt`, capped at 2048 bytes. If the bounded
+wait expires, the response reports the timeout and the job continues running;
+use the returned `job_id` with `job_wait` or `job_status` to continue. Set the
+MCP client's own tool-call timeout longer than `wait_timeout_seconds` so the
+client does not cancel the call first.
+
+Use this tool for short local commands whose result is useful immediately. For
+long-running work, use `job_start` with `wake_me` or `wake_targets` so a wake
+can resume the session. Use `job_start` plus `job_wait` when you need to handle
+progress or checkpoint events while the job runs.
+
+---
+
 ## `job_rerun`
 
 Re-launch a job with its **original** command, cwd, env, timeout, name, tags,
@@ -209,6 +298,9 @@ overridden on the re-run; omitted parameters reuse the original job's values.
 **Response**
 
 Same shape as `job_start` (new `job_id`). Errors if `job_id` is unknown.
+
+CLI counterpart: `vanth rerun <job_id> [options]` reuses the saved configuration
+and supports selected overrides; MCP exposes the fields listed above.
 
 ---
 
@@ -298,6 +390,11 @@ Feed stdin to a running interactive job. Start the job with
 ```
 
 Errors for unknown / not-running / non-interactive jobs.
+
+CLI counterpart: `vanth send <job_id> [--line] [--eof] [<text|->]` sends raw
+input by default, appends a newline with `--line`, and reads stdin when the text
+argument is `-`. `--eof` closes stdin after sending; text may be omitted when
+closing stdin.
 
 ---
 
@@ -460,6 +557,44 @@ Attempt/lease history for one delivery.
 
 `reclaimed: true` means the lease expired and the delivery was re-claimed after
 a daemon crash ambiguity.
+
+---
+
+## `job_clear_deliveries`
+
+Preview or drain matching wake deliveries when stale notifications have built
+up. This MCP tool has no CLI counterpart; the HTTP endpoint is
+`POST /deliveries/clear`.
+
+**Parameters**
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `job_id` | `string?` | `None` | Restrict to one job |
+| `status` | `string?` | `None` | `pending`, `retrying`, `dispatching`, `delivered`, or `failed`; omitted means only `pending` and `retrying` |
+| `older_than_seconds` | `int?` | `None` | Restrict to deliveries created before this age; must be non-negative |
+| `stale_only` | `bool` | `false` | Restrict to deliveries whose source event belongs to a terminal job |
+| `limit` | `int` | `1000` | Maximum rows to drain; 1–10000 |
+| `dry_run` | `bool` | `true` | Preview the match count without changing deliveries |
+
+All filters combine. Review the queue with `job_deliveries` before draining.
+`matched` is the total count that passes the filters; `drained` is capped by
+`limit`. With `dry_run=true`, the response reports `matched` and `drained: 0`. With
+`dry_run=false`, at most `limit` matching deliveries are marked `failed` so the
+queue no longer retries them automatically, with their retry/claim state
+cleared. Any active attempt for a drained `dispatching` delivery is finalized as
+failed. The response includes the number drained and up to
+25 affected delivery IDs. Settled `delivered` or `failed` history is untouched
+unless that status is explicitly selected.
+
+**Response**
+
+```json
+{ "matched": 8, "drained": 0, "dry_run": true }
+```
+
+After a non-dry-run drain, the response also includes `ids` (up to 25 IDs) and
+`dry_run: false`.
 
 ---
 
@@ -848,6 +983,7 @@ One-call "did it work?" — status, runtime, progress, metric overview, artifact
 | Param | Type | Default | Notes |
 |---|---|---|---|
 | `job_id` | `string` | required | Job to summarize |
+| `include_stderr_excerpt` | `bool` | `false` | Add `stderr_excerpt`, capped at 2048 bytes; omitted by default |
 
 **Response**
 
@@ -860,9 +996,13 @@ One-call "did it work?" — status, runtime, progress, metric overview, artifact
   "metrics": [ { "metric": "loss", "latest": 0.1, "first": 0.9,
                  "min": 0.1, "max": 0.9, "count": 10, "stage": "train" } ],
   "latest_metrics": {"loss": 0.1},
+  "stderr_excerpt": "...",
   "artifacts": [ { "artifact_id": "art_...", "name": "best.pt", "uri": "file:///...", "..." } ]
 }
 ```
+
+`stderr_excerpt` is present only when `include_stderr_excerpt=true` and contains
+at most the last 2048 bytes of captured stderr.
 
 ---
 
@@ -968,10 +1108,10 @@ job) plus the job list — the same data the Go terminal monitor charts.
 
 ## Remote execution
 
-Jobs can run on a paired remote host. Discover hosts with `remote_list` (or
-`vanth remote list`); pairing is interactive and lives in the CLI
-(`vanth remote pair user@host`). Pass the returned `remote_id` to the tool that
-acts on that host:
+Jobs can run on a paired remote host. Discover hosts with `remote_list` (the
+CLI also has `vanth remote list`); pairing and host administration are CLI
+operations (`vanth remote pair user@host`). Pass the returned `remote_id` to
+the MCP tool that acts on that host:
 
 | Tool | Remote behaviour |
 |---|---|

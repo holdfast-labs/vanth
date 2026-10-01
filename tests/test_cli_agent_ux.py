@@ -16,6 +16,9 @@ class RecordingClient:
         RecordingClient.payload = payload
         return {"job_id": "j1", "status": "queued"}
 
+    def confirm_local_start(self, result):
+        return result
+
 
 def test_wake_me_forms(monkeypatch, tmp_path):
     monkeypatch.setattr(cli, "VanthClient", RecordingClient)

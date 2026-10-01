@@ -49,6 +49,12 @@ def _resolve_job_id(client: VanthClient, raw: str) -> tuple[str | None, str]:
     if "/" in raw or len(raw) >= 40:  # not a plausible id; let the daemon decide
         return raw, ""
     try:
+        exact = client.get(f"/jobs/{raw}/status")
+        if exact.get("job_id") == raw:
+            return raw, ""
+    except Exception:
+        pass
+    try:
         jobs = client.get("/jobs", {"limit": 1000}).get("jobs") or []
     except Exception:
         return raw, ""
@@ -295,7 +301,7 @@ def cmd_doctor(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                 for entry in result.get("failed", []):
                     print(f"  failed:      pid {entry['pid']}: {entry['error']}")
             return 0
-        report = client.get("/doctor")
+        report = client.get("/doctor", {"verify_artifacts": True}) if "--verify-artifacts" in argv else client.get("/doctor")
     except Exception as exc:
         print(f"vanth doctor: failed to reach daemon: {exc}")
         return 1
@@ -839,6 +845,7 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     with a dash (or to keep a literal ``--json``).
     """
     payload: dict[str, Any] = {}
+    dry_run = False
     env: dict[str, str] = {}
     wake: list[dict[str, Any]] = []
     wake_me_events: list[str] | None = None
@@ -865,14 +872,16 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
             wake_me_events = events
         elif arg in {
             "--name", "--cwd", "--timeout", "--env", "--wake", "--priority",
-            "--pool", "--tag", "--notes", "--secret-env", "--trigger", "--policy",
+            "--pool", "--tag", "--notes", "--secret-env", "--trigger", "--policy", "--idempotency-key",
         }:
             i += 1
             if i >= len(argv):
                 print(f"vanth start: {arg} requires a value", file=sys.stderr)
                 return 2
             value = argv[i]
-            if arg == "--name":
+            if arg == "--idempotency-key":
+                payload["idempotency_key"] = value
+            elif arg == "--name":
                 payload["name"] = value
             elif arg == "--cwd":
                 payload["cwd"] = value
@@ -920,6 +929,8 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
                     print(f"vanth start: {exc}", file=sys.stderr)
                     return 2
                 wake.append(target)
+        elif arg == "--dry-run":
+            dry_run = True
         elif arg == "--interactive":
             payload["interactive"] = True
         elif arg.startswith("--"):
@@ -966,6 +977,7 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         )
         return 2
     payload["command"] = command
+    payload.setdefault("cwd", os.getcwd())
     if env:
         payload["env"] = env
     if wake_me_events is not None:
@@ -986,7 +998,9 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     client = VanthClient(home=home)
     try:
         client.ensure()
-        result = client.post("/jobs", payload)
+        result = client.post("/jobs/preview" if dry_run else "/jobs", payload)
+        if not dry_run:
+            result = client.confirm_local_start(result)
     except Exception as exc:
         print(f"vanth start: failed to reach daemon: {exc}", file=sys.stderr)
         return 1
@@ -995,12 +1009,14 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         return 1
     for warning in result.get("warnings") or []:
         print(f"vanth start: warning: {warning}", file=sys.stderr)
-    if json_out:
+    if json_out or dry_run:
         print(json.dumps(result, indent=2, default=str))
     else:
-        print(f"started {result.get('job_id')} ({result.get('status')})")
+        status = result.get("status")
+        verb = "queued" if status == "queued" else "failed to start" if status in {"failed", "lost"} and result.get("startup_confirmed") is False else "started"
+        print(f"{verb} {result.get('job_id')} ({status})")
         print(f"  watch: vanth logs {result.get('job_id')}")
-    return 0
+    return 1 if result.get("status") in {"failed", "lost", "timeout", "cancelled", "orphaned"} else 0
 
 
 def cmd_sleep(argv: list[str], home: Path, *, json_out: bool = False) -> int:
@@ -1515,6 +1531,143 @@ def cmd_stop(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     return 0
 
 
+def cmd_rerun(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    if not argv:
+        print("vanth rerun: missing job id", file=sys.stderr)
+        return 2
+    raw_job_id = argv[0]
+    payload: dict[str, Any] = {}
+    env: dict[str, str] = {}
+    tags: list[str] = []
+    secret_env: list[str] = []
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"--command", "--cwd", "--timeout", "--env", "--name", "--tag", "--notes", "--secret-env"}:
+            i += 1
+            if i >= len(argv):
+                print(f"vanth rerun: {arg} requires a value", file=sys.stderr)
+                return 2
+            value = argv[i]
+            if arg == "--command":
+                payload["command"] = value
+            elif arg == "--cwd":
+                payload["cwd"] = value
+            elif arg == "--name":
+                payload["name"] = value
+            elif arg == "--notes":
+                payload["notes"] = value
+            elif arg == "--tag":
+                tags.append(value)
+            elif arg == "--secret-env":
+                secret_env.append(value)
+            elif arg == "--timeout":
+                try:
+                    timeout = int(value)
+                except ValueError:
+                    print(f"vanth rerun: invalid --timeout value {value!r}", file=sys.stderr)
+                    return 2
+                if timeout < 1:
+                    print("vanth rerun: --timeout must be >= 1", file=sys.stderr)
+                    return 2
+                payload["timeout_seconds"] = timeout
+            else:
+                key, sep, val = value.partition("=")
+                if not sep or not key:
+                    print(f"vanth rerun: --env expects KEY=VALUE, got {value!r}", file=sys.stderr)
+                    return 2
+                env[key] = val
+        elif arg == "--interactive":
+            payload["interactive"] = True
+        elif arg == "--no-interactive":
+            payload["interactive"] = False
+        else:
+            print(f"vanth rerun: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    if env:
+        payload["env"] = env
+    if tags:
+        payload["tags"] = tags
+    if secret_env:
+        payload["secret_env"] = secret_env
+
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+    except Exception as exc:
+        print(f"vanth rerun: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    job_id, problem = _requiring_job_id(client, raw_job_id, "rerun")
+    if problem:
+        return problem
+    try:
+        result = client.post(f"/jobs/{job_id}/rerun", payload)
+        result = client.confirm_local_start(result)
+    except Exception as exc:
+        print(f"vanth rerun: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        print(f"vanth rerun: daemon error: {result.get('error') or result}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        print(f"reran {job_id} as {result.get('job_id')} ({result.get('status')})")
+    return 1 if result.get("status") in {"failed", "lost", "timeout", "cancelled", "orphaned"} else 0
+
+
+def cmd_send(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    """Send raw input or EOF to an interactive job."""
+    if not argv:
+        print("vanth send: missing job id", file=sys.stderr)
+        return 2
+    raw_job_id, *args = argv
+    line = eof = False
+    while args and args[0] in {"--line", "--eof"}:
+        option = args.pop(0)
+        line |= option == "--line"
+        eof |= option == "--eof"
+    literal = bool(args and args[0] == "--")
+    if literal:
+        args.pop(0)
+    if args == ["-"] and not literal:
+        input_text = sys.stdin.read()
+    elif args:
+        input_text = " ".join(args)
+    elif eof:
+        input_text = ""
+    else:
+        print("vanth send: missing input (use - to read stdin)", file=sys.stderr)
+        return 2
+    if line and not input_text.endswith("\n"):
+        input_text += "\n"
+
+    client = VanthClient(home=home)
+    try:
+        client.ensure()
+    except Exception as exc:
+        print(f"vanth send: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    job_id, problem = _requiring_job_id(client, raw_job_id, "send")
+    if problem:
+        return problem
+    try:
+        result = client.post(f"/jobs/{job_id}/send", {"input": input_text, "eof": eof})
+    except Exception as exc:
+        print(f"vanth send: failed to reach daemon: {exc}", file=sys.stderr)
+        return 1
+    if not _expect_ok(result):
+        print(f"vanth send: {result.get('error') or result}", file=sys.stderr)
+        return 1
+    if json_out:
+        print(json.dumps(result, indent=2, default=str))
+    else:
+        suffix = " (stdin closed)" if eof else ""
+        print(f"vanth send: sent {result.get('sent', 0)} bytes to {job_id}{suffix}")
+    return 0
+
+
 def cmd_deliveries(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     """List wake deliveries so the `failed` counter in `vanth status` is
     actionable (which job, how many attempts, why it failed)."""
@@ -1668,6 +1821,7 @@ def cmd_wake(argv: list[str], home: Path, *, json_out: bool = False) -> int:
 
 
 _HTTP_ROUTES: tuple[tuple[str, str], ...] = (
+    ("POST", "/jobs/preview"),
     ("GET", "/health (no auth)"),
     ("GET", "/ready | /doctor | /metrics"),
     ("GET", "/jobs?status=&limit=&name=&tags="),
@@ -1686,7 +1840,7 @@ _HTTP_ROUTES: tuple[tuple[str, str], ...] = (
 
 
 def cmd_api(argv: list[str], home: Path, *, json_out: bool = False) -> int:
-    """Print the loopback HTTP surface and how to authenticate to it."""
+    """Summarize the loopback HTTP surface and how to authenticate to it."""
     if argv:
         print(f"vanth api: unknown option {argv[0]!r}", file=sys.stderr)
         return 2
@@ -1901,6 +2055,7 @@ def _usage() -> str:
         "usage: vanth <command> [options]\n"
         "\n"
         "Vanth is a local background-job daemon for AI agents (and humans).\n"
+        "The CLI covers core jobs and administration; MCP exposes the full agent surface.\n"
         "\n"
         "commands:\n"
         "  status         show daemon health, running jobs, and MCP client state\n"
@@ -1911,6 +2066,8 @@ def _usage() -> str:
         "  logs, tail     show a job's stdout/stderr output (--grep filters lines)\n"
         "  wait           block until a job emits an event (CLI job_wait)\n"
         "  diff           diff the run specs of two jobs\n"
+        "  rerun          relaunch a job with its original settings (optional overrides)\n"
+        "  send           send input or EOF to an interactive job\n"
         "  stop           stop a running job\n"
         "  sleep          start a background sleep job\n"
         "  wake           add a wake target to a job after it started (--now to fire once)\n"
@@ -1924,7 +2081,7 @@ def _usage() -> str:
         "  setup          register the MCP server in your clients' configs (one-shot)\n"
         "  autostart      enable/disable/status (daemon survives reboots)\n"
         "  version        print the installed package version\n"
-        "  api            list loopback HTTP routes and authentication details\n"
+        "  api            summarize loopback HTTP routes and authentication details\n"
         "\n"
         "  help <command> show help for one command (same as `vanth <command> --help`)\n"
         "\n"
@@ -1933,20 +2090,14 @@ def _usage() -> str:
         "  --json         machine-readable output (where supported); may precede or\n"
         "                 follow the command: `vanth --json list` == `vanth list --json`\n"
         "\n"
-        "http api (loopback only):\n"
-        "  base url       written to <VANTH_HOME>/daemon.json as `url`\n"
-        "  auth           `Authorization: Bearer <token>`; token at\n"
-        "                 <VANTH_HOME>/token (`/health` is unauthenticated)\n"
-        "  routes         run `vanth api` to list them\n"
-        "\n"
         "run `vanth setup` after installing to connect your MCP clients; run\n"
         "`vanth <command> --help` for command-specific options.\n"
         "\n"
-        "mcp tools without mcp (same operations, CLI names):\n"
+        "core MCP counterparts in the CLI (MCP has more agent tools):\n"
         "  job_start   -> vanth start -- <command>      job_tail  -> vanth logs <id>\n"
         "  job_wait    -> vanth wait <id>               job_stop  -> vanth stop <id>\n"
         "  job_status  -> vanth status <id>             job_list  -> vanth list [--all]\n"
-        "  job_rerun   -> vanth start --name N -- <command>   job_view -> vanth list\n"
+        "  job_rerun   -> vanth rerun <id>             job_send  -> vanth send <id> <text>\n"
         "  job_add_wake_target / job_wake_now -> vanth wake <id> [--now]\n"
         "  full workflow: vanth sleep 30\n"
         "                 vanth wait <id>\n"
@@ -1968,7 +2119,9 @@ _COMMAND_HELP: dict[str, str] = {
               "  counterpart of the MCP `job_status`.\n"
               "  examples: vanth status            (is the daemon up?)\n"
               "            vanth status job_abc123 (how did that job go?)\n",
-    "doctor": "usage: vanth doctor [--reap-orphans] [--json]\n"
+    "doctor": "usage: vanth doctor [--verify-artifacts] [--reap-orphans] [--json]\n"
+              "  --verify-artifacts checks recent blob hashes with bounded time/bytes;\n"
+              "  see artifact_integrity.complete for checks that hit the scan limit.\n"
               "  Full health report: schema, deliveries, relay liveness, dead letters,\n"
               "  orphaned MCP servers. OK means the daemon is healthy: a non-zero\n"
               "  failed-delivery count is reported but does not by itself fail it\n"
@@ -1980,7 +2133,7 @@ _COMMAND_HELP: dict[str, str] = {
             "  finished ones instead. --thread-id is the closest equivalent of the\n"
             "  MCP `job_view`.\n"
             "  example: vanth list --all --name train --limit 10\n",
-    "start": "usage: vanth start [--name N] [--cwd DIR] [--timeout S] [--env K=V]...\n"
+    "start": "usage: vanth start [--dry-run] [--idempotency-key KEY] [--name N] [--cwd DIR] [--timeout S] [--env K=V]...\n"
              "                  [--wake JSON|@FILE|-]... [--wake-me[=EVENTS]]\n"
              "                  [--trigger JSON|@FILE|-]\n"
              "                  [--interactive] [--] <command...>\n"
@@ -2025,7 +2178,7 @@ _COMMAND_HELP: dict[str, str] = {
             "  By default, waits for any terminal outcome: completed, failed, timeout,\n"
             "  cancelled, or orphaned. Pass --events to narrow the event types.\n"
             "  example: vanth wait job_abc123 --timeout 120\n",
-     "stop": "usage: vanth stop <job-id> [--signal terminate|kill] [--kill-after SECONDS]\n"
+    "stop": "usage: vanth stop <job-id> [--signal terminate|kill] [--kill-after SECONDS]\n"
              "                  [--reason TEXT]\n"
              "  Stop a running job. terminate asks first and escalates to kill after\n"
              "  --kill-after seconds (default 10); the job ends `cancelled` (non-zero\n"
@@ -2033,6 +2186,17 @@ _COMMAND_HELP: dict[str, str] = {
              "  It returns as soon as the stop is REQUESTED, so confirm with\n"
              "  `vanth status <job-id>` (or `vanth list --all`).\n"
              "  example: vanth stop job_abc123 --signal kill && vanth status job_abc123\n",
+    "rerun": "usage: vanth rerun <job-id> [--command CMD] [--name N] [--cwd DIR]\n"
+              "                   [--timeout SECONDS] [--env K=V]... [--tag TAG]...\n"
+              "                   [--notes TEXT] [--secret-env KEY]... [--interactive|--no-interactive] [--json]\n"
+              "  Start a new job from the source job's settings, overriding only fields\n"
+              "  you pass. An unambiguous job-id prefix is accepted.\n"
+              "  example: vanth rerun job_abc123 --env MODE=retry --name second-attempt\n",
+    "send": "usage: vanth send <job-id> [--line] [--eof] [--] <text|-> [--json]\n"
+            "  Send input to a job started with --interactive. Text is sent exactly\n"
+            "  as given; --line appends a newline if missing. Use - to read stdin,\n"
+            "  or omit text with --eof to close the job's stdin.\n"
+            "  example: vanth send job_abc123 --line hello\n",
     "sleep": "usage: vanth sleep <seconds>\n"
              "  Start a background job that sleeps for a positive number of seconds.\n",
     "deliveries": "usage: vanth deliveries [--status delivered|failed|pending] [--job-id ID] [--json]\n"
@@ -2060,7 +2224,7 @@ _COMMAND_HELP: dict[str, str] = {
                  "  Artifacts attached to a job.\n",
     "diff": "usage: vanth diff <job-id> <other-job-id> [--json]\n"
             "  Compare two jobs' run specs (command/env/cwd/tags/wake targets).\n",
-    "api": "usage: vanth api [--json]\n  The loopback HTTP routes and how to authenticate.\n",
+    "api": "usage: vanth api [--json]\n  A route summary and how to authenticate to the loopback HTTP API.\n",
     "remote": "usage: vanth remote <pair|list|doctor|remove|pending|retry> [options]\n"
               "  pair <user@host> [--name N] [--allow-root]   create an SSH pairing\n"
               "  list   doctor [--remote ID]   remove <id> [--yes]\n"
@@ -2131,6 +2295,10 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_diff(argv[1:], home, json_out=json_out)
     if command == "stop":
         return cmd_stop(argv[1:], home, json_out=json_out)
+    if command == "rerun":
+        return cmd_rerun(argv[1:], home, json_out=json_out)
+    if command == "send":
+        return cmd_send(argv[1:], home, json_out=json_out)
     if command == "sleep":
         return cmd_sleep(argv[1:], home, json_out=json_out)
     if command == "deliveries":

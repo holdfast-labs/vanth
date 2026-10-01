@@ -7,7 +7,7 @@ import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 
-LATEST_SCHEMA_VERSION = 18
+LATEST_SCHEMA_VERSION = 19
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 
 
@@ -69,6 +69,7 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_events_job_seq ON events(job_id, seq);
         CREATE INDEX IF NOT EXISTS idx_events_job_type_seq ON events(job_id, type, seq);
+        CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at);
         CREATE TABLE IF NOT EXISTS wake_targets (
           target_id TEXT PRIMARY KEY, job_id TEXT NOT NULL, remote_id TEXT, type TEXT NOT NULL,
           events_json TEXT NOT NULL, config_json TEXT NOT NULL, created_at TEXT NOT NULL
@@ -135,7 +136,11 @@ def _create_latest_schema(db: sqlite3.Connection) -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_decisions_job ON decisions(job_id, created_at);
         CREATE INDEX IF NOT EXISTS idx_decisions_pending ON decisions(status, expires_at);
-        PRAGMA user_version=18;
+        CREATE TABLE IF NOT EXISTS local_start_requests (
+          idempotency_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL,
+          job_id TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        PRAGMA user_version=19;
         """
     )
 
@@ -355,6 +360,14 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
                 )
                 db.execute("PRAGMA user_version=18")
                 version = 18
+            if version < 19:
+                db.execute("CREATE INDEX IF NOT EXISTS idx_events_type_created ON events(type, created_at)")
+                db.execute(
+                    "CREATE TABLE IF NOT EXISTS local_start_requests ("
+                    "idempotency_key TEXT PRIMARY KEY, request_hash TEXT NOT NULL, "
+                    "job_id TEXT NOT NULL, created_at TEXT NOT NULL)"
+                )
+                db.execute("PRAGMA user_version=19")
             db.commit()
         except Exception:
             db.rollback()

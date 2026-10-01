@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 import os
@@ -91,8 +92,8 @@ def mask_secrets(line: bytes, secrets: list[str] | None) -> bytes:
     The ``::add-mask::`` pattern: a job names secret env vars, the runner
     resolves their values from the job's merged environment, and every value is
     scrubbed from stdout/stderr before it is written to a durable log file or
-    parsed into a structured event. Masking is line-scoped (a value split across
-    two reads would not be fully masked), which matches the convention.
+    parsed into a structured event. This helper masks a complete byte buffer;
+    the stream reader additionally retains boundary bytes between pipe reads.
     """
     if not secrets:
         return line
@@ -320,7 +321,12 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
         current = data.get("current")
         total = data.get("total")
         if "percent" not in data and isinstance(current, (int, float)) and isinstance(total, (int, float)):
-            data["percent"] = round((current / total) * 100, 2) if total else 0
+            try:
+                data["percent"] = round((current / total) * 100, 2) if total else 0
+            except OverflowError:
+                # Preserve the raw event when its derived chart value cannot
+                # be represented as a float.
+                pass
         if isinstance(data.get("percent"), (int, float)):
             data["percent"] = max(0, min(100, data["percent"]))
     return {
@@ -610,6 +616,9 @@ class JobManager:
         self.reader_threads: dict[str, list[threading.Thread]] = {}
         self.conditions: dict[str, threading.Condition] = {}
         self._log_truncated: set[tuple[str, str]] = set()
+        self._capture_failed: set[str] = set()
+        self.sqlite_contentions = 0
+        self._contention_reported: set[str] = set()
         self._metric_ingest_keys: set[str] = set()
         self._delivery_threads: set[threading.Thread] = set()
         self._delivery_threads_lock = threading.Lock()
@@ -721,17 +730,12 @@ class JobManager:
             # The guarded terminal transition is run-IDENTITY guarded (rc33
             # P1-5); it returns 0 if a newer run took ownership between the
             # revalidation above and this write.
-            if row["claim_token"]:
-                transitioned = self._transition_terminal(job_id, terminal, claim_token=row["claim_token"])
-            else:
-                transitioned = self._transition_terminal(job_id, terminal, worker_pid=row["worker_pid"])
-            if transitioned:
-                self._emit(
-                    job_id,
-                    terminal,
-                    message="Job runner was not alive during recovery",
-                    data=stop_event_data(row, default_actor="watchdog", default_reason="runner not alive during recovery"),
-                )
+            self._terminal_event(
+                job_id, terminal, claim_token=row["claim_token"],
+                worker_pid=row["worker_pid"] if not row["claim_token"] else _UNSET,
+                message="Job runner was not alive during recovery",
+                data=stop_event_data(row, default_actor="watchdog", default_reason="runner not alive during recovery"),
+            )
 
     def _reconcile_running_jobs(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_stale_after)
@@ -767,17 +771,12 @@ class JobManager:
             # It only finalizes the row if it is STILL running under OUR recorded
             # worker/token, so an old reconciliation pass can never orphan a
             # newer run.
-            if row["claim_token"]:
-                transitioned = self._transition_terminal(job_id, terminal, claim_token=row["claim_token"])
-            else:
-                transitioned = self._transition_terminal(job_id, terminal, worker_pid=row["worker_pid"])
-            if transitioned:
-                self._emit(
-                    job_id,
-                    terminal,
-                    message="Runner heartbeat is stale and the runner is not alive",
-                    data=stop_event_data(row, default_actor="watchdog", default_reason="runner heartbeat stale"),
-                )
+            self._terminal_event(
+                job_id, terminal, claim_token=row["claim_token"],
+                worker_pid=row["worker_pid"] if not row["claim_token"] else _UNSET,
+                message="Runner heartbeat is stale and the runner is not alive",
+                data=stop_event_data(row, default_actor="watchdog", default_reason="runner heartbeat stale"),
+            )
 
     def begin_shutdown(self) -> None:
         self.shutdown_requested.set()
@@ -795,6 +794,7 @@ class JobManager:
         worker_pid: int | None | object = _UNSET,
         require_launching: bool = False,
         expected_worker_pid: int | None | object = _UNSET,
+        transaction: bool = True,
     ) -> bool:
         if status not in TERMINAL_STATUSES:
             raise ValueError(f"invalid terminal status: {status}")
@@ -842,6 +842,15 @@ class JobManager:
                         f"WHERE job_id=? AND claim_token=? AND {status_guard}",
                         args,
                     ).rowcount
+                elif require_launching:
+                    guard = " AND worker_pid IS ?" if expected_worker_pid is not _UNSET else ""
+                    args = (status, exit_code, stamp, stamp, job_id)
+                    if expected_worker_pid is not _UNSET:
+                        args += (expected_worker_pid,)
+                    changed = self.db.execute(
+                        "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL "
+                        "WHERE job_id=? AND status='launching' AND claim_token IS NULL" + guard, args,
+                    ).rowcount
                 elif worker_pid is not _UNSET:
                     # No-token RUN-IDENTITY guarded transition (review rc33
                     # P1-5): only finalize a stale row if the recorded worker is
@@ -862,10 +871,11 @@ class JobManager:
                         "UPDATE jobs SET status=?, exit_code=?, ended_at=?, updated_at=?, stop_requested_at=NULL WHERE job_id=? AND status='running'",
                         (status, exit_code, stamp, stamp, job_id),
                     ).rowcount
-                self.db.commit()
+                if transaction:
+                    self.db.commit()
             return bool(changed)
 
-        return self._retry_locked(transition)
+        return self._retry_locked(transition) if transaction else transition()
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -885,6 +895,7 @@ class JobManager:
             except sqlite3.OperationalError as exc:
                 if "locked" not in str(exc).lower() or attempt == attempts - 1:
                     raise
+                self.sqlite_contentions += 1
                 time.sleep(0.02 * (attempt + 1))
         raise RuntimeError("unreachable")  # pragma: no cover
 
@@ -1457,55 +1468,26 @@ class JobManager:
                     self._probe_last_attempt.pop(job_id, None)
             for job_id, probe in to_cancel_probe:
                 reason = f"readiness probe ({probe['type']}) did not become ready within {probe['timeout_seconds']}s"
-                with self.db_lock:
-                    changed = self.db.execute(
-                        "UPDATE jobs SET status='cancelled', stop_actor='daemon', stop_reason=?, "
-                        "ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
-                        (reason, now_iso(), now_iso(), job_id),
-                    ).rowcount
-                    self.db.commit()
-                if changed:
+                if self._cancel_queued(
+                    job_id, actor="daemon", reason=reason, message=f"Queued job cancelled: {reason}",
+                    data={"actor": "daemon", "reason": reason, "probe": probe},
+                ):
                     self._probe_last_attempt.pop(job_id, None)
-                    self._emit(
-                        job_id,
-                        "cancelled",
-                        message=f"Queued job cancelled: {reason}",
-                        data={"actor": "daemon", "reason": reason, "probe": probe},
-                    )
             for job_id, parent, status in to_cancel:
-                with self.db_lock:
-                    changed = self.db.execute(
-                        "UPDATE jobs SET status='cancelled', stop_actor='daemon', "
-                        "stop_reason='trigger parent reached an incompatible terminal status', "
-                        "ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
-                        (now_iso(), now_iso(), job_id),
-                    ).rowcount
-                    self.db.commit()
-                if changed:
-                    self._emit(
-                        job_id,
-                        "cancelled",
-                        message=f"Trigger parent {parent} reached a different terminal status than {status}",
-                        data={"actor": "daemon", "reason": "trigger parent reached an incompatible terminal status",
-                              "trigger": {"job_id": parent, "status": status},
-                              "parent_status": parents.get(parent, (None, None))[0]},
-                    )
+                reason = "trigger parent reached an incompatible terminal status"
+                self._cancel_queued(
+                    job_id, actor="daemon", reason=reason,
+                    message=f"Trigger parent {parent} reached a different terminal status than {status}",
+                    data={"actor": "daemon", "reason": reason,
+                          "trigger": {"job_id": parent, "status": status},
+                          "parent_status": parents.get(parent, (None, None))[0]},
+                )
             for job_id, parent in to_cancel_orphan:
                 reason = f"trigger parent {parent} no longer exists"
-                with self.db_lock:
-                    changed = self.db.execute(
-                        "UPDATE jobs SET status='cancelled', stop_actor='daemon', stop_reason=?, "
-                        "ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
-                        (reason, now_iso(), now_iso(), job_id),
-                    ).rowcount
-                    self.db.commit()
-                if changed:
-                    self._emit(
-                        job_id,
-                        "cancelled",
-                        message=f"Queued job cancelled: {reason}",
-                        data={"actor": "daemon", "reason": reason, "trigger": {"job_id": parent}},
-                    )
+                self._cancel_queued(
+                    job_id, actor="daemon", reason=reason, message=f"Queued job cancelled: {reason}",
+                    data={"actor": "daemon", "reason": reason, "trigger": {"job_id": parent}},
+                )
         except Exception:
             self.logger.exception("queued-job dispatch failed")
 
@@ -2265,6 +2247,7 @@ class JobManager:
         message: str | None,
         mutate: Callable[[sqlite3.Connection], None] | None = None,
         exempt_from_cap: bool = False,
+        transaction: bool = True,
     ) -> dict[str, Any]:
         """Persist a state mutation and its event + deliveries in ONE transaction.
 
@@ -2275,12 +2258,14 @@ class JobManager:
         repair). ``mutate`` may raise ``_DecisionNoOp`` to abort cleanly.
         ``exempt_from_cap`` is set only by authoritative decision transitions.
         """
-        self.db.execute("BEGIN IMMEDIATE")
+        if transaction:
+            self.db.execute("BEGIN IMMEDIATE")
         try:
             if event_type not in TERMINAL_STATUSES and not exempt_from_cap:
                 count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
                 if count >= self.max_events_per_job:
-                    self.db.rollback()
+                    if transaction:
+                        self.db.rollback()
                     if job_id not in self._events_truncated:
                         self._events_truncated.add(job_id)
                         self.logger.warning("structured event cap reached job_id=%s max_events=%s", job_id, self.max_events_per_job)
@@ -2348,11 +2333,55 @@ class JobManager:
             }
             self._enqueue_deliveries_uncommitted(event)
             self._persist_metric_series_uncommitted(event)
-            self.db.commit()
+            if transaction:
+                self.db.commit()
         except BaseException:
             self.db.rollback()
             raise
         return event
+
+    def _emit_capture_batch(self, job_id: str, payloads: list[dict[str, Any]], source: str) -> None:
+        """Commit available pipe events together; never hold a transaction while reading."""
+        prepared = []
+        for payload in payloads:
+            encoded = json.dumps(payload["data"], separators=(",", ":"))
+            if len(encoded.encode()) > self.max_event_bytes:
+                payload["data"] = {"truncated": True, "max_bytes": self.max_event_bytes}
+                payload["message"] = payload["message"] or "Event payload exceeded max bytes"
+                payload["level"] = "warning"
+                encoded = json.dumps(payload["data"], separators=(",", ":"))
+            prepared.append((payload, encoded))
+        for offset in range(0, len(prepared), 64):
+            def persist():
+                with self.db_lock:
+                    self.db.execute("BEGIN IMMEDIATE")
+                    try:
+                        events = [self._emit_transactional(
+                            job_id, payload, encoded, payload["type"], payload["level"], source,
+                            payload["message"], transaction=False,
+                        ) for payload, encoded in prepared[offset:offset + 64]]
+                        self.db.commit()
+                        return events
+                    except BaseException:
+                        self.db.rollback()
+                        raise
+            started = time.monotonic()
+            contentions = self.sqlite_contentions
+            events = self._retry_locked(persist)
+            elapsed = time.monotonic() - started
+            for event in events:
+                if event.get("persisted") is not False:
+                    self._append_event_mirror(event, job_id)
+            with self._condition(job_id):
+                self._condition(job_id).notify_all()
+            with self.db_lock:
+                report = (self.sqlite_contentions > contentions or elapsed > 1) and job_id not in self._contention_reported
+                if report:
+                    self._contention_reported.add(job_id)
+            if report:
+                self._emit_safely(job_id, "write_contended", message="Captured events waited for SQLite persistence",
+                                  data={"retry_count": self.sqlite_contentions - contentions,
+                                        "write_seconds": round(elapsed, 3)}, level="warning")
 
     def _append_event_mirror(self, event: dict[str, Any], job_id: str) -> None:
         try:
@@ -2406,7 +2435,11 @@ class JobManager:
         if isinstance(value, bool):
             return False
         if isinstance(value, (int, float)):
-            return value == value and value not in (float("inf"), float("-inf"))
+            try:
+                number = float(value)
+            except OverflowError:
+                return False
+            return number == number and number not in (float("inf"), float("-inf"))
         return False
 
     def _metric_x(self, data: dict[str, Any], seq: int) -> float:
@@ -3055,8 +3088,36 @@ class JobManager:
         pool: str | None = None,
         priority: int = 0,
         schedule_id: str | None = None,
+        idempotency_key: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
+        request_hash = None
+        if cwd is not None:
+            if not isinstance(cwd, str) or not cwd.strip():
+                raise ValueError("cwd must be a non-empty string")
+            cwd = str(Path(cwd).expanduser().resolve())
+        if not isinstance(dry_run, bool):
+            raise ValueError("dry_run must be a boolean")
+        if idempotency_key is not None:
+            if not isinstance(idempotency_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", idempotency_key):
+                raise ValueError("idempotency_key must be 8..128 letters, digits, underscores or hyphens")
+            request_spec = {
+                "command": command, "cwd": cwd or os.getcwd(), "name": name,
+                "env": env, "timeout_seconds": timeout_seconds, "notify_on": notify_on,
+                "wake_targets": wake_targets, "origin_thread_id": origin_thread_id,
+                "tags": tags, "notes": notes, "interactive": interactive,
+                "trigger": trigger, "policy": policy, "secret_env": secret_env,
+                "pool": pool, "priority": priority, "schedule_id": schedule_id,
+            }
+            try:
+                request_hash = hashlib.sha256(json.dumps(request_spec, sort_keys=True, allow_nan=False).encode()).hexdigest()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("job request must contain JSON-compatible values") from exc
+            if not dry_run:
+                replay = self._replay_local_start(idempotency_key, request_hash)
+                if replay is not None:
+                    return replay
         # Thread identity (review P1-4 / P2-2): the LAUNCHING thread is the
         # default wake destination, but the daemon cannot know it. The MCP
         # wrapper (job_start) resolves origin_thread_id from the calling task's
@@ -3121,6 +3182,19 @@ class JobManager:
         secret_env = self._validate_secret_env(secret_env)
         pool = self._validate_pool(pool)
         priority = self._validate_priority(priority)
+        if dry_run:
+            resolved_cwd = Path(cwd or os.getcwd()).expanduser().resolve()
+            if not resolved_cwd.is_dir():
+                raise ValueError(f"cwd does not exist or is not a directory: {resolved_cwd}")
+            return {
+                "result": "preview", "command": command,
+                "shell": os.environ.get("COMSPEC", "cmd.exe") if sys.platform == "win32" else "/bin/sh",
+                "cwd": str(resolved_cwd), "env_names": sorted(env or {}),
+                "secret_env": secret_env, "timeout_seconds": timeout_seconds,
+                "interactive": interactive, "trigger": trigger, "policy": policy,
+                "pool": pool, "priority": priority,
+                **self._start_extras(wake_targets, notify_on),
+            }
         # A trigger OR a pool gates launch: the job is created 'queued' and the
         # single dispatcher launches it once the trigger fires and the pool has
         # capacity (and is not paused).
@@ -3159,8 +3233,14 @@ class JobManager:
                 # manager processes (or threads) synchronized at a SELECT-then-insert
                 # can no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two
                 # 'launching' rows. Both 'launching' and 'running' reservations count.
-                if self.max_running_jobs and not queued:
+                if idempotency_key is not None or (self.max_running_jobs and not queued):
                     self.db.execute("BEGIN IMMEDIATE")
+                if idempotency_key is not None:
+                    replay = self._replay_local_start(idempotency_key, request_hash)
+                    if replay is not None:
+                        self.db.commit()
+                        return replay
+                if self.max_running_jobs and not queued:
                     reserved = self.db.execute(
                         "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
                     ).fetchone()[0]
@@ -3211,6 +3291,11 @@ class JobManager:
                 # it). Rollback on ANY failure so a half-written acceptance can
                 # never be swept into the DB by a later commit.
                 self._insert_wake_targets(job_id, wake_targets or [], created_at)
+                if idempotency_key is not None:
+                    self.db.execute(
+                        "INSERT INTO local_start_requests VALUES (?, ?, ?, ?)",
+                        (idempotency_key, request_hash, job_id, created_at),
+                    )
                 self.db.commit()
             except BaseException:
                 self.db.rollback()
@@ -3256,6 +3341,26 @@ class JobManager:
             job_id, stdout_path, stderr_path, events_path, claim_spec_path, claim_token=direct_claim_token
         )
         return {**result, **self._start_extras(wake_targets, notify_on)}
+
+    def _replay_local_start(self, key: str, request_hash: str) -> dict[str, Any] | None:
+        with self.db_lock:
+            request = self.db.execute(
+                "SELECT request_hash, job_id FROM local_start_requests WHERE idempotency_key=?", (key,)
+            ).fetchone()
+            if request is None:
+                return None
+            if request["request_hash"] != request_hash:
+                raise ValueError("idempotency_key was already used for a different job request")
+            row = self.db.execute("SELECT * FROM jobs WHERE job_id=?", (request["job_id"],)).fetchone()
+            if row is None:
+                raise ValueError(f"idempotency_key refers to cleaned job {request['job_id']}; use a new key for new work")
+            return {
+                "job_id": row["job_id"], "status": row["status"],
+                "stdout_path": row["stdout_path"], "stderr_path": row["stderr_path"],
+                "events_path": row["events_path"], "idempotent_replay": True,
+                "message": "Existing job returned; no new workload launched",
+                **self._start_extras(self._wake_targets_for_job(row["job_id"]), None),
+            }
 
     def _validate_trigger(self, trigger: dict[str, Any] | None) -> dict[str, Any] | None:
         """Validate a queue trigger: a DAG gate, a readiness probe, or both.
@@ -3367,9 +3472,10 @@ class JobManager:
         creationflags = 0
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0)
-        runner_log = (self.logs / f"{job_id}.runner.log").open("ab")
+        runner_log = None
         try:
             try:
+                runner_log = (self.logs / f"{job_id}.runner.log").open("ab")
                 proc = subprocess.Popen(
                     [sys.executable, "-m", "vanth.runner", str(self.home), job_id, f"{job_id}-{claim_token}.json"],
                     stdin=subprocess.DEVNULL,
@@ -3387,27 +3493,15 @@ class JobManager:
                 # terminal guard's WHERE status='running' would skip a launching
                 # row). The write is CLAIM-token guarded so a stale starter can
                 # never mark a newer run failed (review rc36 P1).
-                stamp = now_iso()
-                with self.db_lock:
-                    self.db.execute(
-                        "UPDATE jobs SET status='failed', exit_code=1, ended_at=?, updated_at=?, stop_requested_at=NULL "
-                        "WHERE job_id=? AND claim_token=? AND status='launching'",
-                        (stamp, stamp, job_id, claim_token),
-                    )
-                    self.db.commit()
-                # Review rc33 P1-6: a RESTART claim whose spawn failed must keep
-                # its budgeted retry intent. Restore the pending deadline so
-                # restart policy relaunches after the backoff instead of treating
-                # this as a fresh (unbudgeted) failure.
-                self._restore_pending_restart_after(job_id, claim_token)
-                self._emit(
-                    job_id,
-                    "failed",
-                    message=f"Job runner failed to start: {exc}",
-                    data={"error": str(exc)},
-                    level="error",
-                    source="server",
+                changed = self._terminal_event(
+                    job_id, "failed", 1, claim_token=claim_token, require_launching=True,
+                    message=f"Job runner failed to start: {exc}", data={"error": str(exc)},
+                    level="error", source="server",
                 )
+                # Preserve a budgeted restart only after the owned failure and
+                # its event were committed together.
+                if changed:
+                    self._restore_pending_restart_after(job_id, claim_token)
                 Path(spec_path).unlink(missing_ok=True)
                 return {
                     "job_id": job_id,
@@ -3420,7 +3514,8 @@ class JobManager:
                     "events_path": str(events_path),
                 }
         finally:
-            runner_log.close()
+            if runner_log is not None:
+                runner_log.close()
         self.processes[job_id] = proc
         threading.Thread(target=self._watch_runner, args=(job_id, proc, claim_token), daemon=True).start()
         # The runner (not this parent) performs the launching->running
@@ -3595,6 +3690,16 @@ class JobManager:
                 interactive = json.loads(spec_row["run_json"] or "{}").get("interactive") is True
             except (TypeError, ValueError):
                 interactive = False
+            if interactive:
+                lock = self._lock_stdin(job_id)
+                try:
+                    owner = self._row("SELECT status, claim_token FROM jobs WHERE job_id=?", (job_id,))
+                    if owner["status"] != "launching" or owner["claim_token"] != token:
+                        raise RuntimeError("stdin reset refused: launch claim is no longer owned")
+                    for suffix in ("in", "closed"):
+                        (self.home / "stdin" / f"{job_id}.{suffix}").unlink(missing_ok=True)
+                finally:
+                    lock.release()
             spec = {
                 "command": spec_row["command"],
                 "cwd": spec_row["cwd"],
@@ -3753,89 +3858,44 @@ class JobManager:
                 return
         self._retry_locked(clear)
 
-    def _revert_abandoned_claim(self, job_id: str, claim_token: str | None, target: str) -> bool:
-        """Revert an abandoned launch claim back to ``launching`` when the
-        workload kill failed (review rc36 P1).
+    def _abandon_launch_claim(
+        self, job_id: str, claim_token: str | None, expected_worker_pid: int | None | object = _UNSET,
+        *, message: str = "Launch claim went stale before the runner published its workload",
+    ) -> tuple[bool, str]:
+        """Win the launching-only ownership CAS before cleanup; commit event with state.
 
-        Stale-claim recovery wins the launching-only terminal transition first
-        (blocking relaunch), then kills the owned workload PID. If the kill
-        fails, the workload may still be alive — leaving the row terminal would
-        orphan a live, untracked process. This reverts the row to ``launching``
-        (guarded by the same token/status) and, if the recovery restored a
-        pending restart deadline, moves ``restart_after`` back to
-        ``pending_restart_after`` so a later pass retries cleanly.
-        """
-        def revert() -> bool:
-            with self.db_lock:
-                if claim_token:
-                    changed = self.db.execute(
-                        "UPDATE jobs SET status='launching', ended_at=NULL, "
-                        "policy_state_json=json_set(json_remove(policy_state_json, '$.restart_after'), "
-                        "  '$.pending_restart_after', json_extract(policy_state_json, '$.restart_after')), "
-                        "updated_at=? WHERE job_id=? AND claim_token=? AND status=?",
-                        (now_iso(), job_id, claim_token, target),
-                    ).rowcount
-                else:
-                    changed = self.db.execute(
-                        "UPDATE jobs SET status='launching', ended_at=NULL, updated_at=? "
-                        "WHERE job_id=? AND claim_token IS NULL AND status=?",
-                        (now_iso(), job_id, target),
-                    ).rowcount
-                self.db.commit()
-                return bool(changed)
-        return self._retry_locked(revert)
-
-    def _abandon_launch_claim(self, job_id: str, claim_token: str | None, expected_worker_pid: int | None | object = _UNSET) -> tuple[bool, str]:
-        """Recover an abandoned ``launching`` claim (never spawned) to a terminal
-        state, preserving any budgeted restart intent (review rc33 P1-4/P1-6).
-
-        The terminal transition is an ATOMIC launching-only, token-guarded
-        UPDATE: it returns True ONLY if the runner has not already promoted the
-        claim to ``running`` (rc33 P1-4). ``expected_worker_pid`` (the observed
-        worker identity from the stale snapshot) is included in the CAS so a
-        runner that became live after the snapshot is never orphaned (review
-        rc36 P1). If the claim carried a pending restart deadline
-        (``pending_restart_after`` set by ``_claim_due_restart``), the row is
-        recovered as ``failed`` with the deadline restored so restart policy
-        (which only watches failed/completed rows) relaunches the
-        already-budgeted retry (rc33 P1-6); otherwise it is recovered as
-        ``orphaned``. Returns ``(recovered, target_status)``.
+        Cleanup runs while the winning write transaction owns the claim. If
+        cleanup fails, roll back instead of announcing a terminal state for a
+        live workload. Preserve a budgeted restart deadline after commit.
         """
         with self.db_lock:
-            row = self.db.execute(
-                "SELECT policy_state_json, worker_pid FROM jobs WHERE job_id=?", (job_id,)
-            ).fetchone()
+            row = self.db.execute("SELECT policy_state_json FROM jobs WHERE job_id=?", (job_id,)).fetchone()
         pending = None
         if row:
             try:
                 state = json.loads(row["policy_state_json"] or "{}")
                 pending = state.get("pending_restart_after") if isinstance(state, dict) else None
             except (TypeError, ValueError):
-                pending = None
+                pass
         target = "failed" if pending else "orphaned"
-        if claim_token:
-            recovered = self._transition_terminal(
-                job_id, target, claim_token=claim_token, require_launching=True,
-                expected_worker_pid=expected_worker_pid,
-            )
-        else:
-            # Legacy row claimed before the claim_token column existed (never a
-            # restart claim, so target is always 'orphaned'). The CAS binds the
-            # OBSERVED worker identity (including NULL via the sentinel) so a
-            # runner that published a live worker after the snapshot is never
-            # orphaned (review rc36 P1).
-            def recover_legacy() -> bool:
-                with self.db_lock:
-                    changed = self.db.execute(
-                        "UPDATE jobs SET status=?, ended_at=?, updated_at=? "
-                        "WHERE job_id=? AND status='launching' AND claim_token IS NULL AND worker_pid IS ?",
-                        (target, now_iso(), now_iso(), job_id, expected_worker_pid),
-                    ).rowcount
-                    self.db.commit()
-                return bool(changed)
-            recovered = self._retry_locked(recover_legacy)
+
+        def cleanup_owned_workload() -> bool:
+            owned = self._row("SELECT pid FROM jobs WHERE job_id=?", (job_id,))
+            if owned and owned["pid"]:
+                if not self._terminate_pid(int(owned["pid"]), force=True,
+                                           deadline=time.monotonic() + self.recovery_kill_timeout):
+                    self.logger.error("abandoned claim could not terminate workload job_id=%s pid=%s", job_id, owned["pid"])
+                    return False
+            return True
+
+        recovered = self._terminal_event(
+            job_id, target, claim_token=claim_token, require_launching=True,
+            expected_worker_pid=expected_worker_pid,
+            message=message + ("; restart intent preserved" if pending else ""),
+            data={"claim_token": claim_token}, level="error" if pending else "info",
+            before_commit=cleanup_owned_workload,
+        )
         if recovered and pending:
-            # Restore the budgeted deadline so restart policy relaunches.
             self._restore_pending_restart_after(job_id, claim_token, status=target)
         return recovered, target
 
@@ -3888,43 +3948,9 @@ class JobManager:
                 # The observed worker identity is included in the CAS so a
                 # runner that became live after the snapshot is never orphaned
                 # (review rc36 P1).
-                recovered, target = self._abandon_launch_claim(
+                self._abandon_launch_claim(
                     job_id, row["claim_token"], expected_worker_pid=row["worker_pid"]
                 )
-                if not recovered:
-                    # The runner won the promotion (or a newer launch owns the
-                    # row, or the worker identity changed). Either way the row is
-                    # no longer ours to orphan; the live workload must be left
-                    # untouched.
-                    continue
-                # We own the abandoned launch now (the row is terminal, which
-                # blocks relaunch). Reconcile the exact owned workload PID. If
-                # the kill FAILS, the workload may still be alive; revert the
-                # row to 'launching' so a later recovery pass retries instead of
-                # leaving a terminal row with a live, untracked process (review
-                # rc36 P1).
-                if row["pid"]:
-                    if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
-                        self.logger.error("stale-claim recovery could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
-                        self._revert_abandoned_claim(job_id, row["claim_token"], target)
-                        continue
-                if target == "failed":
-                    self._emit(
-                        job_id,
-                        "failed",
-                        message="Launch claim went stale before the runner published its workload; restart intent preserved",
-                        data={"claim_token": row["claim_token"]},
-                        level="error",
-                        source="server",
-                    )
-                else:
-                    self._emit(
-                        job_id,
-                        "orphaned",
-                        message="Launch claim went stale before the runner published its workload",
-                        data={"claim_token": row["claim_token"]},
-                        source="server",
-                    )
         except Exception:
             self.logger.exception("stale launch claim recovery failed")
 
@@ -4047,25 +4073,10 @@ class JobManager:
                 # Review rc34 P2: establish ownership FIRST (win the atomic
                 # launching-only transition) before terminating any workload
                 # PID, so a PID reused by a newer run is never killed.
-                recovered, target = self._abandon_launch_claim(job_id, claim_token, expected_worker_pid=row["worker_pid"])
-                if recovered:
-                    if row["pid"]:
-                        if not self._terminate_pid(int(row["pid"]), force=True, deadline=time.monotonic() + self.recovery_kill_timeout):
-                            self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
-                            # Revert to launching: the workload may still be
-                            # alive; a terminal row would orphan it (P1).
-                            self._revert_abandoned_claim(job_id, claim_token, target)
-                            return
-                    self._emit(
-                        job_id,
-                        target,
-                        message="Job runner exited before its workload was published"
-                        if target == "orphaned"
-                        else "Job runner exited before its workload was published; restart intent preserved",
-                        data={"claim_token": claim_token},
-                        level="error" if target == "failed" else "info",
-                        source="server",
-                    )
+                self._abandon_launch_claim(
+                    job_id, claim_token, expected_worker_pid=row["worker_pid"],
+                    message="Job runner exited before its workload was published",
+                )
                 return
             if row["status"] != "running":
                 return
@@ -4093,13 +4104,12 @@ class JobManager:
                     self.logger.error("runner watcher could not terminate workload job_id=%s pid=%s", job_id, row["pid"])
                     return
             terminal = "cancelled" if row["stop_requested_at"] else "orphaned"
-            if self._transition_terminal(job_id, terminal, claim_token=claim_token):
-                self._emit(
-                    job_id,
-                    terminal,
-                    message="Job runner exited before recording a terminal status",
-                    data=stop_event_data(row, default_actor="watchdog", default_reason="runner exited before terminal status"),
-                )
+            self._terminal_event(
+                job_id, terminal, claim_token=claim_token,
+                worker_pid=row["worker_pid"] if not claim_token else _UNSET,
+                message="Job runner exited before recording a terminal status",
+                data=stop_event_data(row, default_actor="watchdog", default_reason="runner exited before terminal status"),
+            )
         except (sqlite3.Error, RuntimeError):
             return
 
@@ -4526,55 +4536,148 @@ class JobManager:
         if stream is None:
             return
         max_bytes = self.max_log_bytes
-        written = path.stat().st_size if path.exists() else 0
-        with path.open("ab") as f:
-            while line := stream.readline(self.max_event_line_bytes + 1):
-                # Scrub declared-secret values BEFORE anything durable happens:
-                # the masked bytes are what reach the log file and the parsed
-                # AGENT_EVENT payload (review #9).
-                if mask_values:
-                    line = mask_secrets(line, mask_values)
-                if written < max_bytes:
-                    chunk = line[: max_bytes - written]
-                    f.write(chunk)
-                    f.flush()
-                    written += len(chunk)
+        written = 0
+        f = None
+        values = {variant for value in (mask_values or []) if value for variant in (
+            value, value.replace("\r\n", "\n"), value.replace("\r\n", "\n").replace("\n", "\r\n"),
+            value.replace("\n", "\r\n"),  # Text-mode Windows stdout also translates existing CRLF.
+        )}
+        needles = sorted({encoded for value in values for encoded in (
+            value.encode(), json.dumps(value, ensure_ascii=False)[1:-1].encode(),
+            json.dumps(value)[1:-1].encode(),
+        )}, key=len, reverse=True)
+        pattern = re.compile(b"|".join(re.escape(value) for value in needles)) if needles else None
+        prefix_tables = []
+        for needle in needles:
+            table = [0] * len(needle)
+            length = 0
+            for index in range(1, len(needle)):
+                while length and needle[index] != needle[length]:
+                    length = table[length - 1]
+                if needle[index] == needle[length]:
+                    length += 1
+                table[index] = length
+            prefix_tables.append((needle, table))
+        pending = b""
+        line = bytearray()
+        oversized = False
+        event_line = False
+        event_capture_failed = False
+
+        def capture_error(exc: OSError) -> None:
+            self._capture_failed.add(job_id)
+            self.logger.error("log capture failed job_id=%s stream=%s error=%s", job_id, source, exc)
+            self._emit_safely(job_id, "log_capture_failed", message=f"{source} log storage failed",
+                              data={"stream": source, "error": str(exc)}, level="error")
+
+        try:
+            try:
+                written = path.stat().st_size if path.exists() else 0
+                f = path.open("ab")
+            except OSError as exc:
+                capture_error(exc)
+            read = getattr(stream, "read1", stream.read)
+            while True:
+                chunk = read(65536)
+                pending += chunk
+                hold = 0
+                if chunk:
+                    # Only a suffix that could finish a secret needs another read.
+                    for needle, table in prefix_tables:
+                        length = 0
+                        for byte in pending[-(len(needle) - 1):] if len(needle) > 1 else b"":
+                            while length and byte != needle[length]:
+                                length = table[length - 1]
+                            if byte == needle[length]:
+                                length += 1
+                        hold = max(hold, length)
+                cut = len(pending) - hold
+                if pattern:
+                    for match in pattern.finditer(pending):
+                        if match.start() < cut < match.end():
+                            cut = match.end()
+                    safe = pattern.sub(b"***", pending[:cut])
+                else:
+                    safe = pending[:cut]
+                pending = pending[cut:]
+                if f is not None and written < max_bytes:
+                    try:
+                        output = safe[:max_bytes - written]
+                        f.write(output)
+                        f.flush()
+                        written += len(output)
+                    except OSError as exc:
+                        capture_error(exc)
+                        try:
+                            f.close()
+                        except OSError:
+                            pass
+                        f = None
                 if written >= max_bytes and (job_id, source) not in self._log_truncated:
                     self._log_truncated.add((job_id, source))
-                    self._emit_safely(
-                        job_id,
-                        "log_truncated",
-                        message=f"{source} log reached its configured byte cap",
-                        data={"stream": source, "max_bytes": max_bytes},
-                        level="warning",
-                        source="server",
-                    )
-                if len(line) > self.max_event_line_bytes:
-                    while line and not line.endswith(b"\n"):
-                        line = stream.readline(self.max_event_line_bytes + 1)
-                    self._emit_safely(
-                        job_id,
-                        "event_rejected",
-                        message="AGENT_EVENT line exceeded the configured byte limit",
-                        data={"max_bytes": self.max_event_line_bytes},
-                        level="warning",
-                        source=source,
-                    )
-                    continue
+                    self._emit_safely(job_id, "log_truncated", message=f"{source} log reached its configured byte cap",
+                                      data={"stream": source, "max_bytes": max_bytes}, level="warning")
+                events = []
+                for part in safe.splitlines(keepends=True):
+                    if not oversized:
+                        line.extend(part)
+                        if len(line) > self.max_event_line_bytes:
+                            event_line = line.startswith(EVENT_PREFIX.encode())
+                            oversized = True
+                            line.clear()
+                    if part.endswith(b"\n"):
+                        if oversized:
+                            if event_line:
+                                self._emit_safely(job_id, "event_rejected",
+                                                  message="AGENT_EVENT line exceeded the configured byte limit",
+                                                  data={"max_bytes": self.max_event_line_bytes},
+                                                  level="warning", source=source)
+                        else:
+                            try:
+                                payload = parse_agent_event_line(line.decode(errors="replace").rstrip("\r\n"))
+                                if payload:
+                                    events.append(normalize_event_payload(payload))
+                            except Exception:
+                                pass
+                        line.clear()
+                        oversized = False
+                        event_line = False
+                if not chunk and oversized and event_line:
+                    self._emit_safely(job_id, "event_rejected",
+                                      message="AGENT_EVENT line exceeded the configured byte limit",
+                                      data={"max_bytes": self.max_event_line_bytes}, level="warning", source=source)
+                if not chunk and line and not oversized:
+                    try:
+                        payload = parse_agent_event_line(line.decode(errors="replace").rstrip("\r\n"))
+                        if payload:
+                            events.append(normalize_event_payload(payload))
+                    except Exception:
+                        pass
+                if events and not event_capture_failed:
+                    try:
+                        self._emit_capture_batch(job_id, events, source)
+                    except (sqlite3.Error, RuntimeError) as exc:
+                        event_capture_failed = True
+                        self._capture_failed.add(job_id)
+                        self.logger.exception("event capture failed; draining pipe job_id=%s stream=%s", job_id, source)
+                        self._emit_safely(job_id, "log_capture_failed", message=f"{source} event persistence failed",
+                                          data={"stream": source, "error": str(exc)}, level="error")
+                if not chunk:
+                    break
+        except (OSError, sqlite3.Error, RuntimeError) as exc:
+            self._capture_failed.add(job_id)
+            self.logger.exception("capture failed job_id=%s stream=%s", job_id, source)
+            self._emit_safely(job_id, "log_capture_failed", message=f"{source} capture failed",
+                              data={"stream": source, "error": str(exc)}, level="error")
+            proc = self.processes.get(job_id)
+            if proc is not None:
+                self._kill_process(proc, force=True)
+        finally:
+            if f is not None:
                 try:
-                    payload = parse_agent_event_line(line.decode(errors="replace").rstrip("\r\n"))
-                except Exception:
-                    payload = None
-                if payload:
-                    event = normalize_event_payload(payload)
-                    self._emit_safely(
-                        job_id,
-                        event["type"],
-                        message=event["message"],
-                        data=event["data"],
-                        level=event["level"],
-                        source=source,
-                    )
+                    f.close()
+                except OSError as exc:
+                    capture_error(exc)
 
     def _emit_safely(
         self,
@@ -4592,28 +4695,52 @@ class JobManager:
             self.logger.exception("structured event persisted failed job_id=%s type=%s", job_id, event_type)
 
     def _watch(self, job_id: str, proc: subprocess.Popen[bytes], timeout_seconds: int | None) -> None:
+        deadline = time.monotonic() + timeout_seconds if timeout_seconds is not None else None
         try:
             exit_code = proc.wait(timeout=timeout_seconds)
         except subprocess.TimeoutExpired:
             self._kill_process(proc, force=True)
             exit_code = proc.wait()
-            self._readers_done(job_id)
+            self._readers_done(job_id, timeout=1)
             self._finish(job_id, "timeout", exit_code)
             return
         status = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))["status"]
         if status == "cancelled":
             return
-        self._readers_done(job_id)
-        self._finish(job_id, "completed" if exit_code == 0 else "failed", exit_code)
+        drained = self._readers_done(job_id, timeout=max(0, deadline - time.monotonic()) if deadline else 30)
+        terminal = "timeout" if not drained and deadline else (
+            "completed" if exit_code == 0 and job_id not in self._capture_failed else "failed"
+        )
+        self._finish(job_id, terminal, exit_code)
 
-    def _readers_done(self, job_id: str) -> None:
-        for thread in self.reader_threads.pop(job_id, []):
-            thread.join()
+    def _readers_done(self, job_id: str, timeout: float = 30.0) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        threads = self.reader_threads.pop(job_id, [])
+        for thread in threads:
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        if any(thread.is_alive() for thread in threads):
+            self._capture_failed.add(job_id)
+            self._emit_safely(job_id, "pipe_drain_timeout", message="Output pipes remained open after workload exit",
+                              data={"drain_timeout_seconds": timeout,
+                                    "next_action": "Ensure child processes close inherited stdout/stderr."}, level="error")
+            proc = self.processes.get(job_id)
+            if proc is not None:
+                self._kill_process(proc, force=True)
+            return False
+        return True
 
     def _kill_process(self, proc: subprocess.Popen[bytes], force: bool) -> None:
+        if sys.platform != "win32" and proc.poll() is not None:
+            # The reaped leader's PID may already belong to another process.
+            # Descendants can still hold its original process group and pipes.
+            try:
+                os.killpg(proc.pid, 9 if force else 15)
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
         self._kill_pid(proc.pid, force)
 
-    def _kill_pid(self, pid: int, force: bool) -> None:
+    def _kill_pid(self, pid: int, force: bool, *, timeout_seconds: float = 10.0) -> None:
         if sys.platform == "win32":
             args = ["taskkill", "/PID", str(pid), "/T"]
             if force:
@@ -4622,6 +4749,7 @@ class JobManager:
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                timeout=max(0.1, timeout_seconds),
             )
             return
         signal_number = 9 if force else 15
@@ -4636,27 +4764,69 @@ class JobManager:
     def _terminate_pid(self, pid: int, force: bool, deadline: float) -> bool:
         if not pid or not self._pid_alive(pid):
             return True
-        self._kill_pid(pid, force=force)
+        # Even an immediate force-stop needs bounded process-launch grace for
+        # taskkill itself; a zero grace must not time out before it can start.
+        try:
+            self._kill_pid(pid, force=force, timeout_seconds=max(1.0, deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            return False
         while self._pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         if self._pid_alive(pid):
-            self._kill_pid(pid, force=True)
+            try:
+                self._kill_pid(pid, force=True, timeout_seconds=max(1.0, min(deadline + 1, time.monotonic() + 1) - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                return False
             force_deadline = min(deadline + 1, time.monotonic() + 1)
             while self._pid_alive(pid) and time.monotonic() < force_deadline:
                 time.sleep(0.05)
         return not self._pid_alive(pid)
 
+    def _cancel_queued(self, job_id: str, *, actor: str, reason: str,
+                       message: str, data: dict[str, Any]) -> bool:
+        def cancel(db: sqlite3.Connection) -> None:
+            changed = db.execute(
+                "UPDATE jobs SET status='cancelled', stop_actor=?, stop_reason=?, ended_at=?, updated_at=? "
+                "WHERE job_id=? AND status='queued'",
+                (actor, reason, now_iso(), now_iso(), job_id),
+            ).rowcount
+            if not changed:
+                raise _DecisionNoOp()
+
+        event = self._emit(job_id, "cancelled", message=message, data=data, mutate=cancel)
+        return event.get("persisted") is not False
+
+    def _terminal_event(
+        self, job_id: str, status: str, exit_code: int | None = None, *,
+        claim_token: str | None = None, worker_pid: int | None | object = _UNSET,
+        require_launching: bool = False, expected_worker_pid: int | None | object = _UNSET,
+        message: str | None = None, data: dict[str, Any] | None = None,
+        level: str = "info", source: str = "server", before_commit: Callable[[], bool] | None = None,
+    ) -> bool:
+        """Commit owned terminal state, event, and wakes together or none of them."""
+        def transition(db: sqlite3.Connection) -> None:
+            if not self._transition_terminal(
+                job_id, status, exit_code, claim_token=claim_token, worker_pid=worker_pid,
+                require_launching=require_launching, expected_worker_pid=expected_worker_pid, transaction=False,
+            ):
+                raise _DecisionNoOp()
+            if before_commit is not None and not before_commit():
+                raise _DecisionNoOp()
+
+        event = self._emit(job_id, status, message=message, data=data, level=level,
+                           source=source, mutate=transition)
+        return event.get("persisted") is not False
+
     def _finish(self, job_id: str, status: str, exit_code: int | None = None, *, claim_token: str | None = None) -> None:
         row = self._row("SELECT stop_requested_at, stop_actor, stop_reason, timeout_seconds FROM jobs WHERE job_id=?", (job_id,))
         if row and row["stop_requested_at"]:
             status = "cancelled"
-        if self._transition_terminal(job_id, status, exit_code, claim_token=claim_token):
-            data: dict[str, Any] = {"exit_code": exit_code} if exit_code is not None else {}
-            if status == "cancelled":
-                data.update(stop_event_data(row or {}, default_actor="user", default_reason="stop requested"))
-            elif status == "timeout":
-                data.update({"actor": "timeout", "reason": f"exceeded timeout of {row['timeout_seconds']}s" if row and row["timeout_seconds"] else "exceeded configured timeout"})
-            self._emit(job_id, status, data=data)
+        data: dict[str, Any] = {"exit_code": exit_code} if exit_code is not None else {}
+        if status == "cancelled":
+            data.update(stop_event_data(row or {}, default_actor="user", default_reason="stop requested"))
+        elif status == "timeout":
+            data.update({"actor": "timeout", "reason": f"exceeded timeout of {row['timeout_seconds']}s" if row and row["timeout_seconds"] else "exceeded configured timeout"})
+        self._terminal_event(job_id, status, exit_code, claim_token=claim_token, data=data)
         self.processes.pop(job_id, None)
 
     def _event_query(self, job_id: str, types: list[str] | None, since_event_id: str | None, limit: int,
@@ -4857,6 +5027,30 @@ class JobManager:
             "last_event": self._event_dict(last) if last else None,
         }
         result["progress"] = ({**json.loads(progress["data_json"] or "{}"), "updated_at": progress["created_at"]} if progress else None)
+        if row["status"] in {"failed", "timeout", "orphaned", "cancelled"}:
+            reason = row["status"]
+            action = f"Inspect job_tail for {job_id} before rerunning"
+            if reason == "failed":
+                began = self._row(
+                    "SELECT 1 FROM events WHERE job_id=? AND type='started' AND created_at>=? LIMIT 1",
+                    (job_id, row["started_at"] or row["created_at"]),
+                )
+                reason = "workload_failed" if began else "startup_failed"
+                capture = self._row(
+                    "SELECT type FROM events WHERE job_id=? AND type IN ('log_capture_failed','pipe_drain_timeout') "
+                    "AND created_at>=? ORDER BY seq DESC LIMIT 1",
+                    (job_id, row["started_at"] or row["created_at"]),
+                )
+                if capture:
+                    reason = capture["type"]
+                    action = "Inspect job_doctor capture diagnostics and check disk space or descendant processes"
+            elif reason == "timeout":
+                action = "Inspect captured output and workload progress; increase the timeout only if expected"
+            elif reason == "orphaned":
+                action = "Inspect job_status and verify the previous workload has stopped before rerunning"
+            elif reason == "cancelled":
+                action = "Inspect stop_actor and stop_reason before deciding whether to rerun"
+            result.update(failure_reason=reason, recommended_next_action=action)
         return result
 
     def status_batch(self, job_ids: list[str], limit: int = 500) -> dict[str, Any]:
@@ -5268,7 +5462,8 @@ class JobManager:
                 raise RuntimeError("metric ingest event was not persisted")
         return {"result": "ok", "job_id": job_id, "ingested": len(points), "event_id": event_id}
 
-    def run_summary(self, job_id: str) -> dict[str, Any]:
+    def run_summary(self, job_id: str, include_stderr_excerpt: bool = False,
+                    include_stdout_excerpt: bool = False) -> dict[str, Any]:
         """One-call summary of a job: status, runtime, progress, top metrics.
 
         Computes the latest value of every stored metric series plus the last
@@ -5294,7 +5489,7 @@ class JobManager:
                 }
             )
         artifacts = self.artifacts(job_id)["artifacts"]
-        return {
+        summary = {
             "job_id": job_id,
             "status": status["status"],
             "name": status.get("name"),
@@ -5306,6 +5501,14 @@ class JobManager:
             "latest_metrics": latest_metrics,
             "artifacts": artifacts,
         }
+        if include_stderr_excerpt:
+            summary["stderr_excerpt"] = self.tail(job_id, stream="stderr", max_bytes=2048)["content"]
+        if include_stdout_excerpt:
+            summary["stdout_excerpt"] = self.tail(job_id, stream="stdout", max_bytes=8192)["content"]
+        for field in ("failure_reason", "recommended_next_action"):
+            if field in status:
+                summary[field] = status[field]
+        return summary
 
     def diff_spec(self, base_job_id: str, other_job_id: str) -> dict[str, Any]:
         """Diff the run specs (command/env/cwd/timeout/etc) of two jobs."""
@@ -5907,7 +6110,75 @@ class JobManager:
             lines.append(emit("vanth_pool_queued", pool_counts.get((name, "queued"), 0), pool=name))
         return "\n".join(lines) + "\n"
 
-    def doctor(self) -> dict[str, Any]:
+    def _artifact_integrity_report(self, verify: bool) -> dict[str, Any]:
+        report: dict[str, Any] = {"requested": verify, "checked": 0, "complete": False, "issues": []}
+        catalog_path = self.home / "artifacts.sqlite"
+        if not verify:
+            return report
+        if not catalog_path.exists():
+            return {**report, "complete": True}
+        from .artifacts.lifecycle import Lifecycle
+        from .artifacts.manifest import validate_manifest
+
+        connection = None
+        try:
+            deadline = time.monotonic() + 3
+            connection = sqlite3.connect(catalog_path.resolve().as_uri() + "?mode=ro", uri=True, timeout=1)
+            manifests = connection.execute(
+                "SELECT substr(CAST(manifest_json AS BLOB),1,1048577) FROM versions WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 101"
+            ).fetchall()
+            shas = set()
+            complete = len(manifests) <= 100
+            manifest_budget = 16 * 1024 * 1024
+            for row in manifests[:100]:
+                if len(row[0]) > min(1048576, manifest_budget) or time.monotonic() >= deadline:
+                    complete = False
+                    continue
+                manifest_budget -= len(row[0])
+                validate_manifest(json.loads(row[0]))
+                shas.update(Lifecycle._manifest_shas(row[0]))
+                if len(shas) > 1000:
+                    shas = set(sorted(shas)[:1000])
+                    complete = False
+                    break
+            budget = 64 * 1024 * 1024
+            for sha in sorted(shas):
+                if not re.fullmatch(r"[0-9a-f]{64}", sha):
+                    report["issues"].append({"type": "invalid_artifact_hash", "sha256": sha})
+                    continue
+                path = self.home / "artifacts-store" / "blobs" / sha[:2] / sha[2:4] / sha
+                try:
+                    size = path.stat().st_size
+                    if size > budget or time.monotonic() >= deadline:
+                        complete = False
+                        continue
+                    digest = hashlib.sha256()
+                    with path.open("rb") as handle:
+                        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                            if time.monotonic() >= deadline:
+                                complete = False
+                                break
+                        else:
+                            report["checked"] += 1
+                            budget -= size
+                            if digest.hexdigest() != sha:
+                                report["issues"].append({"type": "corrupt_artifact_blob", "sha256": sha})
+                except FileNotFoundError:
+                    report["issues"].append({"type": "missing_artifact_blob", "sha256": sha})
+                except OSError as exc:
+                    report["issues"].append({"type": "artifact_read_failed", "sha256": sha, "error": str(exc)})
+            report["complete"] = complete
+            report["limits"] = {"versions": 100, "blobs": 1000, "manifest_bytes": 16 * 1024 * 1024,
+                                "bytes": 64 * 1024 * 1024, "seconds": 3}
+        except (sqlite3.Error, ValueError, TypeError, KeyError, AttributeError) as exc:
+            report["issues"].append({"type": "artifact_catalog_check_failed", "error": str(exc)})
+        finally:
+            if connection is not None:
+                connection.close()
+        return report
+
+    def doctor(self, verify_artifacts: bool = False) -> dict[str, Any]:
         self._ensure_open()
         tables = {
             row["name"]
@@ -5931,6 +6202,28 @@ class JobManager:
             if identity and is_relay_client_id(row["type"], identity, relay_client_ids):
                 undeliverable_wakes += 1
         warnings = []
+        integrity = self._artifact_integrity_report(verify_artifacts)
+        if integrity["issues"]:
+            warnings.append({"type": "artifact_integrity", "issues": integrity["issues"],
+                             "detail": "restore missing blobs or republish corrupt artifacts"})
+        diagnostics = self.db.execute(
+            "SELECT job_id, type, message, created_at FROM events "
+            "WHERE type IN ('pipe_drain_timeout','log_capture_failed','write_contended') ORDER BY created_at DESC LIMIT 20"
+        ).fetchall()
+        if diagnostics:
+            warnings.append({"type": "capture_diagnostics", "count": len(diagnostics),
+                             "detail": "inspect capture failures and inherited output pipes in the reported jobs"})
+        contention_count = 0
+        try:
+            with (self.logs / "daemon.log").open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - 8192))
+                contention_count = handle.read(8192).count(b"event write contended")
+        except OSError:
+            pass
+        if contention_count:
+            warnings.append({"type": "ingestion_contention", "count": contention_count,
+                             "detail": "recent event writes contended; reduce parallel event rate or inspect ingestion latency"})
         if undeliverable_wakes:
             warnings.append(
                 {
@@ -5989,7 +6282,8 @@ class JobManager:
         # Orphaned MCP servers are likewise a host-hygiene advisory (reap them
         # explicitly with `vanth doctor --reap-orphans`), and depend on the
         # ambient process table, so they must not flip the health exit code.
-        soft_warning_types = {"codex_unavailable", "opencode_unavailable", "orphaned_mcp_servers"}
+        soft_warning_types = {"codex_unavailable", "opencode_unavailable", "orphaned_mcp_servers",
+                              "capture_diagnostics", "ingestion_contention"}
         hard_warnings = [w for w in warnings if w.get("type") not in soft_warning_types]
         # A dead maintenance/dispatch loop is a HARD failure: queues stop
         # draining and wake deliveries stop progressing, yet `/ready` (which
@@ -6025,6 +6319,9 @@ class JobManager:
             "disk_free_bytes": disk.free,
             "token_path": str(self.home / "token"),
             "warnings": warnings,
+            "artifact_integrity": integrity,
+            "capture_diagnostics": [dict(row) for row in diagnostics],
+            "ingestion": {"recent_contention_log_lines": contention_count},
             "orphaned_mcp_servers": orphaned_mcp,
         }
 
@@ -6263,20 +6560,10 @@ class JobManager:
         if not row:
             raise ValueError(f"Job is not running in this server: {job_id}")
         if row and row["status"] == "queued":
-            with self.db_lock:
-                changed = self.db.execute(
-                    "UPDATE jobs SET status='cancelled', stop_actor=?, stop_reason=?, ended_at=?, updated_at=? "
-                    "WHERE job_id=? AND status='queued'",
-                    (actor, reason, now_iso(), now_iso(), job_id),
-                ).rowcount
-                self.db.commit()
-            if changed:
-                self._emit(
-                    job_id,
-                    "cancelled",
-                    message="Queued job cancelled before its trigger fired",
-                    data={"actor": actor, "reason": reason},
-                )
+            if self._cancel_queued(
+                job_id, actor=actor, reason=reason, message="Queued job cancelled before its trigger fired",
+                data={"actor": actor, "reason": reason},
+            ):
                 return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Queued job cancelled"}
             # The dispatcher claimed the row to 'launching' between our read and
             # this CAS. Re-read and fall through to the live-stop path below so we
@@ -6394,7 +6681,12 @@ class JobManager:
         # newer launch that already owns the row is never cancelled by a stale
         # stop.
         if row["status"] == "launching":
-            changed = self._transition_terminal(job_id, "cancelled", claim_token=observed_claim_token)
+            changed = self._terminal_event(
+                job_id, "cancelled", claim_token=observed_claim_token, require_launching=True,
+                expected_worker_pid=observed_worker_pid,
+                message="Job cancelled while its runner was still launching",
+                data={"actor": actor, "reason": reason},
+            )
             if not changed:
                 # The runner promoted between our snapshot and this write; fall
                 # through to the normal running-stop path. PRESERVE the ORIGINAL
@@ -6417,17 +6709,14 @@ class JobManager:
                     self._terminate_pid(proc.pid, force=True, deadline=deadline)
                 self._readers_done(job_id)
                 self.processes.pop(job_id, None)
-                self._emit(
-                    job_id,
-                    "cancelled",
-                    message="Job cancelled while its runner was still launching",
-                    data={"actor": actor, "reason": reason},
-                )
                 return {"job_id": job_id, "status": "cancelled", "message": "Job stopped"}
-        changed = self._transition_terminal(job_id, "cancelled", claim_token=observed_claim_token)
+        changed = self._terminal_event(
+            job_id, "cancelled", claim_token=observed_claim_token,
+            worker_pid=observed_worker_pid if not observed_claim_token else _UNSET,
+            data={"actor": actor, "reason": reason},
+        )
         if not changed:
             return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal or owned by a newer launch"}
-        self._emit(job_id, "cancelled", data={"actor": actor, "reason": reason})
         failures = []
         runner_pid = int(row["worker_pid"]) if row["worker_pid"] else None
         if runner_pid and not self._terminate_pid(runner_pid, signal == "kill", deadline):
@@ -6578,6 +6867,16 @@ class JobManager:
     async def send(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
         return await asyncio.get_running_loop().run_in_executor(None, self.send_sync, job_id, input, eof)
 
+    def _lock_stdin(self, job_id: str):
+        from .daemon import DaemonLock
+        lock = DaemonLock(self.home / "stdin" / f"{job_id}.lock")
+        deadline = time.monotonic() + 10
+        while not lock.acquire():
+            if time.monotonic() >= deadline:
+                raise TimeoutError("stdin channel is busy; retry the send")
+            time.sleep(0.01)
+        return lock
+
     def send_sync(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
         """Append a stdin record to a running interactive job's channel."""
         self._ensure_open()
@@ -6599,11 +6898,47 @@ class JobManager:
         channel_dir = self.home / "stdin"
         channel_dir.mkdir(parents=True, exist_ok=True)
         data = input.encode()
-        with (channel_dir / f"{job_id}.in").open("ab") as f:
-            if data:
-                f.write(struct.pack("<Q", len(data)) + data)
+        # DaemonLock uses OS locks, so independent CLI/MCP processes serialize too.
+        lock = self._lock_stdin(job_id)
+        try:
+            current = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))
+            if current["status"] != "running":
+                raise ValueError(f"job is not running: {current['status']}")
+            closed = channel_dir / f"{job_id}.closed"
+            channel = channel_dir / f"{job_id}.in"
+            eof_written = closed.exists()
+            if not eof_written and channel.exists():
+                # Recover a crash between durable EOF append and marker publication.
+                with channel.open("rb") as existing:
+                    existing.seek(0, os.SEEK_END)
+                    size = existing.tell()
+                    if size >= 8:
+                        existing.seek(-8, os.SEEK_END)
+                        if existing.read(8) == b"\0" * 8:
+                            existing.seek(0)
+                            while existing.tell() + 8 <= size:
+                                length = struct.unpack("<Q", existing.read(8))[0]
+                                if length == 0:
+                                    eof_written = True
+                                    break
+                                if existing.tell() + length > size:
+                                    break
+                                existing.seek(length, os.SEEK_CUR)
+            if eof_written:
+                if eof and not data:
+                    return {"job_id": job_id, "sent": 0, "eof": True}
+                raise ValueError("stdin channel is already closed")
+            record = (struct.pack("<Q", len(data)) + data) if data else b""
             if eof:
-                f.write(struct.pack("<Q", 0))
+                record += struct.pack("<Q", 0)
+            with channel.open("ab") as f:
+                f.write(record)
+                f.flush()
+                os.fsync(f.fileno())
+            if eof:
+                closed.touch()
+        finally:
+            lock.release()
         return {"job_id": job_id, "sent": len(data), "eof": bool(eof)}
 
     def _decision_dict(self, row: sqlite3.Row) -> dict[str, Any]:
@@ -6928,8 +7263,14 @@ def job_start(
     remote_id: str | None = None,
     idempotency_key: str | None = None,
     wake_me: bool = False,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Core: Start a background job and return its job ID; use ``job_wait`` or ``job_status`` to track it.
+
+    For a direct local job, this call also waits up to three seconds for the
+    workload's ``started`` event. ``startup_confirmed`` reports whether that
+    confirmation arrived; false means check later, not that startup failed.
+    Queued jobs and remote submissions return without this local confirmation.
 
     ``pool`` queues the job behind a named concurrency pool instead of starting
     it immediately; ``priority`` (higher first) orders queued pool/trigger jobs.
@@ -6974,8 +7315,10 @@ def job_start(
     `vanth remote pair user@host`). Remote mutations REQUIRE a caller-supplied
     ``idempotency_key`` (8..128 chars in ``[A-Za-z0-9_-]``) — that is what makes
     a lost response safe to retry — and the daemon rejects a missing one. Local
-    starts are the opposite: they must NOT pass a key (there is no local dedup
-    store yet).
+    starts optionally accept a key too: retry identical settings with the same
+    key to recover the existing job, including after a daemon restart. Reusing
+    a key for different settings is rejected. ``dry_run=True`` validates and
+    previews a local start without launching work or creating a job.
 
     ``wake_targets`` resumes a client when the job emits a matching event. For
     ``opencode_thread``, pass the OpenCode ``ses_...`` session id (from
@@ -6999,6 +7342,7 @@ def job_start(
         origin_thread_id
         or os.environ.get("CODEX_THREAD_ID")
     )
+    cwd = cwd or os.getcwd()
     copied_targets: list[dict[str, Any]] | None = None
     if wake_me and wake_targets is None:
         # Mirror the CLI shorthand: the events MUST be present (a wake target
@@ -7012,8 +7356,11 @@ def job_start(
         }]
     if wake_targets is not None:
         copied_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
-    return get_client().post(
-        "/jobs",
+    client = get_client()
+    if dry_run and remote_id:
+        raise ValueError("start preview is supported for local jobs only")
+    started = client.post(
+        "/jobs/preview" if dry_run else "/jobs",
         {
             "command": command,
             "cwd": cwd,
@@ -7035,6 +7382,34 @@ def job_start(
             "idempotency_key": idempotency_key,
         },
     )
+    return client.confirm_local_start(started) if not remote_id and not dry_run else started
+
+
+@mcp.tool()
+def job_start_and_wait(command: str, cwd: str | None = None, name: str | None = None,
+                       env: dict[str, str] | None = None, timeout_seconds: int | None = None,
+                       wait_timeout_seconds: int = 20, tags: list[str] | None = None,
+                       notes: str | None = None, secret_env: list[str] | None = None,
+                       idempotency_key: str | None = None) -> dict[str, Any]:
+    """Run a short local job, wait for a terminal outcome, and return its summary.
+
+    The wait lasts 1..300 seconds; if it times out the job keeps running and its
+    ``job_id`` is returned for a later ``job_wait``. Use ``job_start`` with a wake
+    target for long work. ``timeout_seconds`` is the job's runtime limit, while
+    ``wait_timeout_seconds`` only bounds this tool call.
+    """
+    if isinstance(wait_timeout_seconds, bool) or not isinstance(wait_timeout_seconds, int) or not 1 <= wait_timeout_seconds <= 300:
+        raise ValueError("wait_timeout_seconds must be between 1 and 300")
+    started = job_start(command=command, cwd=cwd, name=name, env=env,
+                        timeout_seconds=timeout_seconds, tags=tags, notes=notes,
+                        secret_env=secret_env, idempotency_key=idempotency_key)
+    job_id = started.get("job_id")
+    if not job_id:
+        return started
+    waited = job_wait(job_id, ["completed", "failed", "timeout", "cancelled", "orphaned"],
+                      timeout_seconds=wait_timeout_seconds)
+    summary = job_run_summary(job_id, include_stderr_excerpt=True, include_stdout_excerpt=True)
+    return {"job_id": job_id, "status": summary["status"], "wait": waited, "summary": summary}
 
 
 @mcp.tool()
@@ -7046,8 +7421,8 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
     """Core: Start a new job from this job's settings, overriding only supplied fields.
 
     Use after inspecting a failed or completed run; this creates a new job ID.
-    Remote reruns require ``idempotency_key``. Check the returned ID with
-    ``job_status`` or ``job_wait``.
+    Remote reruns require ``idempotency_key``. Direct local reruns include the
+    same bounded startup confirmation and failure guidance as ``job_start``.
     """
     payload = {key: value for key, value in {
         "command": command,
@@ -7062,7 +7437,9 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
         "remote_id": remote_id,
         "idempotency_key": idempotency_key,
     }.items() if value is not None}
-    return get_client().post(f"/jobs/{job_id}/rerun", payload)
+    client = get_client()
+    started = client.post(f"/jobs/{job_id}/rerun", payload)
+    return client.confirm_local_start(started) if not remote_id else started
 
 
 @mcp.tool()
@@ -7409,9 +7786,9 @@ def schedule_next(schedule_id: str, count: int = 5) -> dict[str, Any]:
 
 
 @mcp.tool()
-def job_doctor() -> dict[str, Any]:
+def job_doctor(verify_artifacts: bool = False) -> dict[str, Any]:
     """Core: Check daemon and job-store health; use when Vanth tools fail or report inconsistent state."""
-    return get_client().get("/doctor")
+    return get_client().get("/doctor", {"verify_artifacts": verify_artifacts})
 
 
 @mcp.tool()
@@ -7453,9 +7830,13 @@ def job_duration_stats(name: str | None = None, tags: list[str] | None = None, l
 
 
 @mcp.tool()
-def job_run_summary(job_id: str) -> dict[str, Any]:
-    """One-call summary of a job: status, runtime, progress, latest metrics, artifacts."""
-    return get_client().get(f"/jobs/{job_id}/summary")
+def job_run_summary(job_id: str, include_stderr_excerpt: bool = False,
+                    include_stdout_excerpt: bool = False) -> dict[str, Any]:
+    """One-call summary with optional bounded stderr (2 KiB) and stdout (8 KiB)."""
+    return get_client().get(f"/jobs/{job_id}/summary", {
+        "include_stderr_excerpt": include_stderr_excerpt,
+        "include_stdout_excerpt": include_stdout_excerpt,
+    })
 
 
 @mcp.tool()
@@ -7941,7 +8322,7 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
 _VANTH_CLI_GLOBAL_FLAGS = {"--json"}
 _VANTH_CLI_SUBCOMMANDS = {
     "status", "doctor", "restart", "setup", "--help", "-h", "help",
-    "start", "list", "ps", "logs", "tail", "stop", "sleep", "deliveries", "api",
+    "start", "list", "ps", "logs", "tail", "stop", "rerun", "send", "sleep", "deliveries", "api",
     "artifacts", "prune", "backup", "restore", "wait", "diff", "wake",
     "autostart", "--version", "version", "remote",
 }

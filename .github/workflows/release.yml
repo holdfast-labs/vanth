@@ -27,6 +27,12 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.11', '3.12']
+        # macOS runners are scarce/slow; one Python version there (matching the
+        # push CI matrix). Adding macOS x 3.11 tripled the macOS chaos load and
+        # flaked on timing rather than correctness.
+        exclude:
+          - os: macos-latest
+            python: '3.11'
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

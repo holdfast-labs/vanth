@@ -221,7 +221,10 @@ def test_cleanup_failure_changes_report_to_fail(monkeypatch, tmp_path):
 
 def test_real_short_soak_emits_all_events_on_platform_shell(tmp_path, capsys):
     report_path = tmp_path / "real-soak.json"
-    assert soak.main(["--duration", "2", "--jobs", "1", "--events", "3", "--interval", "0",
+    # 6s (not 2s): a loaded CI runner can take several seconds just to start the
+    # interpreter runner and workload; the 2s window sometimes elapsed before the
+    # single job's terminal state + runner exit were observed (jobs_verified==0).
+    assert soak.main(["--duration", "6", "--jobs", "1", "--events", "3", "--interval", "0",
                       "--report", str(report_path)]) == 0
     report = json.loads(report_path.read_text())
     assert report["result"] == "pass"

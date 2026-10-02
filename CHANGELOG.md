@@ -2,6 +2,20 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.13.1 - 2026-10-02
+
+### Fixes
+
+- Terminal job events now always carry a human-readable `message`. A failed
+  job previously emitted `failed` with an empty message and only
+  `data={"exit_code":1}`, so `job_status`/`job_wait` showed a bare status with
+  no reason. `failed`/`timeout`/`cancelled`/`completed`/`orphaned` now include
+  one (e.g. `Job failed (exit code 7)`, `Job timed out: exceeded timeout of
+  2s`).
+- An unsigned Windows termination status is normalized to its signed value in
+  the stored exit code and messages, so a killed workload shows `-1` instead of
+  `4294967295`.
+
 ## 1.13.0 - 2026-10-01
 
 ### Agent usability

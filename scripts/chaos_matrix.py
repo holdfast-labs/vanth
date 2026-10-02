@@ -112,20 +112,7 @@ class BurstScenario(Scenario):
 
     def run(self) -> None:
         home = Path(tempfile.mkdtemp(prefix="vanth-burst-"))
-        # On platforms without process-group/job-object containment (macOS), one
-        # runner's process probe can momentarily match a concurrently spawning
-        # sibling and orphan it. Bound the concurrency so only a few interpreters
-        # start at once; on Windows containment makes group collisions
-        # impossible, so keep 50-at-once there.
-        previous = os.environ.get("VANTH_MAX_RUNNING_JOBS")
-        os.environ["VANTH_MAX_RUNNING_JOBS"] = "50" if sys.platform == "win32" else "6"
-        try:
-            manager = JobManager(home)
-        finally:
-            if previous is None:
-                os.environ.pop("VANTH_MAX_RUNNING_JOBS", None)
-            else:
-                os.environ["VANTH_MAX_RUNNING_JOBS"] = previous
+        manager = JobManager(home)
         try:
             started = []
             code = (
@@ -134,13 +121,10 @@ class BurstScenario(Scenario):
                 f"print('AGENT_EVENT '+json.dumps({{'type':'metric','data':{{'i':i+{self.events}}}}}), file=sys.stderr, flush=True));"
                 f"[f(i) for i in range({self.events})]"
             )
-            # Start in waves: launches beyond the cap stay 'queued' until earlier
-            # jobs finish, then the dispatcher fires them (start() itself is not
-            # gated by VANTH_MAX_RUNNING_JOBS; the queued dispatch is).
             for index in range(self.jobs):
                 started.append(asyncio.run(manager.start(cmd(code), name=f"burst-{index}"))["job_id"])
                 if index % 5 == 4:
-                    time.sleep(2.0)
+                    time.sleep(1.0)
             for index, job_id in enumerate(started):
                 wait_for(
                     lambda job_id=job_id: manager.status(job_id)["status"] in {"completed", "failed"},

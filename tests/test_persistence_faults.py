@@ -34,8 +34,10 @@ def test_real_sqlite_write_contention_release_preserves_one_terminal_event(manag
     entered, finished = threading.Event(), threading.Event()
     errors = []
     original = manager._emit_transactional
+    attempts = {"n": 0}
 
     def observe_attempt(*args, **kwargs):
+        attempts["n"] += 1
         entered.set()
         return original(*args, **kwargs)
     monkeypatch.setattr(manager, "_emit_transactional", observe_attempt)
@@ -56,7 +58,10 @@ def test_real_sqlite_write_contention_release_preserves_one_terminal_event(manag
         blocker.commit()
         assert finished.wait(3)
         assert not errors
-        assert "event write contended" in caplog.text
+        # The writer had to retry after the blocking lock released. Assert on the
+        # observed attempts (the contention log goes through a propagate=False
+        # logger, which caplog does not reliably capture across platforms).
+        assert attempts["n"] >= 2, attempts
         assert manager.status("job_fault")["status"] == "completed"
         assert manager.status("job_fault")["exit_code"] == 0
         assert [(row["seq"], row["type"]) for row in manager.db.execute(

@@ -19,6 +19,50 @@ def cmd(code: str) -> str:
     return shellcmd.join([sys.executable, "-c", code])
 
 
+def test_terminal_events_carry_a_message_and_normalize_exit_code(tmp_path):
+    """A terminal status must explain itself: failed/timeout events previously
+    had an empty message, and a Windows termination status (4294967295) showed
+    as a huge exit code."""
+    async def main():
+        manager = JobManager(tmp_path)
+        started = await manager.start(cmd("import sys; sys.exit(7)"))
+        # Wait for the terminal event to be persisted.
+        await manager.wait(started["job_id"], ["failed"], timeout_seconds=30)
+        events = manager.events(started["job_id"])["events"]
+        failed = [e for e in events if e["type"] == "failed"]
+        assert failed, events
+        assert failed[0]["message"], "failed event must carry a message"
+        assert "7" in failed[0]["message"], failed[0]["message"]
+        assert manager.status(started["job_id"])["exit_code"] == 7
+        manager.close()
+
+    asyncio.run(main())
+
+
+def test_timeout_event_message_names_the_timeout(tmp_path):
+    async def main():
+        manager = JobManager(tmp_path)
+        started = await manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
+        await manager.wait(started["job_id"], ["timeout"], timeout_seconds=30)
+        events = manager.events(started["job_id"])["events"]
+        timeout = [e for e in events if e["type"] == "timeout"]
+        assert timeout, events
+        assert "timeout" in (timeout[0]["message"] or "").lower(), timeout[0]["message"]
+        manager.close()
+
+    asyncio.run(main())
+
+
+def test_display_exit_code_normalizes_windows_termination_status():
+    from vanth.server import JobManager
+
+    assert JobManager._display_exit_code(None) is None
+    assert JobManager._display_exit_code(0) == 0
+    assert JobManager._display_exit_code(1) == 1
+    assert JobManager._display_exit_code(-9) == -9
+    assert JobManager._display_exit_code(4294967295) == -1
+
+
 def test_malformed_event_does_not_kill_reader(tmp_path):
     async def main():
         manager = JobManager(tmp_path)

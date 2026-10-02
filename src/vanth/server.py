@@ -5109,16 +5109,47 @@ class JobManager:
                            source=source, mutate=transition)
         return event.get("persisted") is not False
 
+    @staticmethod
+    def _display_exit_code(exit_code: int | None) -> int | None:
+        """Render a process exit code for humans.
+
+        Windows reports a termination status as an unsigned DWORD, so a killed
+        workload can surface as 4294967295; show the signed 32-bit value (-1)
+        instead of a huge number. POSIX signal exits are already negative.
+        """
+        if exit_code is None:
+            return None
+        if exit_code > 0x7FFFFFFF:
+            return exit_code - 0x100000000
+        return exit_code
+
     def _finish(self, job_id: str, status: str, exit_code: int | None = None, *, claim_token: str | None = None) -> None:
         row = self._row("SELECT stop_requested_at, stop_actor, stop_reason, timeout_seconds FROM jobs WHERE job_id=?", (job_id,))
         if row and row["stop_requested_at"]:
             status = "cancelled"
+        # Normalize the exit code once (Windows unsigned termination status ->
+        # signed) so status/summary and the event message agree.
+        exit_code = self._display_exit_code(exit_code)
         data: dict[str, Any] = {"exit_code": exit_code} if exit_code is not None else {}
+        message: str | None = None
         if status == "cancelled":
             data.update(stop_event_data(row or {}, default_actor="user", default_reason="stop requested"))
+            message = "Job cancelled"
         elif status == "timeout":
-            data.update({"actor": "timeout", "reason": f"exceeded timeout of {row['timeout_seconds']}s" if row and row["timeout_seconds"] else "exceeded configured timeout"})
-        self._terminal_event(job_id, status, exit_code, claim_token=claim_token, data=data)
+            detail = f"exceeded timeout of {row['timeout_seconds']}s" if row and row["timeout_seconds"] else "exceeded configured timeout"
+            data.update({"actor": "timeout", "reason": detail})
+            message = f"Job timed out: {detail}"
+        elif status == "failed":
+            # A terminal status without a reason is what an operator sees first;
+            # always attach one rather than leaving message empty. A zero exit
+            # code here means the workload exited cleanly but output capture
+            # failed, so don't claim a non-zero exit.
+            message = f"Job failed (exit code {exit_code})" if exit_code else "Job failed"
+        elif status == "completed":
+            message = "Job completed"
+        elif status == "orphaned":
+            message = "Job runner exited before recording a terminal status"
+        self._terminal_event(job_id, status, exit_code, claim_token=claim_token, message=message, data=data)
         self.processes.pop(job_id, None)
 
     def _event_query(self, job_id: str, types: list[str] | None, since_event_id: str | None, limit: int,
@@ -7031,6 +7062,7 @@ class JobManager:
         changed = self._terminal_event(
             job_id, "cancelled", claim_token=observed_claim_token,
             worker_pid=observed_worker_pid if not observed_claim_token else _UNSET,
+            message=f"Job cancelled by {actor}: {reason}",
             data={"actor": actor, "reason": reason},
         )
         if not changed:

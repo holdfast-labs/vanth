@@ -121,10 +121,16 @@ class BurstScenario(Scenario):
                 f"print('AGENT_EVENT '+json.dumps({{'type':'metric','data':{{'i':i+{self.events}}}}}), file=sys.stderr, flush=True));"
                 f"[f(i) for i in range({self.events})]"
             )
+            # Launch through a bounded pool: 50 simultaneous interpreter runner
+            # spawns stampede a constrained CI runner (Windows/macOS), stalling a
+            # launch past the completion wait or tripping a transient write lock.
+            # The dispatcher starts pool jobs a few at a time; the durability
+            # guarantee (no lost events, unique seq) is unchanged.
+            manager.pool_configure("burst", max_parallel=4)
             for index in range(self.jobs):
-                started.append(asyncio.run(manager.start(cmd(code), name=f"burst-{index}"))["job_id"])
-                if index % 5 == 4:
-                    time.sleep(1.0)
+                started.append(
+                    asyncio.run(manager.start(cmd(code), name=f"burst-{index}", pool="burst"))["job_id"]
+                )
             for index, job_id in enumerate(started):
                 wait_for(
                     lambda job_id=job_id: manager.status(job_id)["status"] in {"completed", "failed"},

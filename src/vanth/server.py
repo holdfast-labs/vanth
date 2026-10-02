@@ -3422,81 +3422,90 @@ class JobManager:
         # starter can never mark a newer run failed (all writes are claim-token
         # guarded).
         direct_claim_token = None if queued else "claim_" + uuid.uuid4().hex[:16]
-        with self.db_lock:
-            try:
-                # Concurrent-job quota is enforced ATOMICALLY with the row insert
-                # (review rc37 P1): BEGIN IMMEDIATE acquires the write lock before
-                # the count, so the count and the INSERT are ONE transaction. Two
-                # manager processes (or threads) synchronized at a SELECT-then-insert
-                # can no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two
-                # 'launching' rows. Both 'launching' and 'running' reservations count.
-                if idempotency_key is not None or (self.max_running_jobs and not queued):
-                    self.db.execute("BEGIN IMMEDIATE")
-                if idempotency_key is not None:
-                    replay = self._replay_local_start(idempotency_key, request_hash)
-                    if replay is not None:
-                        self.db.commit()
-                        return replay
-                if self.max_running_jobs and not queued:
-                    reserved = self.db.execute(
-                        "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
-                    ).fetchone()[0]
-                    if reserved >= self.max_running_jobs:
-                        raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
-                self.db.execute(
-                    """
-                INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
-                  timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
-                  stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token, secret_env_json,
-                  pool, priority, schedule_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                    (
-                        job_id,
-                        name,
-                        command,
-                        cwd,
-                        "queued" if queued else "launching",
-                        created_at,
-                        created_at,
-                        None if queued else created_at,
-                        None if queued else created_at,
-                        timeout_seconds,
-                        json.dumps(notify_on or []),
-                        origin_thread_id,
-                        wake_thread_id,
-                        json.dumps(tags or [], separators=(",", ":")),
-                        json.dumps(env or {}, separators=(",", ":")),
-                        notes,
-                        serialize_run_metadata(run_payload),
-                        str(stdout_path),
-                        str(stderr_path),
-                        str(events_path),
-                        json.dumps(trigger, separators=(",", ":")) if trigger else None,
-                        json.dumps(policy, separators=(",", ":")) if policy else None,
-                        direct_claim_token,
-                        json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
-                        pool,
-                        priority,
-                        schedule_id,
-                    ),
-                )
-                # The job row and its wake targets commit in ONE transaction: a
-                # crash between the two would leave an accepted job whose
-                # promised notifications were never registered, and the caller
-                # cannot repair that (the job exists, so a retry would duplicate
-                # it). Rollback on ANY failure so a half-written acceptance can
-                # never be swept into the DB by a later commit.
-                self._insert_wake_targets(job_id, wake_targets or [], created_at)
-                if idempotency_key is not None:
+        def accept_start() -> dict[str, Any] | None:
+            with self.db_lock:
+                try:
+                    # Concurrent-job quota is enforced ATOMICALLY with the row insert
+                    # (review rc37 P1): BEGIN IMMEDIATE acquires the write lock before
+                    # the count, so the count and the INSERT are ONE transaction. Two
+                    # manager processes (or threads) synchronized at a SELECT-then-insert
+                    # can no longer both pass VANTH_MAX_RUNNING_JOBS=1 and create two
+                    # 'launching' rows. Both 'launching' and 'running' reservations count.
+                    if idempotency_key is not None or (self.max_running_jobs and not queued):
+                        self.db.execute("BEGIN IMMEDIATE")
+                    if idempotency_key is not None:
+                        replay = self._replay_local_start(idempotency_key, request_hash)
+                        if replay is not None:
+                            self.db.commit()
+                            return replay
+                    if self.max_running_jobs and not queued:
+                        reserved = self.db.execute(
+                            "SELECT COUNT(*) FROM jobs WHERE status IN ('running','launching')"
+                        ).fetchone()[0]
+                        if reserved >= self.max_running_jobs:
+                            raise ValueError(f"concurrent job quota reached ({self.max_running_jobs} running jobs)")
                     self.db.execute(
-                        "INSERT INTO local_start_requests VALUES (?, ?, ?, ?)",
-                        (idempotency_key, request_hash, job_id, created_at),
+                        """
+                    INSERT INTO jobs(job_id, name, command, cwd, status, created_at, updated_at, started_at, runner_heartbeat_at,
+                      timeout_seconds, notify_on, origin_thread_id, wake_thread_id, tags_json, env_json, notes, run_json,
+                      stdout_path, stderr_path, events_path, trigger_json, policy_json, claim_token, secret_env_json,
+                      pool, priority, schedule_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        (
+                            job_id,
+                            name,
+                            command,
+                            cwd,
+                            "queued" if queued else "launching",
+                            created_at,
+                            created_at,
+                            None if queued else created_at,
+                            None if queued else created_at,
+                            timeout_seconds,
+                            json.dumps(notify_on or []),
+                            origin_thread_id,
+                            wake_thread_id,
+                            json.dumps(tags or [], separators=(",", ":")),
+                            json.dumps(env or {}, separators=(",", ":")),
+                            notes,
+                            serialize_run_metadata(run_payload),
+                            str(stdout_path),
+                            str(stderr_path),
+                            str(events_path),
+                            json.dumps(trigger, separators=(",", ":")) if trigger else None,
+                            json.dumps(policy, separators=(",", ":")) if policy else None,
+                            direct_claim_token,
+                            json.dumps(secret_env, separators=(",", ":")) if secret_env else None,
+                            pool,
+                            priority,
+                            schedule_id,
+                        ),
                     )
-                self.db.commit()
-            except BaseException:
-                self.db.rollback()
-                raise
+                    # The job row and its wake targets commit in ONE transaction: a
+                    # crash between the two would leave an accepted job whose
+                    # promised notifications were never registered, and the caller
+                    # cannot repair that (the job exists, so a retry would duplicate
+                    # it). Rollback on ANY failure so a half-written acceptance can
+                    # never be swept into the DB by a later commit.
+                    self._insert_wake_targets(job_id, wake_targets or [], created_at)
+                    if idempotency_key is not None:
+                        self.db.execute(
+                            "INSERT INTO local_start_requests VALUES (?, ?, ?, ?)",
+                            (idempotency_key, request_hash, job_id, created_at),
+                        )
+                    self.db.commit()
+                    return None
+                except BaseException:
+                    self.db.rollback()
+                    raise
+
+        # Retry transient cross-process write contention (a runner or another
+        # launch holding the lock). The rollback runs under db_lock inside
+        # accept_start, so a retry can never discard another thread's txn.
+        replay = self._retry_locked(accept_start)
+        if replay is not None:
+            return replay
         if queued:
             gates = []
             if trigger and trigger.get("job_id"):

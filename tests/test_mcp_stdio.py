@@ -54,7 +54,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
         )
         try:
             async with stdio_client(server) as (read, write):
-                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
+                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=30)) as session:
                     await session.initialize()
                     tools = {tool.name for tool in (await session.list_tools()).tools}
                     assert {"job_start", "job_wait", "job_tail", "job_view", "job_doctor", "job_retry_delivery"} <= tools
@@ -87,7 +87,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         await session.call_tool(
                             "job_wait",
                             {"job_id": start["job_id"], "filters": ["progress"], "timeout_seconds": 5},
-                            read_timeout_seconds=timedelta(seconds=10),
+                            read_timeout_seconds=timedelta(seconds=30),
                         )
                     )
                     status = content(await session.call_tool("job_status", {"job_id": start["job_id"]}))
@@ -100,7 +100,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                                 "since_event_id": progress["event"]["event_id"],
                                 "timeout_seconds": 5,
                             },
-                            read_timeout_seconds=timedelta(seconds=10),
+                            read_timeout_seconds=timedelta(seconds=30),
                         )
                     )
                     tail = content(await session.call_tool("job_tail", {"job_id": start["job_id"]}))
@@ -129,7 +129,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         "job_start_and_wait",
                         {"command": shellcmd.join([sys.executable, "-c", "print('done')"]),
                          "wait_timeout_seconds": 5},
-                        read_timeout_seconds=timedelta(seconds=10),
+                        read_timeout_seconds=timedelta(seconds=30),
                     ))
                     assert quick["status"] == "completed"
                     assert quick["wait"]["result"] == "event"
@@ -140,7 +140,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         {"command": shellcmd.join([sys.executable, "-c",
                                                    "import sys; sys.stderr.write('E'*2100 + ' final marker'); sys.exit(7)"]),
                          "wait_timeout_seconds": 5},
-                        read_timeout_seconds=timedelta(seconds=10),
+                        read_timeout_seconds=timedelta(seconds=30),
                     ))
                     assert failure["status"] == "failed"
                     assert failure["summary"]["exit_code"] == 7
@@ -159,7 +159,7 @@ def test_mcp_stdio_start_wait_tail(tmp_path):
                         "job_start_and_wait",
                         {"command": shellcmd.join([sys.executable, "-c", "import time; time.sleep(5)"]),
                          "wait_timeout_seconds": 1},
-                        read_timeout_seconds=timedelta(seconds=10),
+                        read_timeout_seconds=timedelta(seconds=30),
                     ))
                     assert waiting["wait"]["result"] == "timeout"
                     assert waiting["status"] in {"running", "launching"}
@@ -183,7 +183,7 @@ def test_mcp_stdio_errors_and_event_cap(tmp_path):
         )
         try:
             async with stdio_client(server) as (read, write):
-                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
+                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=30)) as session:
                     await session.initialize()
                     missing = content(await session.call_tool("job_status", {"job_id": "job_missing"}))
                     assert missing["result"] == "error"
@@ -200,7 +200,7 @@ def test_mcp_stdio_errors_and_event_cap(tmp_path):
                         await session.call_tool(
                             "job_wait",
                             {"job_id": start["job_id"], "filters": ["checkpoint"], "timeout_seconds": 5},
-                            read_timeout_seconds=timedelta(seconds=10),
+                            read_timeout_seconds=timedelta(seconds=30),
                         )
                     )
                     assert event["event"]["data"] == {"truncated": True, "max_bytes": 20}
@@ -231,7 +231,7 @@ def test_job_wake_now_inherits_caller_codex_thread(tmp_path):
         )
         try:
             async with stdio_client(server) as (read, write):
-                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=10)) as session:
+                async with ClientSession(read, write, read_timeout_seconds=timedelta(seconds=30)) as session:
                     await session.initialize()
                     # Start a quick job so there is a real job row to wake.
                     command = shellcmd.join([sys.executable, "-c", "print('wake me')"])

@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
@@ -420,6 +421,77 @@ def test_launch_claim_clears_stale_workload_pid(tmp_path):
         assert row["pid"] is None
         assert row["worker_pid"] is None
         assert row["runner_heartbeat_at"] is None
+    finally:
+        manager.close()
+
+
+def test_launch_retries_transient_lock_on_worker_pid_write(tmp_path, monkeypatch):
+    """_launch's post-spawn worker_pid write must go through _retry_locked.
+
+    An uncaught 'database is locked' there would abort start() after the runner
+    already spawned, leaking a live runner the caller never learned about. Assert
+    the write is retried (the fn passed to _retry_locked raises once, then the
+    real write runs)."""
+    import sqlite3
+    import vanth.server as server_module
+
+    manager = JobManager(tmp_path, recover=False)
+    try:
+        token = "claim_" + "a" * 16
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, "
+                "events_path, claim_token) VALUES ('job_lock', 'true', 'launching', ?, ?, ?, ?, ?, ?)",
+                (
+                    server_module.now_iso(), server_module.now_iso(),
+                    str(manager.logs / "job_lock.stdout.log"),
+                    str(manager.logs / "job_lock.stderr.log"),
+                    str(manager.events_dir / "job_lock.jsonl"),
+                    token,
+                ),
+            )
+            manager.db.commit()
+
+        real_retry = manager._retry_locked
+        state = {"locked_once": False, "retries": 0}
+
+        def retry_then_inject(fn, *args, **kwargs):
+            def flaky():
+                if not state["locked_once"]:
+                    state["locked_once"] = True
+                    raise sqlite3.OperationalError("database is locked")
+                return fn()
+            return real_retry(flaky, *args, **kwargs)
+
+        monkeypatch.setattr(manager, "_retry_locked", retry_then_inject)
+
+        released = threading.Event()
+
+        class FakeProc:
+            pid = 4242
+
+            def wait(self, timeout=None):
+                released.wait(5)
+                return 0
+
+            def poll(self):
+                return None
+
+        monkeypatch.setattr(server_module.subprocess, "Popen", lambda *a, **k: FakeProc())
+        try:
+            result = manager._launch(
+                "job_lock",
+                manager.logs / "job_lock.stdout.log",
+                manager.logs / "job_lock.stderr.log",
+                manager.events_dir / "job_lock.jsonl",
+                manager.specs_dir / "job_lock.json",
+                claim_token=token,
+            )
+        finally:
+            released.set()
+        assert state["locked_once"], "worker_pid write should not have raised before retry"
+        assert result["status"] == "running"
+        assert result["worker_pid"] == 4242
     finally:
         manager.close()
 

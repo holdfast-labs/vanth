@@ -3721,79 +3721,91 @@ class JobManager:
         # from a claim abandoned before spawn (review rc32 P1-3). This write
         # is claim-token guarded: it cannot resurrect a run the runner has
         # already finished or that a newer launch owns.
-        with self.db_lock:
-            wrote = self.db.execute(
-                "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND claim_token=? AND status='launching'",
-                (proc.pid, now_iso(), job_id, claim_token),
-            ).rowcount
-            self.db.commit()
-            if wrote != 1:
-                # The worker_pid write returned 0. That can mean two very
-                # different things:
-                #
-                # 1. OWNED SUCCESS: our runner already promoted this same claim
-                #    launching -> running (and possibly already finished it).
-                #    The runner is a VALID run of the job — never terminate it.
-                # 2. CLAIM LOSS: recovery reclaimed the claim, or a newer launch
-                #    owns the row (claim_token mismatched). The runner is for a
-                #    run that is no longer ours — terminate it.
-                #
-                # Distinguish by inspecting claim_token/status: same token with
-                # status 'running' (or any terminal) is owned success; only a
-                # mismatched token represents claim loss (review rc33 P1-1).
-                current = self._row(
-                    "SELECT status, claim_token, pid, worker_pid FROM jobs WHERE job_id=?", (job_id,)
-                )
-                ours = bool(
-                    current
-                    and current["claim_token"] == claim_token
-                    and current["status"] in {"running", "launching"} | TERMINAL_STATUSES
-                )
-                if ours:
-                    # The runner beat us to the promotion (or finished the job
-                    # before we recorded worker_pid). This is the success path.
-                    # The runner already cleared any pending restart intent in
-                    # its promotion transaction (review rc34 P1-1); no clear
-                    # here.
-                    return {
-                        "job_id": job_id,
-                        "status": current["status"],
-                        "worker_pid": current["worker_pid"] or proc.pid,
-                        "pid": current["pid"],
-                        "stdout_path": str(stdout_path),
-                        "stderr_path": str(stderr_path),
-                        "events_path": str(events_path),
-                        "message": "Job started",
-                    }
-                # The claim was lost between spawn and this write. Never leave a
-                # runner for a run that is no longer ours.
-                self.processes.pop(job_id, None)
+        def record_worker_pid() -> int:
+            # Retry transient cross-process write-lock contention (a runner
+            # promoting its own claim, or another launch). An uncaught "database
+            # is locked" here would abort start() after the runner already
+            # spawned, leaving a live runner the caller never learned about.
+            with self.db_lock:
                 try:
-                    self._terminate_pid(proc.pid, force=True, deadline=time.monotonic() + self.recovery_kill_timeout)
-                except Exception:
-                    self.logger.exception("could not terminate leaked runner job_id=%s pid=%s", job_id, proc.pid)
+                    changed = self.db.execute(
+                        "UPDATE jobs SET worker_pid=?, updated_at=? WHERE job_id=? AND claim_token=? AND status='launching'",
+                        (proc.pid, now_iso(), job_id, claim_token),
+                    ).rowcount
+                    self.db.commit()
+                    return changed
+                except BaseException:
+                    self.db.rollback()
+                    raise
+
+        wrote = self._retry_locked(record_worker_pid)
+        if wrote != 1:
+            # The worker_pid write returned 0. That can mean two very
+            # different things:
+            #
+            # 1. OWNED SUCCESS: our runner already promoted this same claim
+            #    launching -> running (and possibly already finished it).
+            #    The runner is a VALID run of the job — never terminate it.
+            # 2. CLAIM LOSS: recovery reclaimed the claim, or a newer launch
+            #    owns the row (claim_token mismatched). The runner is for a
+            #    run that is no longer ours — terminate it.
+            #
+            # Distinguish by inspecting claim_token/status: same token with
+            # status 'running' (or any terminal) is owned success; only a
+            # mismatched token represents claim loss (review rc33 P1-1).
+            current = self._row(
+                "SELECT status, claim_token, pid, worker_pid FROM jobs WHERE job_id=?", (job_id,)
+            )
+            ours = bool(
+                current
+                and current["claim_token"] == claim_token
+                and current["status"] in {"running", "launching"} | TERMINAL_STATUSES
+            )
+            if ours:
+                # The runner beat us to the promotion (or finished the job
+                # before we recorded worker_pid). This is the success path.
+                # The runner already cleared any pending restart intent in
+                # its promotion transaction (review rc34 P1-1); no clear
+                # here.
                 return {
                     "job_id": job_id,
-                    "status": (current["status"] if current else "lost"),
-                    "message": "Launch claim was lost before the runner published",
-                    "worker_pid": proc.pid,
+                    "status": current["status"],
+                    "worker_pid": current["worker_pid"] or proc.pid,
+                    "pid": current["pid"],
                     "stdout_path": str(stdout_path),
                     "stderr_path": str(stderr_path),
                     "events_path": str(events_path),
+                    "message": "Job started",
                 }
-            # The runner clears pending_restart_after in its token-guarded
-            # promotion transaction (review rc34 P1-1). The parent must NOT
-            # clear it here: the row may still be 'launching' and a crash before
-            # promotion would lose the already-budgeted retry.
+            # The claim was lost between spawn and this write. Never leave a
+            # runner for a run that is no longer ours.
+            self.processes.pop(job_id, None)
+            try:
+                self._terminate_pid(proc.pid, force=True, deadline=time.monotonic() + self.recovery_kill_timeout)
+            except Exception:
+                self.logger.exception("could not terminate leaked runner job_id=%s pid=%s", job_id, proc.pid)
             return {
                 "job_id": job_id,
-                "status": "running",
+                "status": (current["status"] if current else "lost"),
+                "message": "Launch claim was lost before the runner published",
                 "worker_pid": proc.pid,
                 "stdout_path": str(stdout_path),
                 "stderr_path": str(stderr_path),
                 "events_path": str(events_path),
-                "message": "Job started",
             }
+        # The runner clears pending_restart_after in its token-guarded
+        # promotion transaction (review rc34 P1-1). The parent must NOT
+        # clear it here: the row may still be 'launching' and a crash before
+        # promotion would lose the already-budgeted retry.
+        return {
+            "job_id": job_id,
+            "status": "running",
+            "worker_pid": proc.pid,
+            "stdout_path": str(stdout_path),
+            "stderr_path": str(stderr_path),
+            "events_path": str(events_path),
+            "message": "Job started",
+        }
 
     def _claim_launch(
         self,

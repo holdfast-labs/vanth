@@ -2476,12 +2476,18 @@ class JobManager:
                 self._condition(job_id).notify_all()
             with self.db_lock:
                 retry_count = self.event_contentions_by_job.get(job_id, 0) - contentions
-                report = (retry_count > 0 or elapsed > 1) and job_id not in self._contention_reported
+                # Only emit a job event for *actual* lock contention. A slow but
+                # uncontended batch (loaded CI runner, stalled disk) is logged,
+                # not injected into the job's event stream, so it cannot perturb
+                # sequence-sensitive consumers.
+                report = retry_count > 0 and job_id not in self._contention_reported
                 if report:
                     self._contention_reported.add(job_id)
             if report:
                 self._emit_safely(job_id, "write_contended", message="Captured events waited for SQLite persistence",
                                   data={"retry_count": retry_count, "write_seconds": round(elapsed, 3)}, level="warning")
+            elif elapsed > 1:
+                self.logger.warning("event capture slow job_id=%s stream=%s seconds=%.3f", job_id, source, elapsed)
 
     def _append_event_mirror(self, event: dict[str, Any], job_id: str) -> None:
         try:

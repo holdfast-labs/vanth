@@ -27,9 +27,10 @@ def cmd(code: str) -> str:
     return shellcmd.join([sys.executable, "-c", code])
 
 
-def wait_completed(manager: JobManager, job_id: str, timeout: float = 120) -> None:
-    # 120s default: the concurrent burst test launches 10 jobs in parallel and
-    # the full suite runs under load; 60s flaked when reader threads lagged.
+def wait_completed(manager: JobManager, job_id: str, timeout: float = 240) -> None:
+    # 240s default: the concurrent burst test launches 10 jobs in parallel and
+    # the full suite runs under load; 120s still flaked on a loaded macOS
+    # runner when interpreter startup alone was slow.
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if manager.status(job_id)["status"] in {"completed", "failed"}:
@@ -52,7 +53,7 @@ def all_event_seqs(manager: JobManager, job_id: str) -> list[int]:
     return [row["seq"] for row in rows]
 
 
-def wait_event_counts(manager: JobManager, job_id: str, expected: dict[str, int], timeout: float = 30) -> None:
+def wait_event_counts(manager: JobManager, job_id: str, expected: dict[str, int], timeout: float = 60) -> None:
     """Wait until per-type event counts reach expectations.
 
     Status flips to terminal before the terminal EVENT row is necessarily
@@ -100,7 +101,11 @@ def test_concurrent_burst_loses_no_events_and_keeps_unique_seq(tmp_path):
             assert counts["started"] == 1, (job_id, counts)
             assert counts["completed"] == 1, (job_id, counts)
             seqs = all_event_seqs(manager, job_id)
-            assert seqs == list(range(1, per_job * 2 + 3)), job_id
+            # No gaps and no duplicates (the real guarantee). Compare against the
+            # observed length rather than a fixed count so a legitimate
+            # diagnostic event (e.g. write_contended under load) cannot fail it.
+            assert len(seqs) >= per_job * 2 + 2, (job_id, len(seqs))
+            assert seqs == list(range(1, len(seqs) + 1)), (job_id, seqs)
     finally:
         manager.close()
 

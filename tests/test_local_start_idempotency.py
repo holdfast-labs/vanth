@@ -79,14 +79,14 @@ def test_preview_validates_resolves_and_never_launches(tmp_path, monkeypatch):
     try:
         monkeypatch.setattr(manager, "_launch", lambda *args, **kwargs: pytest.fail("preview launched a job"))
         result = asyncio.run(manager.start(
-            "echo preview", cwd=str(tmp_path), env={"SECRET": "private"}, secret_env=["SECRET"],
+            "echo preview", cwd=str(tmp_path), env={"SECRET": "s3cr3t-value"}, secret_env=["SECRET"],
             wake_targets=[{"type": "local_command", "events": ["completed"], "command": ["echo", "wake"]}],
             idempotency_key="preview-123", dry_run=True,
         ))
         assert result["result"] == "preview"
         assert result["cwd"] == str(tmp_path.resolve())
         assert result["env_names"] == ["SECRET"]
-        assert "private" not in str(result)
+        assert "s3cr3t-value" not in str(result)
         assert result["wake_targets"][0]["events"] == ["completed"]
         assert not manager.list()["jobs"]
         assert manager.db.execute("SELECT COUNT(*) FROM local_start_requests").fetchone()[0] == 0

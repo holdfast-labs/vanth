@@ -502,7 +502,7 @@ class AgentFeatureScenario(Scenario):
                 status = manager.status(job_id)
                 assert "AGENT_EVENT" in status["command"], job_id
                 assert status["tags"] == ["agent", "chaos"], (job_id, status["tags"])
-                assert status["cwd"] == str(home), job_id
+                assert Path(status["cwd"]).resolve() == home.resolve(), job_id
                 assert "RERUN_MARK" in status["env"], job_id
                 assert status["run"].get("hostname"), job_id
                 assert status["run"].get("os"), job_id

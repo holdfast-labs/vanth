@@ -4972,12 +4972,46 @@ class JobManager:
         if sys.platform != "win32" and proc.poll() is not None:
             # The reaped leader's PID may already belong to another process.
             # Descendants can still hold its original process group and pipes.
-            try:
-                os.killpg(proc.pid, 9 if force else 15)
-            except (ProcessLookupError, PermissionError):
-                pass
+            # Kill only OUR still-live descendants by reading the group the
+            # workload actually leads — NOT os.killpg(proc.pid): if the pid was
+            # reused as a new group leader (a concurrently spawned runner is
+            # start_new_session, hence a leader), that would signal the entire
+            # new group.
+            group = self._workload_group(proc.pid)
+            if group is not None:
+                try:
+                    os.killpg(group, 9 if force else 15)
+                except (ProcessLookupError, PermissionError):
+                    pass
             return
         self._kill_pid(proc.pid, force)
+
+    @staticmethod
+    def _workload_group(pid: int) -> int | None:
+        """Return the pgid a live pid leads, or None if it is gone.
+
+        ``ps`` reports a process's own pgid; equal to its pid means it is a
+        group leader (the workload case). A reused pid leading a *different*
+        group is not ours to signal.
+        """
+        try:
+            result = subprocess.run(
+                ["ps", "-o", "pgid=", "-p", str(pid)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        text = result.stdout.strip()
+        if result.returncode != 0 or not text:
+            return None
+        try:
+            pgid = int(text)
+        except ValueError:
+            return None
+        return pgid if pgid == pid else None
 
     def _kill_pid(self, pid: int, force: bool, *, timeout_seconds: float = 10.0) -> None:
         if sys.platform == "win32":
@@ -4992,13 +5026,20 @@ class JobManager:
             )
             return
         signal_number = 9 if force else 15
-        try:
-            os.killpg(pid, signal_number)
-        except (ProcessLookupError, PermissionError):
+        # Signal ONLY the group the target pid actually leads. Never
+        # os.killpg(pid) blindly: a reused pid that leads a *different* group
+        # (e.g. a concurrently spawned runner, which is start_new_session) would
+        # otherwise take a whole unrelated process group down with it.
+        if self._workload_group(pid) is not None:
             try:
-                os.kill(pid, signal_number)
-            except ProcessLookupError:
-                return
+                os.killpg(pid, signal_number)
+            except (ProcessLookupError, PermissionError):
+                pass
+            return
+        try:
+            os.kill(pid, signal_number)
+        except ProcessLookupError:
+            return
 
     def _terminate_pid(self, pid: int, force: bool, deadline: float) -> bool:
         if not pid or not self._pid_alive(pid):

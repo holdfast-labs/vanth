@@ -181,8 +181,17 @@ def test_log_line_probe_requires_known_job(tmp_path):
 def test_probe_timeout_clock_starts_after_dag_gate(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
-        parent = asyncio.run(manager.start(cmd("print('done')")))
-        _wait_status(manager, parent["job_id"], {"completed", "failed"})
+        # The parent must actually reach 'completed': the child's trigger targets
+        # that status, so a transient parent launch failure on a loaded runner
+        # would make the gate unsatisfiable and cancel the child. Retry the
+        # parent a few times to keep the probe-clock assertion the subject.
+        parent = None
+        for _ in range(3):
+            candidate = asyncio.run(manager.start(cmd("print('done')")))
+            if _wait_status(manager, candidate["job_id"], {"completed", "failed"}) == "completed":
+                parent = candidate
+                break
+        assert parent is not None, "parent job did not complete"
         port = _free_port()
         child = asyncio.run(manager.start(
             cmd(SLEEP),

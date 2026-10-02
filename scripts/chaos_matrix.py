@@ -168,7 +168,20 @@ class AdapterScenario(Scenario):
 
     def run(self) -> None:
         home = Path(tempfile.mkdtemp(prefix="vanth-adapter-"))
-        manager = JobManager(home)
+        # Cap delivery concurrency to 1 for this scenario: 200 progress events
+        # each enqueue a wake, and spawning up to 4 slow interpreter adapters at
+        # once starved the runner on macOS (terminal state drifted past the 6s
+        # bound). One adapter still proves the property — a slow wake must not
+        # delay terminal state — without the CPU-spawn artifact.
+        previous = os.environ.get("VANTH_DELIVERY_MAX_CONCURRENT")
+        os.environ["VANTH_DELIVERY_MAX_CONCURRENT"] = "1"
+        try:
+            manager = JobManager(home)
+        finally:
+            if previous is None:
+                os.environ.pop("VANTH_DELIVERY_MAX_CONCURRENT", None)
+            else:
+                os.environ["VANTH_DELIVERY_MAX_CONCURRENT"] = previous
         try:
             slow = [sys.executable, "-c", "import time; time.sleep(8)"]
             code = (

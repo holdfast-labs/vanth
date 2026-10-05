@@ -1039,6 +1039,89 @@ def cmd_sleep(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     )
 
 
+def _coerce_event_value(value: str) -> Any:
+    """Parse an emitted ``KEY=VALUE`` as JSON when possible, else keep the string.
+
+    This is what makes ``loss=0.42`` a numeric metric and ``stage=train`` a
+    string, so callers in any language get the same typing as the Python helper.
+    """
+    try:
+        return json.loads(value)
+    except ValueError:
+        return value
+
+
+def cmd_emit(argv: list[str], home: Path, *, json_out: bool = False) -> int:
+    """Emit one AGENT_EVENT line to stdout (language-neutral event SDK).
+
+    Any process on any platform can call this instead of importing the Python
+    helper: the daemon parses the same ``AGENT_EVENT {json}`` line from stdout.
+
+    Usage:
+      vanth emit <type> [message] [--data KEY=VALUE]... [--json-data JSON|@FILE|-]
+                 [--level LEVEL]
+    """
+    from .agent_events import build_event, format_event
+
+    if not argv or argv[0].startswith("-"):
+        print("vanth emit: expected an event type (e.g. `vanth emit checkpoint done`)", file=sys.stderr)
+        return 2
+    event_type = argv[0]
+    message: str | None = None
+    data: dict[str, Any] = {}
+    level: str | None = None
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"--data", "--json-data", "--level", "--message"}:
+            i += 1
+            if i >= len(argv):
+                print(f"vanth emit: {arg} requires a value", file=sys.stderr)
+                return 2
+            value = argv[i]
+            if arg == "--data":
+                key, sep, val = value.partition("=")
+                if not sep or not key:
+                    print(f"vanth emit: --data expects KEY=VALUE, got {value!r}", file=sys.stderr)
+                    return 2
+                data[key] = _coerce_event_value(val)
+            elif arg == "--json-data":
+                try:
+                    data.update(_load_json_object(value, "--json-data"))
+                except ValueError as exc:
+                    print(f"vanth emit: {exc}", file=sys.stderr)
+                    return 2
+            elif arg == "--level":
+                level = value
+            else:
+                message = value
+        elif arg == "--":
+            rest = argv[i + 1:]
+            if len(rest) > 1:
+                print(f"vanth emit: unexpected argument {rest[1]!r}", file=sys.stderr)
+                return 2
+            if rest:
+                message = rest[0]
+            break
+        elif arg.startswith("--"):
+            print(f"vanth emit: unknown option {arg!r}", file=sys.stderr)
+            return 2
+        elif message is None:
+            message = arg
+        else:
+            print(f"vanth emit: unexpected argument {arg!r}", file=sys.stderr)
+            return 2
+        i += 1
+    if event_type == "progress" and "total" in data and "current" in data and "percent" not in data:
+        try:
+            total = float(data["total"])
+            data["percent"] = round((float(data["current"]) / total) * 100, 2) if total else 0
+        except (TypeError, ValueError):
+            pass
+    print(format_event(build_event(event_type, message, data, level)))
+    return 0
+
+
 def cmd_logs(argv: list[str], home: Path, *, json_out: bool = False) -> int:
     if not argv:
         print("vanth logs: missing job id", file=sys.stderr)
@@ -2119,6 +2202,7 @@ def _usage() -> str:
         "  send           send input or EOF to an interactive job\n"
         "  stop           stop a running job\n"
         "  sleep          start a background sleep job\n"
+        "  emit           print one AGENT_EVENT line (language-neutral event SDK)\n"
         "  wake           add a wake target to a job after it started (--now to fire once)\n"
         "  deliveries     list wake deliveries; --clear prunes them\n"
         "  artifacts      list a job's artifacts\n"
@@ -2248,6 +2332,19 @@ _COMMAND_HELP: dict[str, str] = {
             "  example: vanth send job_abc123 --line hello\n",
     "sleep": "usage: vanth sleep <seconds>\n"
              "  Start a background job that sleeps for a positive number of seconds.\n",
+    "emit": "usage: vanth emit <type> [message] [--message TEXT] [--data KEY=VALUE]...\n"
+            "                  [--json-data JSON|@FILE|-] [--level LEVEL] [--] [message]\n"
+            "  Print one `AGENT_EVENT {json}` line to stdout. Call this from ANY\n"
+            "  language (shell, Go, Node, Rust, ...) inside a running job to emit a\n"
+            "  structured event - no Python import needed. Values are parsed as JSON\n"
+            "  when possible, so `loss=0.42` is numeric and `stage=train` is a string.\n"
+            "  types: progress, metric, checkpoint, log (others are passed through).\n"
+            "  the optional positional is the event message; progress takes its\n"
+            "  numbers from --data.\n"
+            "  examples: vanth emit checkpoint \"epoch done\" --data epoch=3\n"
+            "            vanth emit metric --data _step=10 --data loss=0.42\n"
+            "            vanth emit progress --data current=10 --data total=100 --data unit=epoch\n"
+            "  from a job:  sh -c 'vanth emit progress --data current=1 --data total=3'\n",
     "deliveries": "usage: vanth deliveries [--status delivered|failed|pending] [--job ID] [--limit N] [--json]\n"
                   "       vanth deliveries --clear [--status S] [--job ID] [--older-than SECONDS] [--stale-only] [--yes]\n"
                   "  Wake deliveries, so a nonzero `failed` count is actionable.\n",
@@ -2351,6 +2448,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_send(argv[1:], home, json_out=json_out)
     if command == "sleep":
         return cmd_sleep(argv[1:], home, json_out=json_out)
+    if command == "emit":
+        return cmd_emit(argv[1:], home, json_out=json_out)
     if command == "deliveries":
         return cmd_deliveries(argv[1:], home, json_out=json_out)
     if command == "wake":

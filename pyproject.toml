@@ -1,6 +1,6 @@
 [project]
 name = "vanth"
-version = "1.13.1"
+version = "1.14.0"
 description = "Event-driven background jobs for agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -43,6 +43,8 @@ dependencies = [
 
 [project.optional-dependencies]
 artifact-s3 = ["boto3>=1.28"]
+# Build-only: `uv run --extra standalone python scripts/build_standalone.py`
+standalone = ["pyinstaller>=6.0"]
 
 [project.urls]
 Homepage = "https://github.com/abhim-dv/vanth"

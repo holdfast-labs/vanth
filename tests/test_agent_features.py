@@ -6,8 +6,6 @@ with its original command/env/targets, and daemon discovery metadata.
 """
 
 import asyncio
-import json
-import os
 import sys
 
 import pytest
@@ -184,7 +182,6 @@ def test_rerun_preserves_wake_targets_and_origin(tmp_path):
 
 
 def test_run_overview_metadata_captured_at_start(tmp_path):
-    import os
     import platform
     manager = JobManager(tmp_path / "state")
     try:
@@ -199,7 +196,9 @@ def test_run_overview_metadata_captured_at_start(tmp_path):
         assert status["notes"] == "this run is special"
         assert run["hostname"] == platform.node()
         assert run["os"] == platform.system()
-        assert run["python_version"] == platform.python_version()
+        # toolchain describes the JOB, not the daemon's interpreter
+        assert run["toolchain"]["language"] == "python"
+        assert "python_version" not in run
         assert run["cwd"] == str(tmp_path)
         assert run["author"] is not None
         assert status["runtime_seconds"] is not None and status["runtime_seconds"] >= 0

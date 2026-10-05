@@ -2,6 +2,24 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.14.0 - 2026-10-05
+
+### Language-neutral jobs
+
+- `vanth emit <type> [message] [--data KEY=VALUE]... [--level L]` prints a
+  well-formed `AGENT_EVENT {json}` line from any language (shell, Go, Node,
+  Rust, ...), so non-Python jobs get structured progress, metrics, and
+  checkpoints without importing Python. The raw wire protocol is documented in
+  the README.
+- `job_status`'s run overview now reports a job-scoped `toolchain`
+  (`{"language": ..., "detected_from": ...}`) inferred from the command and
+  project marker files. The daemon's own `python_version`/`python_executable`
+  are no longer reported as the job's runtime.
+- Self-contained standalone binaries are built per platform (PyInstaller) and
+  attached to GitHub releases, so Vanth installs and runs without a Python or
+  `uv` toolchain. `src/vanth/launcher.py` dispatches the internal
+  `-m vanth.<module>` spawns and the per-program roles in the frozen binary.
+
 ## 1.13.1 - 2026-10-02
 
 ### Fixes

@@ -73,6 +73,16 @@ the ops CLI as standalone tools (the wheel bundles the native Go monitor, so
 no Go toolchain is needed). Wheels are published for Windows x86_64, Linux
 x86_64/arm64, and macOS x86_64/arm64.
 
+**No Python toolchain?** Download the self-contained binary for your platform
+from the [releases page](https://github.com/abhim-dv/vanth/releases)
+(`vanth-standalone-linux-x86_64`, `vanth-standalone-windows-x86_64.exe`, or
+`vanth-standalone-macos-arm64`) and run it directly — it needs neither Python
+nor a package manager. It ships the same CLI/MCP server and daemon, bundles the
+Go monitor, and dispatches the internal spawns that a wheel would run as
+`python -m vanth.<module>`. Copies named `vanthd` / `vanth-monitor` act as those
+commands. (One caveat: it is a PyInstaller one-file build, so each job runner
+re-extracts the bundle on start; the wheel is faster for many short jobs.)
+
 From a source checkout (development), install the project environment with `uv sync` and run commands as `uv run vanth ...`. The rest of this guide shows the installed `vanth` command unless a row says `uv run`.
 
 ```cmd
@@ -220,6 +230,7 @@ noted for scripts.
 | `vanth rerun <job_id>` | Rerun a job with its saved configuration (core counterpart of `job_rerun`) |
 | `vanth send <job_id> [--line] [--eof] [<text|->]` | Send raw input to an interactive job; `--line` appends a newline, `-` reads stdin, and text may be omitted with `--eof` (core counterpart of `job_send`) |
 | `vanth sleep <seconds>` | Start a trivial sleep job |
+| `vanth emit <type> [message] [--data K=V]... [--level L]` | Print one `AGENT_EVENT` line (language-neutral event SDK) |
 | `vanth list` (`ps` alias) | List jobs (`--status`, `--limit`, `--all`, `--json`); defaults to in-flight (launching/queued/running/…), `--all` shows finished jobs; running jobs show DURATION and AGE |
 | `vanth deliveries [--status S] [--job JOB_ID] [--limit N] [--json]` | List wake deliveries, attempts, and last errors |
 | `vanth wake <job_id> [--now] [--type T] [--events a,b] [--cwd DIR] [--config JSON] [--target JSON]` | Add a wake target to a job **after it started** (in-flight or finished). Fires on future events; `--now` surfaces a synthetic wake immediately. CLI forms of the core `job_add_wake_target` / `job_wake_now` operations |
@@ -238,7 +249,7 @@ noted for scripts.
 
 Run `vanth --help` for the command list. Command-specific help is available
 with `vanth <command> --help` for `status`, `doctor`, `list`, `start`, `rerun`,
-`send`, `logs`, `wait`, `stop`, `sleep`, `deliveries`, `wake`, `artifacts`,
+`send`, `logs`, `wait`, `stop`, `sleep`, `emit`, `deliveries`, `wake`, `artifacts`,
 `diff`, `api`, `remote`, `backup`, `restore`, `prune`, `restart`, `setup`,
 `autostart`, and `version`. Job-id arguments accept an **unambiguous prefix**;
 an unknown id suggests near matches.
@@ -478,11 +489,46 @@ directory.
 
 ---
 
-## Instrumenting jobs with `agent_event`
+## Instrumenting jobs with events
 
-Any Python script can emit structured events to stdout (or stderr) that Vanth
-parses and the monitor charts. This is optional — plain scripts still run and
-log — but it is what turns a job into a first-class tracked object.
+A job in **any language** emits structured events by printing a single line to
+stdout (or stderr) that Vanth parses and the monitor charts:
+
+```
+AGENT_EVENT {"type":"metric","data":{"loss":0.42,"_step":10}}
+```
+
+This is optional — plain scripts still run and log — but it is what turns a job
+into a first-class tracked object. Python jobs can use the `vanth.agent_events`
+helper; every other language can shell out to `vanth emit` or print the line
+directly.
+
+### Emitting from any language
+
+`vanth emit` is the language-neutral SDK: run it from shell, Go, Node, Rust,
+Java, or anything else to print a correctly-formed event. Values are parsed as
+JSON when possible, so `loss=0.42` is numeric and `stage=train` is a string.
+
+```sh
+# shell (also works from any language via subprocess)
+vanth emit checkpoint "epoch done" --data epoch=10 --data val_loss=0.42
+vanth emit metric --data _step=10 --data loss=0.42 --data acc=0.88
+vanth emit progress --data current=10 --data total=100 --data unit=epoch --data stage=train
+vanth emit log --level warning "low disk" --data free_gb=2.5
+```
+
+```go
+// Go: any language that can run a subprocess is enough
+exec.Command("vanth", "emit", "metric", "--data", "loss="+strconv.FormatFloat(v, 'f', 4, 64)).Run()
+```
+
+The raw wire format is just as portable: print `AGENT_EVENT ` followed by a JSON
+object with a required `type` and optional `message` / `data` / `level` keys to
+stdout, flushed on its own line.
+
+### Python helper
+
+Any Python script can emit the same events without the subprocess overhead:
 
 ```python
 from vanth.agent_events import agent_event, progress
@@ -500,7 +546,8 @@ agent_event("metric", _step=10, loss=0.42, acc=0.88, mbps=12.4)
 Notes:
 
 - the helper prints `AGENT_EVENT {json}` with `flush=True` (flush matters);
-- `progress(current, total, unit=..., stage=...)` computes `percent` for you;
+- `progress(current, total, unit=..., stage=...)` computes `percent` for you
+  (`vanth emit progress` does the same when `current` and `total` are present);
 - `metric` payloads: numeric fields become series; `_step` (if present and
   numeric) is the x-axis, otherwise the event sequence number is used; keys
   starting with `_` other than `_step` are ignored; booleans are not metrics;
@@ -718,7 +765,7 @@ job_status(job_id="job_...")
 ```
 
 Returns status, **command**, **cwd**, **env**, **timeout_seconds**, **notes**,
-**run** (author, hostname, OS, Python version, CPU/GPU, git repo/branch/commit),
+**run** (author, hostname, OS, toolchain, CPU/GPU, git repo/branch/commit),
 **runtime_seconds**, progress, last event, thread linkage, tags, and exit code.
 This is the fastest way for an agent to answer "what is this job doing?" — and
 mirrors the run-overview you'd see for a run in W&B.

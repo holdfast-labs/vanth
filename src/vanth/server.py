@@ -3412,7 +3412,7 @@ class JobManager:
             ),
             None,
         )
-        run_info = capture_run_metadata(cwd=cwd, notes=notes)
+        run_info = capture_run_metadata(cwd=cwd, notes=notes, command=command)
         run_payload = {**run_info, "interactive": interactive}
         # Every direct launch carries a claim token (review rc36 P1): the row is
         # inserted 'launching' with the token atomically, and the runner
@@ -8800,12 +8800,25 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
 _VANTH_CLI_GLOBAL_FLAGS = {"--json"}
 _VANTH_CLI_SUBCOMMANDS = {
     "status", "doctor", "restart", "setup", "--help", "-h", "help",
-    "start", "list", "ps", "logs", "tail", "stop", "rerun", "send", "sleep", "deliveries", "api",
+    "start", "list", "ps", "logs", "tail", "stop", "rerun", "send", "sleep", "emit", "deliveries", "api",
     "artifacts", "prune", "backup", "restore", "wait", "diff", "wake",
     "autostart", "--version", "version", "remote",
 }
 
 _VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw"}
+
+
+def _is_vanth_script_name(base: str) -> bool:
+    """Whether a basename is the ``vanth`` CLI/MCP program.
+
+    Includes the PyInstaller standalone artifacts (``vanth-standalone-<target>``),
+    which are launched bare as the MCP stdio server and must be reapable too.
+    The pattern is anchored to the release naming so a lookalike like
+    ``vanth-standalone-notes.txt`` is never matched (the reaper kills matches).
+    """
+    if base in _VANTH_SCRIPT_NAMES:
+        return True
+    return bool(re.fullmatch(r"vanth-standalone(?:-[a-z0-9_]+)+(?:\.exe)?", base))
 
 # Interpreter options the MCP launch shape may carry. Valueless options are
 # skipped; value-taking options consume the next token; ANYTHING else that
@@ -8875,11 +8888,11 @@ def _is_vanth_mcp_command(command_line: str) -> bool:
                 continue
             if tok.startswith("-"):
                 return False
-            if _base(tok) in _VANTH_SCRIPT_NAMES:
+            if _is_vanth_script_name(_base(tok)):
                 return not _is_cli_script(i)
             return False
         return False
-    if _base(tokens[0]) in _VANTH_SCRIPT_NAMES:
+    if _is_vanth_script_name(_base(tokens[0])):
         return not _is_cli_script(0)
     return False
 

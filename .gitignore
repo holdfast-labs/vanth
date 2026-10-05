@@ -5,6 +5,7 @@ __pycache__/
 .vanth/
 .vanth-demo/
 dist/
+build/
 bin/
 *.exe
 *.test

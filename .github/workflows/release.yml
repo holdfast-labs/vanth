@@ -186,9 +186,60 @@ jobs:
           name: sdist
           path: dist/*.tar.gz
 
+  standalone:
+    name: Standalone binary (${{ matrix.target }})
+    needs: binaries
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            os: ubuntu-latest
+            bin: linux-amd64
+          - target: windows-x86_64
+            os: windows-latest
+            bin: windows-amd64
+          - target: macos-arm64
+            os: macos-latest
+            bin: darwin-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.1.0
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v8
+        with:
+          name: monitor-${{ matrix.bin }}
+          path: dist
+      - name: Locate monitor binary
+        shell: bash
+        run: |
+          # PyInstaller builds for the host only, so download the matching
+          # prebuilt Go monitor and point the build script at it. On Windows the
+          # runner is Git Bash, whose $PWD is an MSYS path (/d/a/...) that native
+          # Python cannot open; convert it with cygpath.
+          found="$(find dist -name 'vanth-monitor-${{ matrix.bin }}*' -type f | head -n1)"
+          test -n "$found"
+          mon="$PWD/dist/prebuilt-monitor-${{ matrix.bin }}"
+          cp "$found" "$mon"
+          if command -v cygpath >/dev/null 2>&1; then
+            mon="$(cygpath -w "$mon")"
+          fi
+          echo "VANTH_MONITOR_BIN=$mon" >> "$GITHUB_ENV"
+      - name: Build standalone binary
+        shell: bash
+        run: uv run --extra standalone python scripts/build_standalone.py --output-name vanth-standalone-${{ matrix.target }}
+      - uses: actions/upload-artifact@v7
+        with:
+          name: standalone-${{ matrix.target }}
+          path: |
+            dist/vanth-standalone-${{ matrix.target }}
+            dist/vanth-standalone-${{ matrix.target }}.exe
+
   publish:
     name: Publish to PyPI and GitHub Release
-    needs: [validation, wheels, sdist]
+    needs: [validation, wheels, sdist, standalone]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
@@ -206,6 +257,11 @@ jobs:
           name: sdist
           path: dist
           merge-multiple: true
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: 'standalone-*'
+          path: release-assets
+          merge-multiple: true
       - name: Publish to PyPI
         shell: bash
         env:
@@ -221,7 +277,7 @@ jobs:
           if [[ "${{ github.ref_name }}" == *-rc* ]]; then
             ARGS+=(--prerelease)
           fi
-          gh release create "${{ github.ref_name }}" dist/*.whl dist/*.tar.gz \
+          gh release create "${{ github.ref_name }}" dist/*.whl dist/*.tar.gz release-assets/vanth-standalone-* \
             "${ARGS[@]}" \
             --title "Vanth ${{ github.ref_name }}" \
             --notes "Release ${{ github.ref_name }}"

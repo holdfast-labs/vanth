@@ -84,3 +84,25 @@ func TestProjectShadowsSummaries(t *testing.T) {
 		t.Fatalf("local summary misprojected: %+v", local)
 	}
 }
+
+func TestExtractPayloadStringDecodesEscapes(t *testing.T) {
+	// Payloads with JSON escapes must decode fully: the old substring scan
+	// stopped at the first quote even when escaped, and never decoded
+	// backslashes, newlines, or unicode escapes.
+	payload := `{"name":"a\"b\\c","command":"echo hi","note":"line1\nline2 ☃"}`
+	if got := extractPayloadName(payload); got != `a"b\c` {
+		t.Fatalf("name = %q, want %q", got, `a"b\c`)
+	}
+	if got := extractPayloadCommand(payload); got != "echo hi" {
+		t.Fatalf("command = %q", got)
+	}
+	if got := extractPayloadString(payload, "note"); got != "line1\nline2 ☃" {
+		t.Fatalf("note = %q", got)
+	}
+	if got := extractPayloadString("not json", "name"); got != "" {
+		t.Fatalf("garbage payload should yield empty, got %q", got)
+	}
+	if got := extractPayloadString(`{"name":42}`, "name"); got != "" {
+		t.Fatalf("non-string field should yield empty, got %q", got)
+	}
+}

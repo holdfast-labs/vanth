@@ -66,11 +66,11 @@ func main() {
 			os.Exit(runMonitor(home))
 		default:
 			fmt.Fprintf(os.Stderr, "vanth: unknown subcommand %q\n", os.Args[1])
-			fmt.Fprintln(os.Stderr, "Usage: vanth [--version [--json]] <daemon|mcp|monitor|doctor|cleanup> ...")
+			fmt.Fprintln(os.Stderr, "Usage: vanth [--version [--json]] monitor")
 			os.Exit(2)
 		}
 	}
 	fmt.Fprintln(os.Stderr, "vanth: a subcommand is required")
-	fmt.Fprintln(os.Stderr, "Usage: vanth <daemon|mcp|monitor|doctor|cleanup> ...")
+	fmt.Fprintln(os.Stderr, "Usage: vanth [--version [--json]] monitor")
 	os.Exit(2)
 }

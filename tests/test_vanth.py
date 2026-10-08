@@ -63,7 +63,7 @@ def test_vanth_home_and_event_size_cap(tmp_path, monkeypatch):
         monkeypatch.setenv("VANTH_HOME", str(tmp_path / "state"))
         monkeypatch.setenv("VANTH_MAX_EVENT_BYTES", "20")
         manager = JobManager()
-        started = await manager.start(cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','data':{'big':'x'*100}}), flush=True)"))
+        started = manager.start(cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','data':{'big':'x'*100}}), flush=True)"))
         event = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30)
         assert event["event"]["data"] == {"truncated": True, "max_bytes": 20}
         assert manager.home == tmp_path / "state"
@@ -76,7 +76,7 @@ def test_vanth_home_and_event_size_cap(tmp_path, monkeypatch):
 def test_wait_returns_stored_event(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("print('hello')"))
+        started = manager.start(cmd("print('hello')"))
         result = await manager.wait(started["job_id"], ["completed"], timeout_seconds=30)
         assert result["result"] == "event"
         assert result["event"]["type"] == "completed"
@@ -94,7 +94,7 @@ def test_checkpoint_progress_and_tail(tmp_path):
             "time.sleep(.1);"
             "print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'done'}), flush=True)"
         )
-        started = await manager.start(cmd(code))
+        started = manager.start(cmd(code))
         progress = await manager.wait(started["job_id"], ["progress"], timeout_seconds=30)
         checkpoint = await manager.wait(started["job_id"], ["checkpoint"], progress["event"]["event_id"], timeout_seconds=30)
         completed = await manager.wait(started["job_id"], ["completed"], checkpoint["event"]["event_id"], timeout_seconds=30)
@@ -132,7 +132,7 @@ def test_wake_target_enqueues_delivery(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'wake me'}), flush=True)"
-        started = await manager.start(
+        started = manager.start(
             cmd(code),
             wake_targets=[
                 {
@@ -198,7 +198,7 @@ for line in sys.stdin:
             encoding="utf-8",
         )
         code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'codex dispatch'}), flush=True)"
-        started = await manager.start(
+        started = manager.start(
             cmd(code),
             wake_targets=[
                 {
@@ -233,7 +233,7 @@ def test_opencode_thread_delivery_dispatches_via_cli(tmp_path):
             encoding="utf-8",
         )
         code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'opencode dispatch'}), flush=True)"
-        started = await manager.start(
+        started = manager.start(
             cmd(code),
             wake_targets=[
                 {
@@ -278,7 +278,7 @@ def test_local_command_delivery_dispatches_immediately(tmp_path):
             "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text(sys.stdin.read())",
             str(sink),
         ]
-        started = await manager.start(
+        started = manager.start(
             cmd(code),
             wake_targets=[
                 {
@@ -306,7 +306,7 @@ def test_local_command_delivery_dispatches_immediately(tmp_path):
 def test_thread_association_agent_view_and_doctor(tmp_path):
     async def main():
         manager = JobManager(tmp_path / "state")
-        started = await manager.start(
+        started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'needs review'}), flush=True)"),
             name="reviewable",
             origin_thread_id="thread_origin",
@@ -355,7 +355,7 @@ def test_delivery_retry_records_attempts_and_succeeds(tmp_path):
             str(marker),
             str(sink),
         ]
-        started = await manager.start(
+        started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'retry me'}), flush=True)"),
             wake_targets=[{"type": "local_command", "events": ["checkpoint"], "command": retry_command}],
         )
@@ -376,7 +376,7 @@ def test_delivery_retry_records_attempts_and_succeeds(tmp_path):
 def test_restart_persists_completed_job(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("print('hello')"))
+        started = manager.start(cmd("print('hello')"))
         completed = await manager.wait(started["job_id"], ["completed"], timeout_seconds=30)
         manager.close()
 
@@ -392,7 +392,7 @@ def test_restart_persists_completed_job(tmp_path):
 def test_running_runner_survives_manager_restart(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("import time; print('before', flush=True); time.sleep(.5); print('after', flush=True)"))
+        started = manager.start(cmd("import time; print('before', flush=True); time.sleep(.5); print('after', flush=True)"))
         manager.close()
 
         restarted = JobManager(tmp_path)
@@ -437,11 +437,11 @@ def test_restart_marks_running_job_orphaned(tmp_path):
 def test_failed_and_cancelled(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        failed_job = await manager.start(cmd("import sys; sys.exit(3)"))
+        failed_job = manager.start(cmd("import sys; sys.exit(3)"))
         failed = await manager.wait(failed_job["job_id"], ["failed"], timeout_seconds=30)
         assert failed["event"]["data"]["exit_code"] == 3
 
-        slow_job = await manager.start(cmd("import time; time.sleep(30)"))
+        slow_job = manager.start(cmd("import time; time.sleep(30)"))
         waiter = asyncio.create_task(manager.wait(slow_job["job_id"], ["cancelled"], timeout_seconds=30))
         stopped = await manager.stop(slow_job["job_id"], kill_after_seconds=1)
         cancelled = await waiter
@@ -454,13 +454,13 @@ def test_failed_and_cancelled(tmp_path):
 def test_stderr_event_and_timeout(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        stderr_job = await manager.start(
+        stderr_job = manager.start(
             cmd("import json,sys; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), file=sys.stderr, flush=True)")
         )
         checkpoint = await manager.wait(stderr_job["job_id"], ["checkpoint"], timeout_seconds=30)
         assert checkpoint["event"]["source"] == "stderr"
 
-        timeout_job = await manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
+        timeout_job = manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
         timed_out = await manager.wait(timeout_job["job_id"], ["timeout"], timeout_seconds=30)
         assert timed_out["event"]["type"] == "timeout"
 
@@ -471,7 +471,7 @@ def test_multiple_waiters(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         code = "import json,time; time.sleep(.2); print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"
-        started = await manager.start(cmd(code))
+        started = manager.start(cmd(code))
         results = await asyncio.gather(
             manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30),
             manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=30),
@@ -497,7 +497,7 @@ def test_wake_thread_targets_inherit_caller_thread(tmp_path, monkeypatch):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            started = await manager.start(
+            started = manager.start(
                 cmd("print('inherit')"),
                 notify_on=["completed"],
                 origin_thread_id="ses_origin",
@@ -555,7 +555,7 @@ def test_dead_mans_switch_emits_job_stuck_and_wake(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import time; time.sleep(30)"),
                 notify_on=["job_stuck"],
                 wake_targets=[{"type": "codex_thread", "thread_id": "t_dms", "auto_dispatch": False}],
@@ -579,7 +579,7 @@ def test_dead_mans_switch_emits_schedule_missed(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("print('once')"),
                 policy={"schedule": {"expected_interval_seconds": 1, "grace_period_seconds": 1}},
             )
@@ -601,7 +601,7 @@ def test_failure_threshold_alert_action(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 1, "action": "alert"}},
             )
@@ -622,7 +622,7 @@ def test_failure_threshold_streak_across_reruns_then_reset(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 2, "action": "alert"}},
             )
@@ -650,7 +650,7 @@ def test_failure_threshold_disable_action_blocks_rerun(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 1, "action": "disable"}},
             )
@@ -669,9 +669,9 @@ def test_failure_threshold_run_job_action_launches_reaction(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            reaction = await manager.start(cmd("print('cleanup')"), name="reaction-job")
+            reaction = manager.start(cmd("print('cleanup')"), name="reaction-job")
             await manager.wait(reaction["job_id"], ["completed"], timeout_seconds=30)
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 1, "action": "run_job", "job_id": reaction["job_id"]}},
             )
@@ -692,7 +692,7 @@ def test_restart_policy_relails_with_backoff_then_gives_up(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 2, "backoff_seconds": 0}},
             )
@@ -718,7 +718,7 @@ def test_restart_policy_resets_on_success(tmp_path):
         manager = JobManager(tmp_path)
         try:
             # Alternate: fail, succeed via rerun override with same policy.
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 3, "backoff_seconds": 0}},
             )
@@ -752,7 +752,7 @@ def test_restart_backoff_delays_relaunch(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 1, "backoff_seconds": 2}},
             )
@@ -781,7 +781,7 @@ def test_restart_polling_does_not_consume_budget(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 3, "backoff_seconds": 8}},
             )
@@ -814,7 +814,7 @@ def test_failure_streak_counts_each_run_exactly_once(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 5, "action": "alert"}},
             )
@@ -838,7 +838,7 @@ def test_rerun_refuses_disabled_job(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 1, "action": "disable"}},
             )
@@ -859,9 +859,9 @@ def test_run_job_refuses_running_reaction(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            reaction = await manager.start(cmd("import time; time.sleep(30)"))
+            reaction = manager.start(cmd("import time; time.sleep(30)"))
             await manager.wait(reaction["job_id"], ["started"], timeout_seconds=30)
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"on_failure": {"after_n": 1, "action": "run_job", "job_id": reaction["job_id"]}},
             )
@@ -883,7 +883,7 @@ def test_dead_mans_flags_rearm_on_restart(tmp_path, monkeypatch):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={
                     "schedule": {"expected_interval_seconds": 1, "grace_period_seconds": 1},
@@ -912,7 +912,7 @@ def test_retention_policy_prunes_events_and_metrics(tmp_path, monkeypatch):
                 "import json\n"
                 "print('AGENT_EVENT ' + json.dumps({'type': 'metric', 'metric': {'loss': 0.5}}), flush=True)\n"
             )
-            job = await manager.start(
+            job = manager.start(
                 shellcmd.join([sys.executable, str(script)]),
                 policy={"retention": {"events_seconds": 1, "metrics_seconds": 1}},
             )
@@ -938,7 +938,7 @@ def test_clear_deliveries_dry_run_then_drain(tmp_path):
         manager = JobManager(tmp_path)
         try:
             code = "import json; print('AGENT_EVENT ' + json.dumps({'type': 'checkpoint', 'message': 'x'}), flush=True)"
-            started = await manager.start(
+            started = manager.start(
                 cmd(code),
                 wake_targets=[{"type": "codex_thread", "thread_id": "t_drain", "events": ["checkpoint"], "auto_dispatch": False}],
             )
@@ -967,7 +967,7 @@ def test_clear_deliveries_stale_only_scopes_to_terminal_jobs(tmp_path):
         manager = JobManager(tmp_path)
         try:
             code = "import json; print('AGENT_EVENT ' + json.dumps({'type': 'checkpoint', 'message': 'x'}), flush=True)"
-            done = await manager.start(
+            done = manager.start(
                 cmd(code),
                 wake_targets=[{"type": "codex_thread", "thread_id": "t_stale", "events": ["checkpoint"], "auto_dispatch": False}],
             )
@@ -983,7 +983,7 @@ def test_clear_deliveries_stale_only_scopes_to_terminal_jobs(tmp_path):
                 await asyncio.sleep(0.1)
             assert preview is not None and preview["matched"] >= 1, "terminal-job delivery must match stale_only"
             # A delivery for a NON-terminal job must not match.
-            longjob = await manager.start(
+            longjob = manager.start(
                 cmd("import time; time.sleep(60)"),
                 wake_targets=[{"type": "codex_thread", "thread_id": "t_live", "events": ["checkpoint"], "auto_dispatch": False}],
             )
@@ -1043,7 +1043,7 @@ def test_webhook_delivery_dispatches_immediately(tmp_path):
             try:
                 url = f"http://127.0.0.1:{server.server_port}/hook"
                 code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'webhook me'}), flush=True)"
-                started = await manager.start(
+                started = manager.start(
                     cmd(code),
                     wake_targets=[
                         {
@@ -1090,7 +1090,7 @@ def test_webhook_non_2xx_marks_delivery_failed(tmp_path):
             try:
                 url = f"http://127.0.0.1:{server.server_port}/hook"
                 code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
-                started = await manager.start(
+                started = manager.start(
                     cmd(code),
                     wake_targets=[
                         {
@@ -1135,7 +1135,7 @@ def test_webhook_target_validation(tmp_path):
                 {"type": "webhook", "events": ["completed"], "url": "http://x", "headers": {"X-Token": 123}},
             ]:
                 try:
-                    await manager.start(cmd(code), wake_targets=[bad])
+                    manager.start(cmd(code), wake_targets=[bad])
                     raise AssertionError(f"expected validation failure for {bad!r}")
                 except ValueError:
                     pass
@@ -1155,7 +1155,7 @@ def test_webhook_auto_dispatch_false_queues_only(tmp_path):
             try:
                 url = f"http://127.0.0.1:{server.server_port}/hook"
                 code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
-                started = await manager.start(
+                started = manager.start(
                     cmd(code),
                     wake_targets=[
                         {
@@ -1187,7 +1187,7 @@ def test_launch_claim_cannot_be_acquired_twice(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             # A failed job is runnable (eligible for relaunch).
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             first = manager.prepare_launch(job["job_id"])
@@ -1214,7 +1214,7 @@ def test_launch_claim_is_exclusive_across_manager_instances(tmp_path):
         manager = JobManager(tmp_path, recover=False)
         manager2 = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
 
             # Both instances race prepare_launch on the same failed job.
@@ -1263,7 +1263,7 @@ def test_runner_promotes_owned_claim_and_parent_cannot_resurrect(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             assert launch is not None
@@ -1313,7 +1313,7 @@ def test_launch_lost_claim_kills_runner_and_does_not_resurrect(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token = launch["claim_token"]
@@ -1347,7 +1347,7 @@ def test_stale_launch_claim_recovers_to_orphaned(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             first = manager.prepare_launch(job["job_id"])
             assert first is not None
@@ -1389,7 +1389,7 @@ def test_stale_recovery_skips_live_runner(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             assert launch is not None
@@ -1432,7 +1432,7 @@ def test_restart_deadline_survives_until_claim_is_atomic(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
             )
@@ -1485,7 +1485,7 @@ def test_restart_failures_advance_failure_streak(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={
                     "restart": {"max_retries": 2, "backoff_seconds": 0},
@@ -1567,7 +1567,7 @@ def test_webhook_redirect_does_not_leak_headers(tmp_path):
             try:
                 url = f"http://127.0.0.1:{target_port}/hook"
                 code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
-                started = await manager.start(
+                started = manager.start(
                     cmd(code),
                     wake_targets=[
                         {
@@ -1616,7 +1616,7 @@ def test_webhook_payload_omits_header_secrets(tmp_path):
             try:
                 url = f"http://127.0.0.1:{server.server_port}/hook"
                 code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
-                started = await manager.start(
+                started = manager.start(
                     cmd(code),
                     wake_targets=[
                         {
@@ -1650,7 +1650,7 @@ def test_clear_deliveries_default_does_not_touch_delivered(tmp_path):
         manager = JobManager(tmp_path)
         try:
             code = "import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'}), flush=True)"
-            started = await manager.start(
+            started = manager.start(
                 cmd(code),
                 wake_targets=[{"type": "codex_thread", "thread_id": "t_del", "events": ["checkpoint"], "auto_dispatch": False}],
             )
@@ -1682,7 +1682,7 @@ def test_parent_does_not_kill_runner_that_promoted_before_worker_pid_write(tmp_p
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token = launch["claim_token"]
@@ -1726,7 +1726,7 @@ def test_no_token_launch_cannot_resurrect_terminal_job(tmp_path):
             # the row is inserted 'running' with started_at; a terminal
             # transition happens (as a fast job would) before the parent's
             # no-token write.
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             # The parent's no-token write is guarded by the ORIGINAL started_at;
             # after the failure the row is 'failed' with ended_at set, so the
@@ -1757,7 +1757,7 @@ def test_stale_runner_cannot_consume_newer_claim_token(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch1 = manager.prepare_launch(job["job_id"])
             token1 = launch1["claim_token"]
@@ -1804,7 +1804,7 @@ def test_stale_recovery_does_not_orphan_promoted_run(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token = launch["claim_token"]
@@ -1845,7 +1845,7 @@ def test_heartbeat_reconciliation_does_not_orphan_newer_run(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token = launch["claim_token"]
@@ -1884,7 +1884,7 @@ def test_abandoned_restart_claim_preserves_budgeted_retry(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
             )
@@ -1937,7 +1937,7 @@ def test_parent_worker_pid_write_does_not_clear_pending_restart_intent(tmp_path)
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
             )
@@ -1998,7 +1998,7 @@ def test_pending_restart_clear_is_token_guarded(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            job = await manager.start(
+            job = manager.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
             )
@@ -2037,7 +2037,7 @@ def test_recover_between_insert_and_popen_cannot_orphan_pre_spawn(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             # Simulate manager A: claim as launching with worker_pid still NULL.
             token = "claim_" + uuid.uuid4().hex[:16]
@@ -2075,7 +2075,7 @@ def test_popen_failure_after_newer_run_is_token_guarded(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token_a = launch["claim_token"]
@@ -2118,7 +2118,7 @@ def test_reconcile_null_worker_snapshot_cas_loses_after_live_publish(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token = launch["claim_token"]
@@ -2149,7 +2149,7 @@ def test_stale_claim_recovery_null_snapshot_cas_loses(tmp_path):
     async def main():
         manager = JobManager(tmp_path, recover=False)
         try:
-            job = await manager.start(cmd("import sys; sys.exit(1)"))
+            job = manager.start(cmd("import sys; sys.exit(1)"))
             await manager.wait(job["job_id"], ["failed"], timeout_seconds=30)
             launch = manager.prepare_launch(job["job_id"])
             token = launch["claim_token"]
@@ -2194,7 +2194,7 @@ def test_restore_clear_cross_process_cas(tmp_path):
         m1 = JobManager(tmp_path)
         m2 = JobManager(tmp_path, recover=False)
         try:
-            job = await m1.start(
+            job = m1.start(
                 cmd("import sys; sys.exit(1)"),
                 policy={"restart": {"max_retries": 1, "backoff_seconds": 5}},
             )

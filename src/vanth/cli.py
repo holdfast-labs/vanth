@@ -48,6 +48,21 @@ def _resolve_job_id(client: VanthClient, raw: str) -> tuple[str | None, str]:
     best-effort lookup - if the job list is unavailable the raw value is used
     unchanged and the daemon reports the error.
     """
+    try:
+        result = client.get("/jobs/resolve", {"prefix": raw})
+        if isinstance(result, dict) and ("job_id" in result or "problem" in result):
+            return result.get("job_id"), result.get("problem", "")
+    except Exception:
+        pass
+    return _resolve_job_id_legacy(client, raw)
+
+
+def _resolve_job_id_legacy(client: VanthClient, raw: str) -> tuple[str | None, str]:
+    """Pre-`/jobs/resolve` fallback: exact probe plus a 1000-row prefix scan.
+
+    Kept for daemons older than the resolve endpoint; the live path above
+    searches the full history server-side through the primary-key index.
+    """
     if "/" in raw or len(raw) >= 40:  # not a plausible id; let the daemon decide
         return raw, ""
     try:
@@ -1973,6 +1988,7 @@ _HTTP_ROUTES: tuple[tuple[str, str], ...] = (
     ("GET", "/ready | /ready-fast | /doctor | /metrics"),
     ("GET", "/jobs?status=&limit=&name=&tags="),
     ("GET", "/jobs/{id}/status | /events | /tail | /metrics | /summary | /diff | /artifacts"),
+    ("GET", "/jobs/resolve?prefix= (unambiguous-prefix id resolution)"),
     ("GET", "/view | /deliveries | /decisions | /schedules | /pools"),
     ("POST", "/jobs  (add `remote_id` to run on a paired host)"),
     ("POST", "/jobs/{id}/stop | /send | /pause | /resume | /rerun | /wait"),

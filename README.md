@@ -1489,6 +1489,7 @@ HTTP route.
 | POST | `/cleanup` | Cleanup (`older_than_seconds`, `dry_run`) |
 | GET | `/doctor` | Health report |
 | GET | `/ready-fast` | Cheap readiness (home + schema) |
+| GET | `/jobs/resolve` | Resolve an unambiguous job-id prefix (`prefix`) |
 | GET | `/health` | Unauthenticated liveness |
 | GET | `/remotes` | Paired remote hosts |
 | GET | `/remotes/doctor` | SSH binaries + remote state (`remote_id`) |

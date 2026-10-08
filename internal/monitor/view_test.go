@@ -258,3 +258,19 @@ func displayWidth(s string) int {
 	}
 	return w
 }
+
+func TestShortRepoHandlesURLForms(t *testing.T) {
+	cases := map[string]string{
+		"https://github.com/holdfast-labs/vanth.git": "vanth",
+		"https://github.com/holdfast-labs/vanth":     "vanth",
+		"git@github.com:holdfast-labs/vanth.git":     "vanth",
+		"git@github.com:vanth.git":                   "vanth",
+		"vanth": "vanth",
+		"":      "",
+	}
+	for in, want := range cases {
+		if got := shortRepo(in); got != want {
+			t.Errorf("shortRepo(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

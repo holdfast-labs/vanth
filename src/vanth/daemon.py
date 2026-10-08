@@ -900,6 +900,8 @@ class Handler(BaseHTTPRequestHandler):
                 ids = query.get("job_ids", [""])[0]
                 job_ids = [jid for jid in ids.split(",") if jid] if ids else []
                 ok(self, get_manager().status_batch(job_ids, int(query.get("limit", ["500"])[0])))
+            elif parsed.path == "/jobs/resolve":
+                ok(self, get_manager().resolve_job_id(query.get("prefix", [""])[0]))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/status"):
                 remote_id = query.get("remote_id", [None])[0]
                 if remote_id:
@@ -1054,7 +1056,7 @@ class Handler(BaseHTTPRequestHandler):
                 if parsed.path == "/jobs/preview":
                     if remote_id:
                         raise ValueError("start preview is supported for local jobs only")
-                    ok(self, asyncio.run(get_manager().start(**payload, dry_run=True)))
+                    ok(self, get_manager().start(**payload, dry_run=True))
                     return
                 if remote_id:
                     ok(self, _remote_submit(remote_id, "job.start", _remote_payload(payload)))
@@ -1064,7 +1066,7 @@ class Handler(BaseHTTPRequestHandler):
                     # as a 500 and log a traceback rather than echoing an
                     # internal Python message as if the caller got it wrong.
                     try:
-                        result = asyncio.run(get_manager().start(**payload))
+                        result = get_manager().start(**payload)
                     except TypeError:
                         logging.getLogger("vanth.daemon").exception("job start failed")
                         error(self, "Internal server error", 500)

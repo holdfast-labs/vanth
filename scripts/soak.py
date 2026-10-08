@@ -8,7 +8,6 @@ unsupported RSS sampling is explicit. Failure preserves the isolated home.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import ctypes
 import json
 import math
@@ -132,8 +131,8 @@ def run(args):
             if now >= started + args.duration + args.grace:
                 raise TimeoutError("jobs failed to drain before soak grace deadline")
             while now < started + args.duration and len(active) < args.jobs:
-                result = asyncio.run(manager.start(command, name="soak", timeout_seconds=math.ceil(args.grace),
-                                                  notify_on=[], wake_targets=[]))
+                result = manager.start(command, name="soak", timeout_seconds=math.ceil(args.grace),
+                                                  notify_on=[], wake_targets=[])
                 job_id = result["job_id"]
                 proc = manager.processes.get(job_id)
                 if proc is None:

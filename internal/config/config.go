@@ -25,23 +25,27 @@ func DefaultHome() (string, error) {
 }
 
 // CanonicalHome resolves the one state root shared by daemon, client, runner,
-// and monitor. It mirrors src/vanth/paths.canonical_home.
+// and monitor. It mirrors src/vanth/paths.canonical_home: VANTH_HOME is
+// canonical, AGENT_BG_HOME is a supported alias, both must agree when both
+// are set, and the result is absolute with `~` expanded and symlinks
+// resolved (falling back to the cleaned absolute path when resolution fails,
+// e.g. a not-yet-created home — matching Python resolve() strict=False).
 func CanonicalHome() (string, error) {
 	vant := os.Getenv("VANTH_HOME")
 	agent := os.Getenv("AGENT_BG_HOME")
 	if vant != "" && agent != "" {
-		vantPath, err := filepath.Abs(vant)
+		vantPath, err := resolveHome(vant)
 		if err != nil {
 			return "", fmt.Errorf("resolve VANTH_HOME: %w", err)
 		}
-		agentPath, err := filepath.Abs(agent)
+		agentPath, err := resolveHome(agent)
 		if err != nil {
 			return "", fmt.Errorf("resolve AGENT_BG_HOME: %w", err)
 		}
 		if vantPath != agentPath {
 			return "", fmt.Errorf("VANTH_HOME and AGENT_BG_HOME refer to different state directories")
 		}
-		return filepath.Clean(vantPath), nil
+		return vantPath, nil
 	}
 	configured := vant
 	if configured == "" {
@@ -50,19 +54,26 @@ func CanonicalHome() (string, error) {
 	if configured == "" {
 		return DefaultHome()
 	}
-	abs, err := filepath.Abs(configured)
-	if err != nil {
-		return "", fmt.Errorf("resolve %s: %w", homeVarName(configured, vant, agent), err)
-	}
-	return filepath.Clean(abs), nil
+	return resolveHome(configured)
 }
 
-func homeVarName(configured, vant, agent string) string {
-	if vant != "" {
-		return "VANTH_HOME"
+// resolveHome expands a leading `~`, absolutizes, and resolves symlinks,
+// mirroring Python's Path.expanduser().resolve(). A bare `~` or `~/...`
+// resolves against the current user's home; anything else passes through.
+func resolveHome(raw string) (string, error) {
+	if raw == "~" || len(raw) > 1 && (raw[0] == '~' && (raw[1] == '/' || raw[1] == '\\')) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("expand ~: %w", err)
+		}
+		raw = filepath.Join(home, raw[1:])
 	}
-	if agent != "" {
-		return "AGENT_BG_HOME"
+	abs, err := filepath.Abs(raw)
+	if err != nil {
+		return "", err
 	}
-	return "home"
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return resolved, nil
+	}
+	return filepath.Clean(abs), nil
 }

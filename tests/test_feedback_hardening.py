@@ -137,7 +137,7 @@ def http_post(port, path, payload, token=None):
 def test_list_returns_runtime_and_timestamps(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        job_id = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))["job_id"]
+        job_id = manager.start(cmd("import time; time.sleep(30)"))["job_id"]
         deadline = time.monotonic() + 10
         item = None
         while time.monotonic() < deadline:
@@ -180,7 +180,7 @@ def test_start_rejects_bad_field_shapes(tmp_path, kwargs, fragment):
     manager = JobManager(tmp_path / "state")
     try:
         with pytest.raises(ValueError) as excinfo:
-            asyncio.run(manager.start(cmd("print(1)"), **kwargs))
+            manager.start(cmd("print(1)"), **kwargs)
         assert fragment in str(excinfo.value)
         # Nothing was persisted: a rejected request must not create a job row.
         assert manager.list()["jobs"] == []
@@ -198,7 +198,7 @@ def test_start_is_atomic_when_wake_target_insert_fails(tmp_path, monkeypatch):
         monkeypatch.setattr(manager, "_insert_wake_targets", boom)
         target = {"type": "webhook", "url": "http://127.0.0.1:9/none", "events": ["completed"]}
         with pytest.raises(RuntimeError):
-            asyncio.run(manager.start(cmd("print(1)"), wake_targets=[target]))
+            manager.start(cmd("print(1)"), wake_targets=[target])
         # The job row and its targets are one transaction: a failed acceptance
         # must leave NO job behind (not a job that never notifies).
         assert manager.list()["jobs"] == []

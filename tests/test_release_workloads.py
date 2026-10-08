@@ -10,7 +10,6 @@ smaller, CI-safe scale:
 - log caps bound each stream and cleanup is idempotent.
 """
 
-import asyncio
 import json
 import subprocess
 import sys
@@ -83,8 +82,8 @@ def test_concurrent_burst_loses_no_events_and_keeps_unique_seq(tmp_path):
                 f"[f(i) for i in range({per_job})]"
             )
             started.append(
-                asyncio.run(
-                    manager.start(cmd(code), name=f"burst-{index}")
+                
+                    manager.start(cmd(code), name=f"burst-{index}"
                 )["job_id"]
             )
         for job_id in started:
@@ -124,13 +123,12 @@ def test_slow_wake_adapter_does_not_delay_stream_parsing(tmp_path):
             "time.sleep(0.05));"
             "[f(i) for i in range(1,11)]"
         )
-        job_id = asyncio.run(
-            manager.start(
+        job_id = manager.start(
                 cmd(code),
                 wake_targets=[
                     {"type": "local_command", "events": ["progress"], "command": slow_command}
                 ],
-            )
+            
         )["job_id"]
 
         start = time.monotonic()
@@ -156,7 +154,7 @@ def test_log_caps_bound_streams_and_cleanup_is_idempotent(tmp_path, monkeypatch)
             "[print('x'*200, flush=True) for _ in range(300)];"
             "[print('y'*200, file=sys.stderr, flush=True) for _ in range(300)]"
         )
-        job_id = asyncio.run(manager.start(cmd(code)))["job_id"]
+        job_id = manager.start(cmd(code))["job_id"]
         wait_completed(manager, job_id, timeout=30)
 
         counts = event_counts(manager, job_id)

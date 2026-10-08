@@ -1,7 +1,7 @@
 """Tests for the 4 agent-QoL features: metric_ingest, artifact_read, daemon_wake, cleanup_preview.
 
 Uses the same patterns as test_agent_features.py: a direct JobManager instance
-with a tmp_path home and real jobs started via asyncio.run(manager.start(...)).
+with a tmp_path home and real jobs started via manager.start(...).
 """
 
 import asyncio
@@ -27,7 +27,7 @@ def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
 
 
 def start_job(manager, code, **kwargs):
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def test_metric_ingest_records_series(tmp_path):

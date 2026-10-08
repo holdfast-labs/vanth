@@ -13,7 +13,7 @@ def cmd(code: str) -> str:
 
 
 def start_job(manager, **kwargs):
-    return asyncio.run(manager.start(cmd("import time; time.sleep(0.2)"), **kwargs))
+    return manager.start(cmd("import time; time.sleep(0.2)"), **kwargs)
 
 
 def test_notify_on_without_targets_is_stored_but_warns(tmp_path):
@@ -224,7 +224,7 @@ def test_wake_default_is_best_effort_daemon_side(tmp_path):
     manager = JobManager(tmp_path / "state", recover=False)
     try:
         # No live relay: the default wake is dropped, but the start still succeeds.
-        result = asyncio.run(manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600))
+        result = manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600)
         assert result["job_id"]
         assert manager._wake_targets_for_job(result["job_id"]) == []
 
@@ -234,7 +234,7 @@ def test_wake_default_is_best_effort_daemon_side(tmp_path):
             client_type="opencode_thread",
             destinations=[{"client_type": "opencode_thread", "session_id": "ses_x", "directory": os.getcwd()}],
         )
-        result2 = asyncio.run(manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600))
+        result2 = manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600)
         targets = manager._wake_targets_for_job(result2["job_id"])
         assert targets and targets[0].get("session_id") == "ses_x"
 
@@ -245,7 +245,7 @@ def test_wake_default_is_best_effort_daemon_side(tmp_path):
             client_type="opencode_thread",
             destinations=[{"client_type": "opencode_thread", "session_id": "ses_y", "directory": os.getcwd()}],
         )
-        result3 = asyncio.run(manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600))
+        result3 = manager.start(cmd("echo hi"), wake_default=True, timeout_seconds=3600)
         assert manager._wake_targets_for_job(result3["job_id"]) == []
     finally:
         manager.close()
@@ -254,9 +254,8 @@ def test_wake_default_is_best_effort_daemon_side(tmp_path):
 def test_wake_default_excluded_from_idempotency_hash(tmp_path):
     manager = JobManager(tmp_path / "state", recover=False)
     try:
-        first = asyncio.run(manager.start(cmd("echo hi"), idempotency_key="key-abcdefgh", timeout_seconds=3600))
-        replay = asyncio.run(
-            manager.start(cmd("echo hi"), idempotency_key="key-abcdefgh", timeout_seconds=3600, wake_default=True)
+        first = manager.start(cmd("echo hi"), idempotency_key="key-abcdefgh", timeout_seconds=3600)
+        replay = manager.start(cmd("echo hi"), idempotency_key="key-abcdefgh", timeout_seconds=3600, wake_default=True
         )
         assert replay["job_id"] == first["job_id"]
         assert replay.get("idempotent_replay") is True

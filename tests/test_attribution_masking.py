@@ -61,7 +61,7 @@ def test_secret_env_masked_in_logs_and_events(tmp_path):
                 "print('token='+tok, file=__import__('sys').stderr, flush=True);"
                 "print('AGENT_EVENT '+json.dumps({'type':'metric','data':{'token':tok},'message':'leak '+tok}), flush=True)"
             )
-            started = await manager.start(cmd(code), env={"API_TOKEN": "s3cr3t-value"}, secret_env=["API_TOKEN"])
+            started = manager.start(cmd(code), env={"API_TOKEN": "s3cr3t-value"}, secret_env=["API_TOKEN"])
             job_id = started["job_id"]
             _wait_status(manager, job_id, {"completed", "failed"})
 
@@ -89,7 +89,7 @@ def test_stop_event_carries_actor_and_reason(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            started = await manager.start(cmd("import time; time.sleep(30)"))
+            started = manager.start(cmd("import time; time.sleep(30)"))
             job_id = started["job_id"]
             _wait_status(manager, job_id, {"running"})
             result = manager.stop_sync(job_id, actor="tool", reason="agent changed its mind")
@@ -112,7 +112,7 @@ def test_stop_default_actor_is_user(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            started = await manager.start(cmd("import time; time.sleep(30)"))
+            started = manager.start(cmd("import time; time.sleep(30)"))
             job_id = started["job_id"]
             _wait_status(manager, job_id, {"running"})
             manager.stop_sync(job_id)
@@ -138,8 +138,8 @@ def test_queued_cancel_carries_attribution(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            parent = await manager.start(cmd("import time; time.sleep(30)"))
-            child = await manager.start(
+            parent = manager.start(cmd("import time; time.sleep(30)"))
+            child = manager.start(
                 cmd("print('never')"),
                 trigger={"job_id": parent["job_id"], "status": "completed"},
             )
@@ -162,7 +162,7 @@ def test_timeout_event_carries_timeout_actor(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
         try:
-            started = await manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
+            started = manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
             job_id = started["job_id"]
             _wait_status(manager, job_id, {"timeout"}, timeout=20)
             data = _wait_event(manager, job_id, "timeout", timeout=20)["data"]
@@ -179,7 +179,7 @@ def test_rerun_preserves_secret_env(tmp_path):
         manager = JobManager(tmp_path)
         try:
             code = "import os; print('tok='+os.environ.get('API_TOKEN',''), flush=True)"
-            started = await manager.start(cmd(code), env={"API_TOKEN": "s3cr3t-value"}, secret_env=["API_TOKEN"])
+            started = manager.start(cmd(code), env={"API_TOKEN": "s3cr3t-value"}, secret_env=["API_TOKEN"])
             job_id = started["job_id"]
             _wait_status(manager, job_id, {"completed", "failed"})
             rerun = await manager.rerun(job_id)

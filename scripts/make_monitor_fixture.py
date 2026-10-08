@@ -1,5 +1,4 @@
 """Create a real progress/metric dataset for the Go monitor test."""
-import asyncio
 import json
 import os
 import shlex
@@ -30,7 +29,7 @@ def main():
         "time.sleep(0.01));"
         "[f(i) for i in range(1,101)]"
     )
-    job_id = asyncio.run(manager.start(cmd(code), name="training run"))["job_id"]
+    job_id = manager.start(cmd(code), name="training run")["job_id"]
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:
         status = manager.status(job_id)["status"]

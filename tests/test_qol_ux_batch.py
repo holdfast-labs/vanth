@@ -16,7 +16,7 @@ def cmd(code: str) -> str:
 
 
 def start_job(manager, code, **kwargs):
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def wait_terminal(manager, job_id, timeout=20):
@@ -74,10 +74,10 @@ def test_trigger_starts_child_when_parent_completes(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
         parent = start_job(manager, "print('parent done')")
-        child = asyncio.run(manager.start(
+        child = manager.start(
             cmd("print('child done')"),
             trigger={"job_id": parent, "status": "completed"},
-        ))
+        )
         assert child["status"] == "queued"
         child_id = child["job_id"]
         assert manager.status(child_id)["status"] == "queued"
@@ -97,10 +97,10 @@ def test_trigger_cancels_child_when_parent_ends_differently(tmp_path):
     try:
         parent = start_job(manager, "import sys; sys.exit(1)")
         wait_terminal(manager, parent)
-        child = asyncio.run(manager.start(
+        child = manager.start(
             cmd("print('never runs')"),
             trigger={"job_id": parent, "status": "completed"},
-        ))
+        )
         child_id = child["job_id"]
         wait_terminal(manager, child_id)
         assert manager.status(child_id)["status"] == "cancelled"
@@ -112,7 +112,7 @@ def test_trigger_unknown_parent_raises(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
         with pytest.raises(ValueError):
-            asyncio.run(manager.start(cmd("x"), trigger={"job_id": "job_nope", "status": "completed"}))
+            manager.start(cmd("x"), trigger={"job_id": "job_nope", "status": "completed"})
     finally:
         manager.close()
 
@@ -124,10 +124,10 @@ def test_trigger_child_cancelled_when_parent_row_is_removed(tmp_path):
     try:
         # Parent still running, so the DAG gate cannot be satisfied yet.
         parent = start_job(manager, "import time; time.sleep(30)")
-        child = asyncio.run(manager.start(
+        child = manager.start(
             cmd("print('never runs')"),
             trigger={"job_id": parent, "status": "completed"},
-        ))
+        )
         child_id = child["job_id"]
         assert manager.status(child_id)["status"] == "queued"
         with manager.db_lock:
@@ -143,10 +143,10 @@ def test_stop_queued_job_cancels_without_running(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
         parent = start_job(manager, "import time; time.sleep(30)")
-        child = asyncio.run(manager.start(
+        child = manager.start(
             cmd("print('never')"),
             trigger={"job_id": parent, "status": "completed"},
-        ))
+        )
         child_id = child["job_id"]
         stopped = manager.stop_sync(child_id)
         assert stopped["status"] == "cancelled"

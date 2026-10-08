@@ -33,7 +33,7 @@ def cmd(code: str) -> str:
 
 
 def running_job(manager: JobManager) -> str:
-    started = asyncio.run(manager.start(cmd("import time; time.sleep(20)")))
+    started = manager.start(cmd("import time; time.sleep(20)"))
     job_id = started["job_id"]
     asyncio.run(manager.wait(job_id, ["started"], timeout_seconds=10))
     return job_id
@@ -210,7 +210,7 @@ def test_request_decision_validates_inputs(tmp_path):
 def test_request_decision_rejects_terminal_job(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('done')")))
+        started = manager.start(cmd("print('done')"))
         job_id = started["job_id"]
         asyncio.run(manager.wait(job_id, ["completed"], timeout_seconds=10))
         with pytest.raises(ValueError, match="terminal"):
@@ -371,7 +371,7 @@ def test_request_decision_bounds(tmp_path):
 def test_cleanup_removes_decisions(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('done')")))
+        started = manager.start(cmd("print('done')"))
         job_id = started["job_id"]
         asyncio.run(manager.wait(job_id, ["completed"], timeout_seconds=10))
         # Decisions can only be requested while non-terminal, so model a

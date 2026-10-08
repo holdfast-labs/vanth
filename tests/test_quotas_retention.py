@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import sys
 import time
 
@@ -30,7 +29,7 @@ def test_running_count_counts_running_rows(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
         assert manager._running_count() == 0
-        started = asyncio.run(manager.start(cmd("import time; time.sleep(3)")))
+        started = manager.start(cmd("import time; time.sleep(3)"))
         try:
             assert manager._running_count() == 1
         finally:
@@ -52,17 +51,17 @@ def test_concurrent_job_quota_rejects_third_job(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_MAX_RUNNING_JOBS", "2")
     manager = JobManager(tmp_path / "state")
     try:
-        first = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
-        second = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+        first = manager.start(cmd("import time; time.sleep(30)"))
+        second = manager.start(cmd("import time; time.sleep(30)"))
         assert manager._running_count() == 2
         with pytest.raises(ValueError, match="quota"):
-            asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+            manager.start(cmd("import time; time.sleep(30)"))
         manager.stop_sync(first["job_id"], kill_after_seconds=2)
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline and manager.status(first["job_id"])["status"] == "running":
             time.sleep(0.05)
         assert manager.status(first["job_id"])["status"] == "cancelled"
-        third = asyncio.run(manager.start(cmd("import time; time.sleep(5)")))
+        third = manager.start(cmd("import time; time.sleep(5)"))
         assert third["status"] == "running"
         manager.stop_sync(second["job_id"], kill_after_seconds=2)
         manager.stop_sync(third["job_id"], kill_after_seconds=2)
@@ -74,7 +73,7 @@ def test_rerun_sync_inherits_concurrent_quota(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_MAX_RUNNING_JOBS", "1")
     manager = JobManager(tmp_path / "state")
     try:
-        first = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+        first = manager.start(cmd("import time; time.sleep(30)"))
         assert manager._running_count() == 1
         with pytest.raises(ValueError, match="quota"):
             manager.rerun_sync(first["job_id"])
@@ -106,7 +105,7 @@ def test_retention_removes_old_terminal_job_when_not_dry_run(tmp_path, monkeypat
     monkeypatch.setenv("VANTH_DELIVERY_POLL_INTERVAL", "3600")
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('done')")))
+        started = manager.start(cmd("print('done')"))
         job_id = started["job_id"]
         wait_status(manager, job_id, "completed")
         old_stamp = "2026-01-01T00:00:00Z"
@@ -127,7 +126,7 @@ def test_retention_dry_run_reports_but_keeps_job(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_DELIVERY_POLL_INTERVAL", "3600")
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('done')")))
+        started = manager.start(cmd("print('done')"))
         job_id = started["job_id"]
         wait_status(manager, job_id, "completed")
         old_stamp = "2026-01-01T00:00:00Z"
@@ -149,7 +148,7 @@ def test_retention_does_not_remove_fresh_jobs(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_DELIVERY_POLL_INTERVAL", "3600")
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('done')")))
+        started = manager.start(cmd("print('done')"))
         job_id = started["job_id"]
         wait_status(manager, job_id, "completed")
         result = manager._maybe_auto_cleanup()
@@ -191,7 +190,7 @@ def test_doctor_reports_quota_and_retention(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_RETENTION_DRY_RUN", "1")
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+        started = manager.start(cmd("import time; time.sleep(30)"))
         try:
             # Wait for the runner to promote to 'running'; under heavy load the
             # launch can lag, so poll rather than assert immediately.
@@ -230,7 +229,7 @@ def test_max_running_jobs_atomic_across_managers(tmp_path, monkeypatch):
         def start_in(manager, key):
             barrier.wait()
             try:
-                results[key] = asyncio.run(manager.start(cmd("import time; time.sleep(3)")))
+                results[key] = manager.start(cmd("import time; time.sleep(3)"))
             except Exception as exc:
                 results[key] = exc
 

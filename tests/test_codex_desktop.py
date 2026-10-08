@@ -938,7 +938,7 @@ class TestRelayRestartRecovery:
 class TestRelay:
     def _start_delivery(self, manager, thread_id="thread_dest"):
         async def main():
-            job = await manager.start(
+            job = manager.start(
                 shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
                 wake_targets=[{"type": "codex_desktop", "events": ["completed"], "thread_id": thread_id}],
             )
@@ -1100,7 +1100,7 @@ class TestRelay:
             from vanth.server import canonicalize_wake_target
 
             async def main():
-                job = await manager.start(
+                job = manager.start(
                     shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
                     wake_targets=[{"type": "codex_desktop", "events": ["completed"], "threadId": "thread_legacy"}],
                 )
@@ -1127,7 +1127,7 @@ class TestRelay:
             )
 
             async def main():
-                job = await manager.start(
+                job = manager.start(
                     shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
                     wake_targets=[{"type": "codex_desktop", "events": ["completed"], "session_id": "thread_alias"}],
                 )
@@ -1148,11 +1148,11 @@ class TestRelay:
                 "mcp-1234-abcd", "codex_desktop", [{"client_type": "codex_desktop", "thread_id": "thread_real"}]
             )
             with pytest.raises(ValueError, match="relay client id"):
-                asyncio.run(
+                
                     manager.start(
                         shellcmd.join([sys.executable, "-c", "import sys; sys.exit(0)"]),
                         wake_targets=[{"type": "codex_desktop", "events": ["completed"], "thread_id": "mcp-1234-abcd"}],
-                    )
+                    
                 )
         finally:
             manager.close()

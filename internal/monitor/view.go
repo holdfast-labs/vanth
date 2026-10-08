@@ -1172,10 +1172,14 @@ func parseRunOverview(runJSON string) []string {
 	return rows
 }
 
-// shortRepo trims git remote URLs to a readable name.
+// shortRepo trims git remote URLs to a readable name, handling both
+// slash-separated URLs and scp-like `user@host:org/repo` syntax.
 func shortRepo(repo string) string {
 	repo = strings.TrimSuffix(repo, ".git")
 	if i := strings.LastIndex(repo, "/"); i >= 0 {
+		return repo[i+1:]
+	}
+	if i := strings.LastIndex(repo, ":"); i >= 0 {
 		return repo[i+1:]
 	}
 	return repo

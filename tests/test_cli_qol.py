@@ -118,6 +118,26 @@ def test_list_ps_alias(daemon):
         pass
 
 
+def test_resolve_endpoint_round_trip(daemon):
+    """`/jobs/resolve` settles exact, prefix, ambiguous, and unknown inputs."""
+    tmp_path, client, port = daemon
+    started = client.post("/jobs", {"command": cmd("print('x')")})
+    job_id = started["job_id"]
+    assert client.get("/jobs/resolve", {"prefix": job_id}) == {"job_id": job_id, "problem": ""}
+    assert client.get("/jobs/resolve", {"prefix": job_id[:12]})["job_id"] == job_id
+    second = client.post("/jobs", {"command": cmd("print('y')")})["job_id"]
+    ambiguous = client.get("/jobs/resolve", {"prefix": "job_"})
+    assert ambiguous["job_id"] is None
+    assert "ambiguous" in ambiguous["problem"]
+    unknown = client.get("/jobs/resolve", {"prefix": "job_zzz_nope"})
+    assert unknown == {"job_id": None, "problem": "unknown job job_zzz_nope"}
+    try:
+        client.post(f"/jobs/{job_id}/stop", {})
+        client.post(f"/jobs/{second}/stop", {})
+    except Exception:
+        pass
+
+
 def test_list_json(daemon):
     tmp_path, client, port = daemon
     started = client.post("/jobs", {"command": cmd("import time; time.sleep(30)")})

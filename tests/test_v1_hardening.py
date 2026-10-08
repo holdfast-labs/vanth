@@ -57,11 +57,10 @@ def test_future_schema_is_rejected_and_existing_schema_migrates_with_backup(tmp_
 def test_manual_delivery_is_not_polled_or_threaded(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(
+        started = manager.start(
                 cmd("print('AGENT_EVENT {\\\"type\\\":\\\"checkpoint\\\"}', flush=True)"),
                 wake_targets=[{"type": "codex_thread", "thread_id": "thread", "events": ["checkpoint"], "auto_dispatch": False}],
-            )
+            
         )
         wait_event(manager, started["job_id"], "checkpoint")
         for _ in range(5):
@@ -75,11 +74,10 @@ def test_manual_delivery_is_not_polled_or_threaded(tmp_path):
 def test_expired_delivery_reclaim_rejects_stale_completion(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(
+        started = manager.start(
                 cmd("print('AGENT_EVENT {\\\"type\\\":\\\"checkpoint\\\"}', flush=True)"),
                 wake_targets=[{"type": "codex_thread", "thread_id": "thread", "events": ["checkpoint"], "auto_dispatch": False}],
-            )
+            
         )
         wait_event(manager, started["job_id"], "checkpoint")
         delivery = manager.deliveries(started["job_id"])["deliveries"][0]
@@ -99,7 +97,7 @@ def test_expired_delivery_reclaim_rejects_stale_completion(tmp_path):
 def test_shutdown_wakes_active_wait(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+        started = manager.start(cmd("import time; time.sleep(30)"))
         result = {}
 
         def wait() -> None:
@@ -118,7 +116,7 @@ def test_shutdown_wakes_active_wait(tmp_path):
 def test_cleanup_removes_all_job_artifacts_and_is_idempotent(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('done')")))
+        started = manager.start(cmd("print('done')"))
         wait_event(manager, started["job_id"], "completed")
         runner_log = manager.logs / f"{started['job_id']}.runner.log"
         spec = manager.home / "specs" / f"{started['job_id']}.json"
@@ -316,7 +314,7 @@ def test_stop_after_restart_kills_unix_child_and_grandchild(tmp_path):
     )
     command = shlex.join([sys.executable, "-c", code])
     try:
-        started = asyncio.run(manager.start(command))
+        started = manager.start(command)
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and not pids.exists():
             time.sleep(0.05)

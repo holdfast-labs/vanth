@@ -32,11 +32,10 @@ def tail(manager: JobManager, job_id: str, stream: str) -> str:
 def test_interactive_job_receives_stdin_and_eof(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(
+        started = manager.start(
                 cmd("import sys; data=sys.stdin.read(); print('GOT:'+data, flush=True)"),
                 interactive=True,
-            )
+            
         )
         job_id = started["job_id"]
         wait_event(manager, job_id, "started")
@@ -52,7 +51,7 @@ def test_interactive_job_receives_stdin_and_eof(tmp_path):
 def test_job_send_rejects_non_interactive_job(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(manager.start(cmd("print('plain')")))
+        started = manager.start(cmd("print('plain')"))
         wait_event(manager, started["job_id"], "completed")
         with pytest.raises(ValueError, match="not interactive"):
             manager.send_sync(started["job_id"], "nope")
@@ -65,8 +64,7 @@ def test_job_send_rejects_unknown_or_not_running(tmp_path):
     try:
         with pytest.raises(ValueError, match="Unknown job_id"):
             manager.send_sync("job_missing", "nope")
-        started = asyncio.run(
-            manager.start(cmd("import sys; print(sys.stdin.read())"), interactive=True)
+        started = manager.start(cmd("import sys; print(sys.stdin.read())"), interactive=True
         )
         wait_event(manager, started["job_id"], "started")
         manager.send_sync(started["job_id"], "", eof=True)
@@ -80,8 +78,7 @@ def test_job_send_rejects_unknown_or_not_running(tmp_path):
 def test_non_interactive_job_stdin_closed(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(cmd("import sys; print('E'+sys.stdin.read() or 'X', flush=True)"))
+        started = manager.start(cmd("import sys; print('E'+sys.stdin.read() or 'X', flush=True)")
         )
         wait_event(manager, started["job_id"], "completed")
         assert manager.status(started["job_id"])["status"] == "completed"
@@ -93,11 +90,10 @@ def test_non_interactive_job_stdin_closed(tmp_path):
 def test_eof_allows_program_that_exits_on_stdin_close(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(
+        started = manager.start(
                 cmd("import sys; sys.stdin.readline(); print('READY', flush=True)"),
                 interactive=True,
-            )
+            
         )
         job_id = started["job_id"]
         wait_event(manager, job_id, "started")
@@ -112,11 +108,10 @@ def test_eof_allows_program_that_exits_on_stdin_close(tmp_path):
 def test_cleanup_removes_stdin_file(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(
+        started = manager.start(
                 cmd("import sys; sys.stdin.read(); print('done', flush=True)"),
                 interactive=True,
-            )
+            
         )
         job_id = started["job_id"]
         wait_event(manager, job_id, "started")
@@ -134,11 +129,10 @@ def test_cleanup_removes_stdin_file(tmp_path):
 def test_rerun_preserves_interactive(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        started = asyncio.run(
-            manager.start(
+        started = manager.start(
                 cmd("import sys; data=sys.stdin.read(); print('GOT:'+data, flush=True)"),
                 interactive=True,
-            )
+            
         )
         job_id = started["job_id"]
         # An interactive job reads until EOF, so it must be closed before it can

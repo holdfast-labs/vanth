@@ -60,7 +60,7 @@ def test_logger_events_persist_through_daemon(tmp_path):
             "logger.warning('loguru warn')"
         )
         command = shellcmd.join([sys.executable, "-c", code])
-        job_id = asyncio.run(manager.start(command))["job_id"]
+        job_id = manager.start(command)["job_id"]
         asyncio.run(manager.wait(job_id, ["log"], timeout_seconds=10))
         asyncio.run(manager.wait(job_id, ["completed"], timeout_seconds=10))
         logs = [e for e in manager.events(job_id, types=["log"], limit=10)["events"]]

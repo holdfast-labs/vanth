@@ -323,7 +323,7 @@ def test_job_cleanup_preserves_managed_content(home):
 
     manager = JobManager(home)
     try:
-        job_id = asyncio.run(manager.start(cmd("import time; time.sleep(0.05)")))["job_id"]
+        job_id = manager.start(cmd("import time; time.sleep(0.05)"))["job_id"]
         asyncio.run(manager.wait(job_id, ["completed"], timeout_seconds=30))
         report = manager.cleanup(0, dry_run=False)
         assert job_id in report["jobs"]

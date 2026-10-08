@@ -6,6 +6,7 @@ from __future__ import annotations
 # therefore imported function-locally at each use site below (a resolved
 # sys.modules hit once anything async is already running).
 import base64
+import difflib
 import hashlib
 import json
 import logging
@@ -2068,20 +2069,16 @@ class JobManager:
         if "scheduled" not in tags:
             tags.append("scheduled")
         try:
-            import asyncio
-
-            result = asyncio.run(
-                self.start(
-                    command=row["command"],
-                    cwd=row["cwd"],
-                    name=row["name"] or schedule_id,
-                    env=json.loads(row["env_json"] or "{}") or None,
-                    timeout_seconds=row["timeout_seconds"],
-                    tags=tags,
-                    notes=row["notes"],
-                    secret_env=json.loads(row["secret_env_json"] or "[]") or None,
-                    schedule_id=schedule_id,
-                )
+            result = self.start(
+                command=row["command"],
+                cwd=row["cwd"],
+                name=row["name"] or schedule_id,
+                env=json.loads(row["env_json"] or "{}") or None,
+                timeout_seconds=row["timeout_seconds"],
+                tags=tags,
+                notes=row["notes"],
+                secret_env=json.loads(row["secret_env_json"] or "[]") or None,
+                schedule_id=schedule_id,
             )
             self.logger.info("schedule %s fired job %s", schedule_id, result.get("job_id"))
         except Exception:
@@ -3409,7 +3406,7 @@ class JobManager:
             self.logger.info("expired %d never-dispatched delivery(ies) older than %ds", changed, ttl_seconds)
         return changed
 
-    async def start(
+    def start(
         self,
         command: str,
         cwd: str | None = None,
@@ -4393,9 +4390,7 @@ class JobManager:
             if not isinstance(env, dict):
                 raise ValueError("env must be an object of string values")
             merged_env = {**stored_env, **env}
-        import asyncio
-
-        result = asyncio.run(self.start(
+        result = self.start(
             command=command if command is not None else row["command"],
             cwd=cwd if cwd is not None else row["cwd"],
             name=name if name is not None else row["name"],
@@ -4411,7 +4406,7 @@ class JobManager:
             secret_env=secret_env if secret_env is not None else (json.loads(row["secret_env_json"] or "null") or None),
             pool=row["pool"],
             priority=row["priority"] or 0,
-        ))
+        )
         if prior_state and json.loads(row["policy_json"] or "null"):
             # Carry ONLY the failure streak: reacted_* dedup markers belong to
             # the previous runner instance and must not suppress the next
@@ -5635,6 +5630,44 @@ class JobManager:
             if payload.get("status") == "unknown":
                 unknown.append(job_id)
         return {"jobs": jobs, "count": len(jobs), "unknown": unknown}
+
+    def resolve_job_id(self, raw: str) -> dict[str, Any]:
+        """Resolve ``raw`` to a full job id, tolerating an unambiguous prefix.
+
+        Server-side twin of the CLI's prefix resolution: agents and humans
+        transcribe ids by hand, and a single dropped character used to produce
+        "unknown job" with no hint. Returns ``{"job_id": ..., "problem": ...}``
+        with exactly one set. Prefix matching runs over ALL jobs through the
+        primary-key index (no 1000-row window); only the typo-hint candidates
+        come from recent history, as before.
+        """
+        self._ensure_open()
+        if not isinstance(raw, str):
+            raise ValueError("prefix must be a string")
+        if "/" in raw or len(raw) >= 40:  # not a plausible id; let the caller decide
+            return {"job_id": raw, "problem": ""}
+        exact = self._row("SELECT job_id FROM jobs WHERE job_id=?", (raw,))
+        if exact is not None:
+            return {"job_id": raw, "problem": ""}
+        escaped = raw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        matches = [
+            row["job_id"]
+            for row in self._select_all(
+                "SELECT job_id FROM jobs WHERE job_id LIKE ? ESCAPE '\\' ORDER BY job_id ASC",
+                (escaped + "%",),
+            )
+        ]
+        if len(matches) == 1:
+            return {"job_id": matches[0], "problem": ""}
+        if len(matches) > 1:
+            return {"job_id": None, "problem": f"{raw!r} is ambiguous: {', '.join(sorted(matches)[:5])}"}
+        recent = [
+            row["job_id"]
+            for row in self._select_all("SELECT job_id FROM jobs ORDER BY updated_at DESC LIMIT 1000")
+        ]
+        near = difflib.get_close_matches(raw, recent, n=3, cutoff=0.5)
+        hint = f"; did you mean {', '.join(near)}?" if near else ""
+        return {"job_id": None, "problem": f"unknown job {raw}{hint}"}
 
     def list(self, status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
              name: str | None = None, tags: list[str] | None = None) -> dict[str, Any]:

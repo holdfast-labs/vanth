@@ -64,7 +64,7 @@ class FakeManager:
         self.db = self
         self.closed = False
 
-    async def start(self, command, **kwargs):
+    def start(self, command, **kwargs):
         job_id = "own-job"
         self.processes[job_id] = FakeProcess()
         return {"job_id": job_id}

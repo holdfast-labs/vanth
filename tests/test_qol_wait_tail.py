@@ -14,7 +14,7 @@ def cmd(code: str) -> str:
 
 
 def start_job(manager, code, **kwargs):
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def test_wait_return_progress_streams_then_completes(tmp_path):

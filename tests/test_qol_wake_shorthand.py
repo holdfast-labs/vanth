@@ -1,7 +1,7 @@
 """Tests for the daemon_wake shorthand (_build_wake_target) + wake delivery.
 
 Uses the same patterns as test_qol_mcp.py: a direct JobManager instance with a
-tmp_path home and real jobs started via asyncio.run(manager.start(...)).
+tmp_path home and real jobs started via manager.start(...).
 """
 
 import asyncio
@@ -25,7 +25,7 @@ def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
 
 
 def start_job(manager, code, **kwargs):
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def test_build_wake_target_passthrough():

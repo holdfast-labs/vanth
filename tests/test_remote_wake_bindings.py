@@ -1,4 +1,3 @@
-import asyncio
 import sys
 
 import pytest
@@ -69,7 +68,7 @@ def test_non_terminal_remote_status_does_nothing(tmp_path):
 def test_composite_binding_is_safe_from_local_job_collision(tmp_path):
     manager = JobManager(tmp_path / "state")
     try:
-        local_job_id = asyncio.run(manager.start(cmd("pass")))['job_id']
+        local_job_id = manager.start(cmd("pass"))['job_id']
         target_id = manager.register_remote_wake_targets(
             "host-a", local_job_id, [{"type": "local_command", "events": ["completed"], "command": cmd("pass")}]
         )[0]

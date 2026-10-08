@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import sys
 import time
 
@@ -29,8 +28,8 @@ def test_pool_job_queues_and_dispatches_by_priority(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         manager.pool_configure("p", max_parallel=1)
-        low = asyncio.run(manager.start(cmd(SLEEP), pool="p", priority=0))
-        high = asyncio.run(manager.start(cmd(SLEEP), pool="p", priority=5))
+        low = manager.start(cmd(SLEEP), pool="p", priority=0)
+        high = manager.start(cmd(SLEEP), pool="p", priority=5)
         assert low["status"] == "queued" and high["status"] == "queued"
 
         manager._dispatch_queued_jobs()
@@ -52,7 +51,7 @@ def test_pool_pause_holds_then_resume_drains(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         manager.pool_configure("p", max_parallel=2, paused=True)
-        job = asyncio.run(manager.start(cmd(SLEEP), pool="p"))
+        job = manager.start(cmd(SLEEP), pool="p")
         manager._dispatch_queued_jobs()
         assert manager.status(job["job_id"])["status"] == "queued", "paused pool must not launch"
 
@@ -71,7 +70,7 @@ def test_job_pause_and_resume(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         manager.pool_configure("p", max_parallel=1)
-        job = asyncio.run(manager.start(cmd(SLEEP), pool="p"))
+        job = manager.start(cmd(SLEEP), pool="p")
         manager.job_pause(job["job_id"])
         manager._dispatch_queued_jobs()
         assert manager.status(job["job_id"])["status"] == "queued"
@@ -87,7 +86,7 @@ def test_job_pause_and_resume(tmp_path):
 def test_pause_running_job_rejected(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
-        started = asyncio.run(manager.start(cmd(SLEEP)))
+        started = manager.start(cmd(SLEEP))
         for _ in range(200):
             if manager.status(started["job_id"])["status"] == "running":
                 break
@@ -103,12 +102,12 @@ def test_global_quota_limits_queued_dispatch(tmp_path, monkeypatch):
     monkeypatch.setenv("VANTH_MAX_RUNNING_JOBS", "1")
     manager = JobManager(tmp_path, recover=False)
     try:
-        direct = asyncio.run(manager.start(cmd(SLEEP)))
+        direct = manager.start(cmd(SLEEP))
         for _ in range(200):
             if manager.status(direct["job_id"])["status"] == "running":
                 break
             time.sleep(0.05)
-        queued = asyncio.run(manager.start(cmd(SLEEP), pool="p"))
+        queued = manager.start(cmd(SLEEP), pool="p")
         assert queued["status"] == "queued"
         manager._dispatch_queued_jobs()
         assert manager.status(queued["job_id"])["status"] == "queued", "global quota must still gate"
@@ -127,11 +126,11 @@ def test_global_quota_limits_queued_dispatch(tmp_path, monkeypatch):
 def test_queued_stop_persists_attribution(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
-        parent = asyncio.run(manager.start(cmd(SLEEP)))
-        child = asyncio.run(manager.start(
+        parent = manager.start(cmd(SLEEP))
+        child = manager.start(
             cmd("print('x')"),
             trigger={"job_id": parent["job_id"], "status": "completed"},
-        ))
+        )
         assert child["status"] == "queued"
         manager.stop_sync(child["job_id"], actor="user", reason="changed plan")
         status = manager.status(child["job_id"])
@@ -147,11 +146,11 @@ def test_paused_trigger_job_is_still_cancelled(tmp_path):
     """A held job whose trigger parent ends incompatibly must not linger."""
     manager = JobManager(tmp_path, recover=False)
     try:
-        parent = asyncio.run(manager.start(cmd(SLEEP)))
-        child = asyncio.run(manager.start(
+        parent = manager.start(cmd(SLEEP))
+        child = manager.start(
             cmd("print('never')"),
             trigger={"job_id": parent["job_id"], "status": "completed"},
-        ))
+        )
         manager.job_pause(child["job_id"])
         manager.stop_sync(parent["job_id"])  # parent -> cancelled, not completed
         manager._dispatch_queued_jobs()
@@ -170,7 +169,7 @@ def test_pool_capacity_holds_under_concurrent_dispatch(tmp_path):
     try:
         m1.pool_configure("p", max_parallel=1)
         for _ in range(5):
-            asyncio.run(m1.start(cmd(SLEEP), pool="p"))
+            m1.start(cmd(SLEEP), pool="p")
 
         barrier = threading.Barrier(2)
 
@@ -200,12 +199,12 @@ def test_trigger_and_pool_gate_together(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         manager.pool_configure("p", max_parallel=1)
-        parent = asyncio.run(manager.start(cmd(SLEEP)))
-        child = asyncio.run(manager.start(
+        parent = manager.start(cmd(SLEEP))
+        child = manager.start(
             cmd(SLEEP),
             trigger={"job_id": parent["job_id"], "status": "completed"},
             pool="p",
-        ))
+        )
         assert child["status"] == "queued"
         manager._dispatch_queued_jobs()
         assert manager.status(child["job_id"])["status"] == "queued", "trigger not satisfied yet"

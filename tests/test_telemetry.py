@@ -43,7 +43,7 @@ def start_metric_job(manager: JobManager) -> str:
         "[(agent_event('metric', _step=i, loss=1.0/i+1, acc=i*0.1), "
         "  progress(i, 10, unit='epoch', stage='train'), time.sleep(0.1)) for i in range(1, 5)]"
     )
-    started = asyncio.run(manager.start(cmd(code), name="metric demo"))
+    started = manager.start(cmd(code), name="metric demo")
     job_id = started["job_id"]
     wait_event(manager, job_id, "completed", timeout=20)
     return job_id

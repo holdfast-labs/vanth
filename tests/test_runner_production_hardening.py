@@ -1,4 +1,3 @@
-import asyncio
 import io
 import json
 import struct
@@ -87,7 +86,7 @@ def test_pipe_drain_has_one_deadline_for_all_readers(tmp_path, monkeypatch):
 
 def test_concurrent_cross_process_batches_preserve_sequences(tmp_path):
     manager = JobManager(tmp_path)
-    job = asyncio.run(manager.start(shellcmd.join([sys.executable, "-c", "pass"])))
+    job = manager.start(shellcmd.join([sys.executable, "-c", "pass"]))
     job_id = job["job_id"]
     manager.wait_sync(job_id, ["completed"], timeout_seconds=20)
     code = ("from vanth.server import JobManager,normalize_event_payload; import sys; "
@@ -105,7 +104,7 @@ def test_concurrent_cross_process_batches_preserve_sequences(tmp_path):
 def test_concurrent_stdin_records_and_eof_are_serialized(tmp_path):
     manager = JobManager(tmp_path)
     command = shellcmd.join([sys.executable, "-c", "import sys; data=sys.stdin.buffer.read(); print(len(data))"])
-    job = asyncio.run(manager.start(command, interactive=True))
+    job = manager.start(command, interactive=True)
     job_id = job["job_id"]
     manager.wait_sync(job_id, ["started"], timeout_seconds=20)
     with ThreadPoolExecutor(max_workers=6) as pool:
@@ -130,7 +129,7 @@ def test_concurrent_stdin_records_and_eof_are_serialized(tmp_path):
 def test_interactive_restart_resets_eof_and_old_input(tmp_path):
     manager = JobManager(tmp_path)
     command = shellcmd.join([sys.executable, "-c", "import sys; data=sys.stdin.buffer.read(); print(len(data),flush=True); sys.exit(1)"])
-    job = asyncio.run(manager.start(command, interactive=True))
+    job = manager.start(command, interactive=True)
     job_id = job["job_id"]
     manager.wait_sync(job_id, ["started"], timeout_seconds=20)
     manager.send_sync(job_id, "old", eof=True)
@@ -160,7 +159,7 @@ def test_exited_parent_with_inherited_pipes_obeys_workload_deadline(tmp_path):
             f"p=subprocess.Popen([sys.executable,'-c',{child!r}]); "
             f"Path({str(pid_file)!r}).write_text(str(p.pid))")
     started_at = time.monotonic()
-    job = asyncio.run(manager.start(shellcmd.join([sys.executable, "-c", code]), timeout_seconds=1))
+    job = manager.start(shellcmd.join([sys.executable, "-c", code]), timeout_seconds=1)
     try:
         result = manager.wait_sync(job["job_id"], ["timeout"], timeout_seconds=5)
         assert result["result"] == "event"
@@ -220,7 +219,7 @@ def test_windows_runner_exit_reaps_descendants_without_inherited_pipes(tmp_path)
             "p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(120)'], "
             "stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL); "
             f"Path({str(pid_file)!r}).write_text(str(p.pid))")
-    job = asyncio.run(manager.start(shellcmd.join([sys.executable, "-c", code])))
+    job = manager.start(shellcmd.join([sys.executable, "-c", code]))
     try:
         assert manager.wait_sync(job["job_id"], ["completed"], timeout_seconds=10)["result"] == "event"
         child_pid = int(pid_file.read_text())
@@ -260,7 +259,7 @@ def test_event_persistence_failure_keeps_draining(tmp_path, monkeypatch):
 def test_capture_batch_failure_rolls_back_all_events_and_hooks(tmp_path, monkeypatch):
     from vanth.server import normalize_event_payload
     manager = JobManager(tmp_path)
-    job = asyncio.run(manager.start(shellcmd.join([sys.executable, "-c", "pass"])))
+    job = manager.start(shellcmd.join([sys.executable, "-c", "pass"]))
     job_id = job["job_id"]
     manager.wait_sync(job_id, ["completed"], timeout_seconds=20)
     calls = []
@@ -284,11 +283,11 @@ def test_nested_vanth_runner_survives_outer_runner_exit(tmp_path):
     inner_code = f"import time; from pathlib import Path; time.sleep(3); Path({str(marker)!r}).write_text('done')"
     inner_command = shellcmd.join([sys.executable, "-c", inner_code])
     outer_code = ("import asyncio; from vanth.server import JobManager; "
-                  f"m=JobManager({str(nested_home)!r}); j=asyncio.run(m.start({inner_command!r})); "
+                  f"m=JobManager({str(nested_home)!r}); j=m.start({inner_command!r}); "
                   "m.wait_sync(j['job_id'],['started'],timeout_seconds=10); print(j['job_id'],flush=True); m.close()")
     nested = None
     try:
-        outer = asyncio.run(manager.start(shellcmd.join([sys.executable, "-c", outer_code])))
+        outer = manager.start(shellcmd.join([sys.executable, "-c", outer_code]))
         assert manager.wait_sync(outer["job_id"], ["completed"], timeout_seconds=15)["result"] == "event"
         nested = JobManager(nested_home)
         job_id = manager.tail(outer["job_id"])["content"].strip()

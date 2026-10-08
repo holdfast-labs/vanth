@@ -20,7 +20,7 @@ def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
 
 
 def start_job(manager, code, **kwargs):
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def test_rerun_overrides_command_and_env(tmp_path):
@@ -144,6 +144,102 @@ def test_status_batch_empty_raises(tmp_path):
             manager.status_batch(["a", 42])
         with pytest.raises(ValueError, match="job_ids must be a list of strings"):
             manager.status_batch([True])
+    finally:
+        manager.close()
+
+
+def _seed_resolve_jobs(manager, count, prefix="job_seed", oldest_first=True):
+    """Insert `count` terminal jobs directly; ids sort, timestamps spread."""
+    with manager.db_lock:
+        manager.db.executemany(
+            "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path)"
+            " VALUES (?, 'true', 'completed', ?, ?, 'a', 'b', 'c')",
+            [
+                (f"{prefix}_{index:05d}", f"2026-01-{(index % 28) + 1:02d}T00:00:00Z", f"2026-02-{(index % 28) + 1:02d}T00:00:00Z")
+                for index in range(count)
+            ],
+        )
+        manager.db.commit()
+
+
+def test_resolve_exact_and_unique_prefix(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        _seed_resolve_jobs(manager, 1, prefix="job_alpha")
+        _seed_resolve_jobs(manager, 1, prefix="job_beta")
+        assert manager.resolve_job_id("job_alpha_00000") == {"job_id": "job_alpha_00000", "problem": ""}
+        assert manager.resolve_job_id("job_alpha") == {"job_id": "job_alpha_00000", "problem": ""}
+    finally:
+        manager.close()
+
+
+def test_resolve_prefix_finds_job_beyond_recent_window(tmp_path):
+    """Prefix search covers the whole history, not just the recent 1000."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        _seed_resolve_jobs(manager, 1005)
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path)"
+                " VALUES ('job_zzz_ancient', 'true', 'completed', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z', 'a', 'b', 'c')"
+            )
+            manager.db.commit()
+        # 1006 jobs: the ancient one is far outside any 1000-row recent window.
+        assert manager.resolve_job_id("job_zzz") == {"job_id": "job_zzz_ancient", "problem": ""}
+        assert manager.resolve_job_id("job_zzz_ancient") == {"job_id": "job_zzz_ancient", "problem": ""}
+    finally:
+        manager.close()
+
+
+def test_resolve_ambiguous_and_unknown(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        _seed_resolve_jobs(manager, 3, prefix="job_dup")
+        ambiguous = manager.resolve_job_id("job_dup")
+        assert ambiguous["job_id"] is None
+        assert "ambiguous" in ambiguous["problem"]
+        unknown = manager.resolve_job_id("job_nope_nothing")
+        assert unknown["job_id"] is None
+        assert unknown["problem"].startswith("unknown job job_nope_nothing")
+    finally:
+        manager.close()
+
+
+def test_resolve_unknown_suggests_near_miss(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        _seed_resolve_jobs(manager, 1, prefix="job_aaaabbbbcccc")
+        unknown = manager.resolve_job_id("job_aaaabbbbcccd")
+        assert unknown["job_id"] is None
+        assert "did you mean job_aaaabbbbcccc_00000?" in unknown["problem"]
+    finally:
+        manager.close()
+
+
+def test_resolve_passthrough_and_validation(tmp_path):
+    manager = JobManager(tmp_path / "state")
+    try:
+        assert manager.resolve_job_id("weird/id") == {"job_id": "weird/id", "problem": ""}
+        assert manager.resolve_job_id("x" * 40) == {"job_id": "x" * 40, "problem": ""}
+        with pytest.raises(ValueError, match="prefix must be a string"):
+            manager.resolve_job_id(42)
+    finally:
+        manager.close()
+
+
+def test_resolve_treats_wildcards_literally(tmp_path):
+    """LIKE metacharacters in the raw input must not widen the match."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        _seed_resolve_jobs(manager, 2)
+        # `%` alone is a literal prefix no id starts with — not "match all".
+        unknown = manager.resolve_job_id("%")
+        assert unknown["job_id"] is None
+        assert unknown["problem"].startswith("unknown job %")
+        # A literal `job_` prefix genuinely matches everything: ambiguous.
+        ambiguous = manager.resolve_job_id("job_")
+        assert ambiguous["job_id"] is None
+        assert "ambiguous" in ambiguous["problem"]
     finally:
         manager.close()
 

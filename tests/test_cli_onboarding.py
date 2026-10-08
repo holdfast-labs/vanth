@@ -265,6 +265,21 @@ def test_start_reads_trigger_json_from_stdin(monkeypatch, capsys):
 def test_exact_old_job_does_not_depend_on_recent_list():
     class OldClient:
         def get(self, path, params=None):
-            assert path == "/jobs/job_old/status"
+            if path == "/jobs/resolve":
+                return {"job_id": "job_old", "problem": ""}
+            assert path == "/jobs/job_old/status", path
             return {"job_id": "job_old", "status": "completed"}
     assert cli._resolve_job_id(OldClient(), "job_old") == ("job_old", "")
+
+
+def test_resolve_falls_back_for_old_daemons():
+    """Daemons without `/jobs/resolve` 404 it; the legacy path must serve."""
+
+    class OldDaemon:
+        def get(self, path, params=None):
+            if path == "/jobs/resolve":
+                return {"result": "error", "error": "Not found"}
+            assert path == "/jobs/job_old/status", path
+            return {"job_id": "job_old", "status": "completed"}
+
+    assert cli._resolve_job_id(OldDaemon(), "job_old") == ("job_old", "")

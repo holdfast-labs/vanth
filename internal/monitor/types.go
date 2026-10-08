@@ -71,15 +71,19 @@ func (j JobSummary) IsRemote() bool { return j.Shadow }
 // DurationSeconds returns the run's wall-clock runtime for terminal jobs whose
 // started_at and ended_at are both present and well-formed. ok is false for
 // running, queued, or remote-shadow rows (which carry no local timestamps).
+//
+// The daemon emits fractional seconds (2026-01-01T00:00:00.123456Z), so this
+// parses RFC3339Nano — plain RFC3339 rejects the fraction and would silently
+// exclude every real job from duration analytics.
 func (j JobSummary) DurationSeconds() (float64, bool) {
 	if j.StartedAt == "" || j.EndedAt == "" {
 		return 0, false
 	}
-	start, err := time.Parse(time.RFC3339, j.StartedAt)
+	start, err := time.Parse(time.RFC3339Nano, j.StartedAt)
 	if err != nil {
 		return 0, false
 	}
-	end, err := time.Parse(time.RFC3339, j.EndedAt)
+	end, err := time.Parse(time.RFC3339Nano, j.EndedAt)
 	if err != nil {
 		return 0, false
 	}

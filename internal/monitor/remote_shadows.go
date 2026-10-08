@@ -9,7 +9,9 @@ package monitor
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"strings"
 )
 
 // ShadowRow is one projected remote job shadow.
@@ -62,8 +64,8 @@ func LoadRemoteShadows(dbPath string) ([]ShadowRow, error) {
 	return out, rows.Err()
 }
 
-// extractPayloadName pulls "name" from a shadow payload_json without a full
-// JSON decode dependency; falls back to empty on any parse problem.
+// extractPayloadName pulls "name" from a shadow payload_json, falling back to
+// empty on any parse problem.
 func extractPayloadName(payload string) string {
 	return extractPayloadString(payload, "name")
 }
@@ -72,36 +74,20 @@ func extractPayloadCommand(payload string) string {
 	return extractPayloadString(payload, "command")
 }
 
+// extractPayloadString decodes one top-level string field with encoding/json.
+// (A previous hand-rolled substring scan mishandled every escape except \"
+// — \\, \n, \uXXXX — and silently returned truncated values.)
 func extractPayloadString(payload, key string) string {
 	if payload == "" {
 		return ""
 	}
-	needle := "\"" + key + "\":\""
-	idx := indexOf(payload, needle)
-	if idx < 0 {
+	var obj map[string]any
+	dec := json.NewDecoder(strings.NewReader(payload))
+	if err := dec.Decode(&obj); err != nil {
 		return ""
 	}
-	start := idx + len(needle)
-	end := start
-	for end < len(payload) {
-		if payload[end] == '"' && payload[end-1] != '\\' {
-			break
-		}
-		end++
-	}
-	if end > len(payload) {
-		return ""
-	}
-	return payload[start:end]
-}
-
-func indexOf(haystack, needle string) int {
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i:i+len(needle)] == needle {
-			return i
-		}
-	}
-	return -1
+	value, _ := obj[key].(string)
+	return value
 }
 
 // ProjectShadows converts shadow rows into JobSummary entries for the view.

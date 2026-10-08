@@ -31,7 +31,6 @@ Every scenario prints PASS or FAIL and the process exits nonzero on any failure.
 from __future__ import annotations
 
 import argparse
-import asyncio
 import http.client
 import json
 import os
@@ -129,7 +128,7 @@ class BurstScenario(Scenario):
             manager.pool_configure("burst", max_parallel=4)
             for index in range(self.jobs):
                 started.append(
-                    asyncio.run(manager.start(cmd(code), name=f"burst-{index}", pool="burst"))["job_id"]
+                    manager.start(cmd(code), name=f"burst-{index}", pool="burst")["job_id"]
                 )
             for index, job_id in enumerate(started):
                 wait_for(
@@ -200,11 +199,10 @@ class AdapterScenario(Scenario):
                 "time.sleep(0.01));"
                 "[f(i) for i in range(1,21)]"
             )
-            job_id = asyncio.run(
-                manager.start(
+            job_id = manager.start(
                     cmd(code),
                     wake_targets=[{"type": "local_command", "events": ["progress"], "command": slow}],
-                )
+                
             )["job_id"]
             started_at = time.monotonic()
             wait_for(
@@ -359,7 +357,7 @@ class RunnerKillScenario(Scenario):
         home = Path(tempfile.mkdtemp(prefix="vanth-runner-kill-"))
         manager = JobManager(home)
         try:
-            phase_job = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))["job_id"]
+            phase_job = manager.start(cmd("import time; time.sleep(30)"))["job_id"]
             wait_for(
                 lambda: manager.status(phase_job)["status"] == "running",
                 10,
@@ -376,7 +374,7 @@ class RunnerKillScenario(Scenario):
             assert not manager._pid_alive(manager.status(phase_job)["pid"]), "workload leaked after runner kill"
             print("  runner killed during execution -> orphaned, workload tree terminated")
 
-            startup_job = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))["job_id"]
+            startup_job = manager.start(cmd("import time; time.sleep(30)"))["job_id"]
             wait_for(
                 lambda: manager.status(startup_job)["status"] == "running",
                 10,
@@ -458,7 +456,7 @@ class StateScenario(Scenario):
                 "[print('x'*500, flush=True) for _ in range(2000)];"
                 "[print('y'*500, file=sys.stderr, flush=True) for _ in range(2000)]"
             )
-            job_id = asyncio.run(manager.start(cmd(code)))["job_id"]
+            job_id = manager.start(cmd(code))["job_id"]
             wait_for(lambda: manager.status(job_id)["status"] == "completed", 60, "noisy job completion")
             counts = {row["type"]: row["c"] for row in manager.db.execute(
                 "SELECT type, COUNT(*) AS c FROM events WHERE job_id=? GROUP BY type", (job_id,)
@@ -502,7 +500,7 @@ class AgentFeatureScenario(Scenario):
             started = []
             for index in range(10):
                 started.append(
-                    asyncio.run(
+                    
                         manager.start(
                             cmd(batch_code),
                             name=f"agent-job-{index}",
@@ -513,7 +511,7 @@ class AgentFeatureScenario(Scenario):
                                 {"type": "local_command", "events": ["checkpoint"],
                                  "command": [sys.executable, "-c", "import sys; sys.exit(0)"]}
                             ],
-                        )
+                        
                     )["job_id"]
                 )
             for job_id in started:

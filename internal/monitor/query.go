@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -476,7 +477,7 @@ func ReadLogTail(path string, byteLimit int64, lineLimit int) LogTail {
 		return LogTail{Err: err}
 	}
 	data := make([]byte, size-offset)
-	if _, err := f.Read(data); err != nil {
+	if _, err := io.ReadFull(f, data); err != nil {
 		return LogTail{Err: err}
 	}
 	text := string(data)

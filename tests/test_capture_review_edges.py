@@ -105,7 +105,6 @@ def test_failed_eof_publication_does_not_close_the_stdin_channel(manager, monkey
 
 @pytest.mark.skipif(__import__("sys").platform != "win32", reason="uses Windows runner containment for safe own-tree teardown")
 def test_blocked_stdin_feeder_with_exited_parent_obeys_workload_deadline(tmp_path):
-    import asyncio
     import subprocess
     import sys
     import time
@@ -116,8 +115,8 @@ def test_blocked_stdin_feeder_with_exited_parent_obeys_workload_deadline(tmp_pat
             "subprocess.Popen([sys.executable,'-c','import time;time.sleep(30)']); "
             "print('ready',flush=True);time.sleep(.5)")
     try:
-        job = asyncio.run(manager.start(subprocess.list2cmdline([sys.executable, "-c", code]),
-                                        interactive=True, timeout_seconds=10, notify_on=[], wake_targets=[]))
+        job = manager.start(subprocess.list2cmdline([sys.executable, "-c", code]),
+                                        interactive=True, timeout_seconds=10, notify_on=[], wake_targets=[])
         job_id = job["job_id"]
         proc = manager.processes[job_id]
         deadline = time.monotonic() + 20

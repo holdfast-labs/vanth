@@ -1,4 +1,3 @@
-import asyncio
 import json
 import os
 import sqlite3
@@ -47,8 +46,7 @@ def test_quick_job_automatic_delivery_retry_succeeds(tmp_path, request):
         ),
         str(calls),
     ]
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             wake_targets=[
                 {
@@ -59,7 +57,7 @@ def test_quick_job_automatic_delivery_retry_succeeds(tmp_path, request):
                     "retry_delay_seconds": 1,
                 }
             ],
-        )
+        
     )
 
     delivery = wait_for_delivery(manager, started["job_id"], "delivered")
@@ -90,11 +88,10 @@ def test_concurrent_delivery_retries_dispatch_once(tmp_path, request):
         str(calls),
         str(release),
     ]
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             wake_targets=[{"type": "local_command", "events": ["checkpoint"], "command": delivery_command}],
-        )
+        
     )
     failed = wait_for_delivery(manager, started["job_id"], "failed")
     assert failed is not None
@@ -143,8 +140,7 @@ def test_retry_due_after_manager_restart_is_dispatched(tmp_path):
         str(calls),
     ]
     manager = JobManager(home)
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             wake_targets=[
                 {
@@ -155,7 +151,7 @@ def test_retry_due_after_manager_restart_is_dispatched(tmp_path):
                     "retry_delay_seconds": 1,
                 }
             ],
-        )
+        
     )
     retrying = wait_for_delivery(manager, started["job_id"], "retrying")
     # Assert the transient retry state was actually observed BEFORE the manager
@@ -186,12 +182,11 @@ def test_notify_on_defaults_events_for_targets_without_events(tmp_path, request)
         ),
         str(calls),
     ]
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             notify_on=["checkpoint"],
             wake_targets=[{"type": "local_command", "command": delivery_command}],
-        )
+        
     )
     delivery = wait_for_delivery(manager, started["job_id"], "delivered")
     assert delivery is not None and delivery["status"] == "delivered"
@@ -211,8 +206,7 @@ def test_explicit_target_events_override_notify_on(tmp_path, request):
         ),
         str(calls),
     ]
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             notify_on=["completed"],
             wake_targets=[
@@ -222,7 +216,7 @@ def test_explicit_target_events_override_notify_on(tmp_path, request):
                     "events": ["checkpoint"],
                 }
             ],
-        )
+        
     )
     delivery = wait_for_delivery(manager, started["job_id"], "delivered")
     assert delivery is not None and delivery["status"] == "delivered"
@@ -232,8 +226,7 @@ def test_explicit_target_events_override_notify_on(tmp_path, request):
 def test_notify_on_alone_without_targets_still_stores_value(tmp_path, request):
     manager = JobManager(tmp_path / "state")
     request.addfinalizer(manager.close)
-    started = asyncio.run(
-        manager.start(cmd("import time; time.sleep(1)"), notify_on=["completed"])
+    started = manager.start(cmd("import time; time.sleep(1)"), notify_on=["completed"]
     )
     assert json.loads(
         manager._row("SELECT notify_on FROM jobs WHERE job_id=?", (started["job_id"],))["notify_on"]
@@ -254,8 +247,7 @@ def test_retry_delivery_force_advances_retrying_delivery(tmp_path, request):
         ),
         str(calls),
     ]
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             wake_targets=[
                 {
@@ -266,7 +258,7 @@ def test_retry_delivery_force_advances_retrying_delivery(tmp_path, request):
                     "retry_delay_seconds": 60,
                 }
             ],
-        )
+        
     )
     retrying = wait_for_delivery(manager, started["job_id"], "retrying")
     assert retrying is not None
@@ -291,7 +283,7 @@ def test_delivery_dispatch_respects_concurrency_cap(tmp_path, monkeypatch):
             time.sleep(0.05)
 
     manager = JobManager(tmp_path / "state", recover=False)
-    started = asyncio.run(manager.start(cmd("import time; time.sleep(30)")))
+    started = manager.start(cmd("import time; time.sleep(30)"))
     try:
         for _ in range(8):
             manager._insert_wake_targets(
@@ -329,8 +321,7 @@ def test_delivery_dispatch_respects_concurrency_cap(tmp_path, monkeypatch):
 def test_doctor_reports_dead_lettered_deliveries(tmp_path, request):
     manager = JobManager(tmp_path / "state")
     request.addfinalizer(manager.close)
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             wake_targets=[
                 {
@@ -341,7 +332,7 @@ def test_doctor_reports_dead_lettered_deliveries(tmp_path, request):
                     "retry_delay_seconds": 1,
                 }
             ],
-        )
+        
     )
     failed = wait_for_delivery(manager, started["job_id"], "failed")
     assert failed is not None
@@ -361,8 +352,7 @@ def test_stale_opencode_session_skips_retries(tmp_path, request, monkeypatch):
     monkeypatch.setattr(server_module, "send_delivery_to_opencode", raise_not_found)
     manager = JobManager(tmp_path / "state")
     request.addfinalizer(manager.close)
-    started = asyncio.run(
-        manager.start(
+    started = manager.start(
             cmd("import json; print('AGENT_EVENT '+json.dumps({'type':'checkpoint'}), flush=True)"),
             wake_targets=[
                 {
@@ -374,7 +364,7 @@ def test_stale_opencode_session_skips_retries(tmp_path, request, monkeypatch):
                     "retry_delay_seconds": 1,
                 }
             ],
-        )
+        
     )
     failed = wait_for_delivery(manager, started["job_id"], "failed")
     assert failed is not None

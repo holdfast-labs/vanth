@@ -51,7 +51,7 @@ def register(
 
 
 def start_job(manager: JobManager, code: str, **kwargs) -> str:
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def wait_completed(manager: JobManager, job_id: str) -> None:

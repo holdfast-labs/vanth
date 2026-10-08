@@ -25,7 +25,7 @@ def wait_event(manager: JobManager, job_id: str, event_type: str) -> dict:
 
 
 def start_job(manager, code, **kwargs):
-    return asyncio.run(manager.start(cmd(code), **kwargs))["job_id"]
+    return manager.start(cmd(code), **kwargs)["job_id"]
 
 
 def test_status_exposes_command_cwd_env_and_timeout(tmp_path):

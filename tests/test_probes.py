@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import socket
 import sys
 import threading
@@ -120,10 +119,10 @@ def test_port_probe_gates_launch_until_open(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         port = _free_port()
-        job = asyncio.run(manager.start(
+        job = manager.start(
             cmd(SLEEP),
             trigger={"probe": {"type": "port", "host": "127.0.0.1", "port": port}},
-        ))
+        )
         assert job["status"] == "queued"
         manager._dispatch_queued_jobs()
         assert manager.status(job["job_id"])["status"] == "queued", "closed port must not launch"
@@ -147,10 +146,10 @@ def test_probe_timeout_cancels_with_attribution(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         port = _free_port()
-        job = asyncio.run(manager.start(
+        job = manager.start(
             cmd(SLEEP),
             trigger={"probe": {"type": "port", "host": "127.0.0.1", "port": port, "timeout_seconds": 1}},
-        ))
+        )
         with manager.db_lock:
             manager.db.execute(
                 "UPDATE jobs SET created_at=? WHERE job_id=?",
@@ -170,10 +169,10 @@ def test_log_line_probe_requires_known_job(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
         with pytest.raises(ValueError, match="Unknown log_line probe job_id"):
-            asyncio.run(manager.start(
+            manager.start(
                 cmd(SLEEP),
                 trigger={"probe": {"type": "log_line", "job_id": "..\\escape", "pattern": "x"}},
-            ))
+            )
     finally:
         manager.close()
 
@@ -187,20 +186,20 @@ def test_probe_timeout_clock_starts_after_dag_gate(tmp_path):
         # parent a few times to keep the probe-clock assertion the subject.
         parent = None
         for _ in range(3):
-            candidate = asyncio.run(manager.start(cmd("print('done')")))
+            candidate = manager.start(cmd("print('done')"))
             if _wait_status(manager, candidate["job_id"], {"completed", "failed"}) == "completed":
                 parent = candidate
                 break
         assert parent is not None, "parent job did not complete"
         port = _free_port()
-        child = asyncio.run(manager.start(
+        child = manager.start(
             cmd(SLEEP),
             trigger={
                 "job_id": parent["job_id"],
                 "status": "completed",
                 "probe": {"type": "port", "host": "127.0.0.1", "port": port, "timeout_seconds": 1},
             },
-        ))
+        )
         # Backdate the child's creation far past the probe timeout; because the
         # DAG parent only just completed, the readiness clock starts there and
         # the job must NOT be cancelled.
@@ -230,10 +229,10 @@ def test_probe_budget_limits_io_per_pass(tmp_path, monkeypatch):
         monkeypatch.setattr(server_module, "evaluate_probe", counting)
         manager.probe_budget = 1
         for index in range(3):
-            asyncio.run(manager.start(
+            manager.start(
                 cmd(SLEEP),
                 trigger={"probe": {"type": "file", "path": f"/nonexistent/{index}"}},
-            ))
+            )
         manager._dispatch_queued_jobs()
         assert calls["n"] == 1, f"only the budgeted probe should run: {calls}"
         # The first job is now throttled (no I/O), so the next pass probes the next.
@@ -246,11 +245,11 @@ def test_probe_budget_limits_io_per_pass(tmp_path, monkeypatch):
 def test_log_line_probe_releases_when_pattern_appears(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
-        producer = asyncio.run(manager.start(cmd("import time; print('READY', flush=True); time.sleep(30)")))
-        gate = asyncio.run(manager.start(
+        producer = manager.start(cmd("import time; print('READY', flush=True); time.sleep(30)"))
+        gate = manager.start(
             cmd(SLEEP),
             trigger={"probe": {"type": "log_line", "job_id": producer["job_id"], "pattern": "READY"}},
-        ))
+        )
         assert gate["status"] == "queued"
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline and manager.status(gate["job_id"])["status"] == "queued":

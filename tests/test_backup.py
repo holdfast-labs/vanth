@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import sqlite3
@@ -28,7 +27,7 @@ def cmd(code: str) -> str:
 def _seed(home: Path) -> None:
     manager = JobManager(home, recover=False)
     try:
-        job = asyncio.run(manager.start(cmd("print('hi')")))
+        job = manager.start(cmd("print('hi')"))
         manager.wait_sync(job["job_id"], ["completed"], timeout_seconds=20)
         blob = home / "artifacts-store" / "blobs" / "aa" / "bb" / "deadbeef"
         blob.parent.mkdir(parents=True, exist_ok=True)

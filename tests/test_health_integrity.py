@@ -1,6 +1,5 @@
 """Opt-in integrity checks and actionable capture diagnostics."""
 
-import asyncio
 import json
 
 from vanth.artifacts.catalog import open_catalog
@@ -36,7 +35,7 @@ def test_doctor_distinguishes_corruption_and_missing_content(tmp_path):
 def test_doctor_reports_persisted_runner_diagnostics(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
-        started = asyncio.run(manager.start("echo queued", pool="held"))
+        started = manager.start("echo queued", pool="held")
         manager._emit(started["job_id"], "pipe_drain_timeout", message="child held pipes")
         manager._emit(started["job_id"], "write_contended", data={"write_seconds": 2})
         report = manager.doctor()
@@ -49,7 +48,7 @@ def test_doctor_reports_persisted_runner_diagnostics(tmp_path):
 def test_failed_capture_is_actionable_in_status_and_summary(tmp_path):
     manager = JobManager(tmp_path, recover=False)
     try:
-        started = asyncio.run(manager.start("echo queued", pool="held"))
+        started = manager.start("echo queued", pool="held")
         job_id = started["job_id"]
         manager._emit(job_id, "log_capture_failed", message="disk full")
         manager.db.execute("UPDATE jobs SET status='failed',exit_code=0 WHERE job_id=?", (job_id,))

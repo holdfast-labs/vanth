@@ -93,3 +93,44 @@ func TestCanonicalHomeDefaultsToUserVanth(t *testing.T) {
 		t.Fatalf("got %q want %q", got, want)
 	}
 }
+
+func TestCanonicalHomeExpandsTilde(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no user home")
+	}
+	setHomeEnv(t, "~/.vanth", "")
+	got, err := CanonicalHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := resolveHome(filepath.Join(home, ".vanth"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("tilde not expanded like Python expanduser: got %q want %q", got, want)
+	}
+}
+
+func TestCanonicalHomeTildeAndAbsoluteAliasAgree(t *testing.T) {
+	// `~/.vanth` and its absolute spelling must compare equal after
+	// resolution instead of raising a false conflict.
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("no user home")
+	}
+	abs := filepath.Join(home, ".vanth")
+	if runtime.GOOS == "windows" {
+		abs = filepath.Clean(abs)
+	}
+	setHomeEnv(t, "~/.vanth", abs)
+	got, err := CanonicalHome()
+	if err != nil {
+		t.Fatalf("tilde/absolute aliases must agree: %v", err)
+	}
+	want, _ := resolveHome(abs)
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+}

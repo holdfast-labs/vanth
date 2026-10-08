@@ -25,7 +25,7 @@ def test_terminal_events_carry_a_message_and_normalize_exit_code(tmp_path):
     as a huge exit code."""
     async def main():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("import sys; sys.exit(7)"))
+        started = manager.start(cmd("import sys; sys.exit(7)"))
         # Wait for the terminal event to be persisted.
         await manager.wait(started["job_id"], ["failed"], timeout_seconds=30)
         events = manager.events(started["job_id"])["events"]
@@ -42,7 +42,7 @@ def test_terminal_events_carry_a_message_and_normalize_exit_code(tmp_path):
 def test_timeout_event_message_names_the_timeout(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
+        started = manager.start(cmd("import time; time.sleep(30)"), timeout_seconds=1)
         await manager.wait(started["job_id"], ["timeout"], timeout_seconds=30)
         events = manager.events(started["job_id"])["events"]
         timeout = [e for e in events if e["type"] == "timeout"]
@@ -71,7 +71,7 @@ def test_malformed_event_does_not_kill_reader(tmp_path):
             "print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':{'bad':1}}), flush=True); "
             "print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'after bad'}), flush=True)"
         )
-        started = await manager.start(cmd(code))
+        started = manager.start(cmd(code))
         result = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
         assert result["event"]["message"] == "after bad"
         manager.close()
@@ -88,7 +88,7 @@ def test_oversized_event_line_is_rejected_and_reader_continues(tmp_path, monkeyp
             "print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'x'*1000}), flush=True); "
             "print('AGENT_EVENT '+json.dumps({'type':'checkpoint','message':'after big'}), flush=True)"
         )
-        started = await manager.start(cmd(code))
+        started = manager.start(cmd(code))
         rejected = await manager.wait(started["job_id"], ["event_rejected"], timeout_seconds=5)
         valid = await manager.wait(started["job_id"], ["checkpoint"], timeout_seconds=5)
         assert rejected["event"]["data"] == {"max_bytes": 256}
@@ -110,7 +110,7 @@ def test_oversized_event_line_is_rejected_and_reader_continues(tmp_path, monkeyp
 def test_invalid_wake_targets_fail_before_launch(tmp_path, target):
     manager = JobManager(tmp_path)
     with pytest.raises(ValueError):
-        asyncio.run(manager.start(cmd("pass"), wake_targets=[target]))
+        manager.start(cmd("pass"), wake_targets=[target])
     assert manager.list()["jobs"] == []
     manager.close()
 
@@ -123,7 +123,7 @@ def test_recovery_does_not_overwrite_concurrent_completion(tmp_path):
 
     async def start():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("import time; time.sleep(.3)"))
+        started = manager.start(cmd("import time; time.sleep(.3)"))
         await manager.wait(started["job_id"], ["started"], timeout_seconds=5)
         manager.close()
         return started["job_id"]
@@ -148,7 +148,7 @@ def test_unknown_job_events_is_an_error(tmp_path):
 def test_stop_after_restart_kills_runner_and_workload(tmp_path):
     async def start():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("import time; time.sleep(30)"))
+        started = manager.start(cmd("import time; time.sleep(30)"))
         await manager.wait(started["job_id"], ["started"], timeout_seconds=5)
         status = manager.status(started["job_id"])
         manager.close()
@@ -171,7 +171,7 @@ def test_stop_after_restart_kills_runner_and_workload(tmp_path):
 def test_live_manager_detects_runner_disappearance(tmp_path):
     async def main():
         manager = JobManager(tmp_path)
-        started = await manager.start(cmd("import time; time.sleep(30)"))
+        started = manager.start(cmd("import time; time.sleep(30)"))
         await manager.wait(started["job_id"], ["started"], timeout_seconds=5)
         status = manager.status(started["job_id"])
         manager._kill_pid(status["worker_pid"], force=True)
@@ -196,7 +196,7 @@ def test_runner_popen_failure_marks_job_failed(tmp_path, monkeypatch):
     manager = JobManager(tmp_path)
 
     async def main():
-        started = await manager.start(cmd("import time; time.sleep(30)"))
+        started = manager.start(cmd("import time; time.sleep(30)"))
         status = manager.status(started["job_id"])
         events = manager.events(started["job_id"], types=["failed"])["events"]
         assert status["status"] == "failed"

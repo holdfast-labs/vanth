@@ -8,6 +8,13 @@ func TestJobDurationSeconds(t *testing.T) {
 	if !ok || seconds != 120 {
 		t.Fatalf("DurationSeconds = %v, %v; want 120, true", seconds, ok)
 	}
+	// The daemon always emits fractional seconds (now_iso microsecond
+	// precision); durations must parse those, not just whole seconds.
+	frac := JobSummary{StartedAt: "2026-01-01T00:00:00.123456Z", EndedAt: "2026-01-01T00:02:00.623456Z"}
+	seconds, ok = frac.DurationSeconds()
+	if !ok || seconds != 120.5 {
+		t.Fatalf("DurationSeconds fractional = %v, %v; want 120.5, true", seconds, ok)
+	}
 	for _, bad := range []JobSummary{
 		{},
 		{StartedAt: "2026-01-01T00:00:00Z"},

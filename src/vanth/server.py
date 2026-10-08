@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-import asyncio
+# NOTE: `asyncio` costs ~50ms to import and is used only inside method/tool
+# bodies (daemon dispatch, MCP tools) — never at module scope and never on the
+# CLI or job-runner paths, which are bare synchronous processes. It is
+# therefore imported function-locally at each use site below (a resolved
+# sys.modules hit once anything async is already running).
 import base64
 import hashlib
 import json
@@ -90,7 +94,9 @@ class _LazyMCP:
         setattr(self._real_mcp(), name, value)
 
 
-from .client import VanthClient
+# NOTE: `VanthClient` (urllib/ssl, ~40ms past the package baseline) is used only
+# by `get_client()` on the MCP-tool path — never by the daemon core, the CLI
+# (which imports `.client` directly), or the job runner. Imported lazily there.
 from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
@@ -2035,6 +2041,8 @@ class JobManager:
         if "scheduled" not in tags:
             tags.append("scheduled")
         try:
+            import asyncio
+
             result = asyncio.run(
                 self.start(
                     command=row["command"],
@@ -4270,6 +4278,8 @@ class JobManager:
         )
 
     async def rerun(self, job_id: str, **overrides: Any) -> dict[str, Any]:
+        import asyncio
+
         return await asyncio.get_running_loop().run_in_executor(
             None, lambda: self.rerun_sync(job_id, **overrides)
         )
@@ -4322,6 +4332,8 @@ class JobManager:
             if not isinstance(env, dict):
                 raise ValueError("env must be an object of string values")
             merged_env = {**stored_env, **env}
+        import asyncio
+
         result = asyncio.run(self.start(
             command=command if command is not None else row["command"],
             cwd=cwd if cwd is not None else row["cwd"],
@@ -5280,6 +5292,8 @@ class JobManager:
         return_progress: bool = False,
         metric_ge: dict[str, float] | None = None,
     ) -> dict[str, Any]:
+        import asyncio
+
         return await asyncio.get_running_loop().run_in_executor(
             None,
             self.wait_sync,
@@ -7015,6 +7029,8 @@ class JobManager:
         actor: str = DEFAULT_STOP_ACTOR,
         reason: str | None = None,
     ) -> dict[str, Any]:
+        import asyncio
+
         return await asyncio.get_running_loop().run_in_executor(
             None, self.stop_sync, job_id, signal, kill_after_seconds, actor, reason
         )
@@ -7373,6 +7389,8 @@ class JobManager:
         }
 
     async def send(self, job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
+        import asyncio
+
         return await asyncio.get_running_loop().run_in_executor(None, self.send_sync, job_id, input, eof)
 
     def _lock_stdin(self, job_id: str):
@@ -7747,6 +7765,8 @@ def get_client() -> VanthClient:
     # must be initialized under a lock: two concurrent first calls could
     # otherwise both construct a client and both run ensure() (double daemon
     # spawn / port-conflict RuntimeError).
+    from .client import VanthClient
+
     with _client_lock:
         if client is None:
             client = VanthClient()
@@ -7936,6 +7956,8 @@ async def job_start_and_wait(command: str, cwd: str | None = None, name: str | N
     ``job_start`` with a wake target for long work. ``timeout_seconds`` is the
     job's runtime limit, while ``wait_timeout_seconds`` only bounds this call.
     """
+    import asyncio
+
     if isinstance(wait_timeout_seconds, bool) or not isinstance(wait_timeout_seconds, int) or not 1 <= wait_timeout_seconds <= 300:
         raise ValueError("wait_timeout_seconds must be between 1 and 300")
     started = await asyncio.to_thread(
@@ -8215,6 +8237,8 @@ async def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, o
     protocol (a single byte range; ``follow``/``grep`` do not apply, and
     ``offset``/``max_bytes`` select the range).
     """
+    import asyncio
+
     if remote_id:
         # A remote read is a single byte range: refuse the options it cannot
         # honour instead of silently ignoring them (callers would otherwise
@@ -8283,6 +8307,8 @@ async def job_wait(
     cross-machine event push arrives in Phase 4); ``since_event_id``,
     ``return_progress`` and ``metric_ge`` are ignored in that mode.
     """
+    import asyncio
+
     slice_seconds = _mcp_wait_slice_seconds()
     capped = timeout_seconds is not None and timeout_seconds > slice_seconds
     effective = max(1, int(slice_seconds)) if capped else timeout_seconds
@@ -8322,6 +8348,8 @@ async def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: i
     # acknowledgement instead of `-32001` (the daemon keeps stopping regardless).
     client = get_client()
     budget = _mcp_wait_slice_seconds()
+    import asyncio
+
     try:
         return await asyncio.wait_for(
             asyncio.to_thread(

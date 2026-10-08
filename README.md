@@ -74,7 +74,7 @@ no Go toolchain is needed). Wheels are published for Windows x86_64, Linux
 x86_64/arm64, and macOS x86_64/arm64.
 
 **No Python toolchain?** Download the self-contained binary for your platform
-from the [releases page](https://github.com/abhim-dv/vanth/releases)
+from the [releases page](https://github.com/holdfast-labs/vanth/releases)
 (`vanth-standalone-linux-x86_64`, `vanth-standalone-windows-x86_64.exe`, or
 `vanth-standalone-macos-arm64`) and run it directly — it needs neither Python
 nor a package manager. It ships the same CLI/MCP server and daemon, bundles the
@@ -86,7 +86,7 @@ re-extracts the bundle on start; the wheel is faster for many short jobs.)
 From a source checkout (development), install the project environment with `uv sync` and run commands as `uv run vanth ...`. The rest of this guide shows the installed `vanth` command unless a row says `uv run`.
 
 ```cmd
-git clone https://github.com/abhim-dv/vanth.git
+git clone https://github.com/holdfast-labs/vanth.git
 cd vanth
 uv sync
 ```

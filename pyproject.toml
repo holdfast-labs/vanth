@@ -47,11 +47,11 @@ artifact-s3 = ["boto3>=1.28"]
 standalone = ["pyinstaller>=6.0"]
 
 [project.urls]
-Homepage = "https://github.com/abhim-dv/vanth"
-Repository = "https://github.com/abhim-dv/vanth"
-Documentation = "https://github.com/abhim-dv/vanth#readme"
-Changelog = "https://github.com/abhim-dv/vanth/blob/master/CHANGELOG.md"
-Issues = "https://github.com/abhim-dv/vanth/issues"
+Homepage = "https://github.com/holdfast-labs/vanth"
+Repository = "https://github.com/holdfast-labs/vanth"
+Documentation = "https://github.com/holdfast-labs/vanth#readme"
+Changelog = "https://github.com/holdfast-labs/vanth/blob/master/CHANGELOG.md"
+Issues = "https://github.com/holdfast-labs/vanth/issues"
 
 [dependency-groups]
 dev = [

@@ -280,7 +280,10 @@ def test_doctor_reports_orphans_field(daemon):
         ("/usr/bin/python3 /opt/venv/bin/vanth", True),
         (r"C:\venv\Scripts\python.exe C:\venv\Scripts\vanth.exe", True),
         ("/usr/bin/python3 -m vanth.server", True),
-        ("/usr/bin/python3 -O -m vanth.mcp", True),
+        # No vanth.mcp module exists: nothing can launch `-m vanth.mcp`
+        # (ModuleNotFoundError), so it must not match — matching a shape that
+        # can never be a genuine server only risks the reaper.
+        ("/usr/bin/python3 -O -m vanth.mcp", False),
         ('"C:\\Program Files\\Python\\python.exe" -m vanth.server', True),
         ("/usr/bin/python3 -X dev -m vanth.server", True),
         # PyInstaller standalone artifact launched bare as the MCP server:

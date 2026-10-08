@@ -97,6 +97,10 @@ class _LazyMCP:
 # NOTE: `VanthClient` (urllib/ssl, ~40ms past the package baseline) is used only
 # by `get_client()` on the MCP-tool path — never by the daemon core, the CLI
 # (which imports `.client` directly), or the job runner. Imported lazily there.
+# NOTE: the CLI routing constants live in `.cli` (the `vanth` console script
+# enters through `cli.dispatch` without importing this module at all). They
+# are re-exported below via module __getattr__ for compatibility, resolved
+# lazily so importing this module never pulls in the CLI chain.
 from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
@@ -111,6 +115,10 @@ EVENT_PREFIX = "AGENT_EVENT "
 DEFAULT_MAX_EVENT_BYTES = 65536
 DEFAULT_MAX_EVENT_LINE_BYTES = 1024 * 1024
 DEFAULT_MAX_LOG_BYTES = 10 * 1024 * 1024
+# Bound per-job in-memory caches that would otherwise grow for the daemon's
+# whole lifetime (entries are tiny, but never evicted without a cap).
+_CONDITION_CACHE_MAX = 5000
+_CAPTURE_FAILED_MAX = 5000
 
 # Sentinel distinguishing "no worker-pid guard requested" from "the observed
 # worker pid is NULL" in identity-guarded writes (review rc36 P1). Binding
@@ -626,7 +634,7 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             thread_id = target.get("thread_id") or target.get("threadId") or target.get("session_id") or target.get("sessionId")
             if not isinstance(thread_id, str) or not thread_id:
                 raise ValueError(f"{target_type} target requires thread_id")
-        for key, minimum in (("timeout_seconds", 1), ("max_attempts", 1), ("retry_delay_seconds", 0)):
+        for key, minimum in (("timeout_seconds", 1), ("turn_timeout_seconds", 1), ("max_attempts", 1), ("retry_delay_seconds", 0)):
             if key in target and (not isinstance(target[key], int) or isinstance(target[key], bool) or target[key] < minimum):
                 raise ValueError(f"wake target {key} must be an integer >= {minimum}")
 
@@ -766,6 +774,10 @@ class JobManager:
         self._last_wal_checkpoint = 0.0
         self._orphan_cache_at = 0.0
         self._orphan_cache: list[dict[str, Any]] = []
+        self._integrity_cache = ""
+        self._integrity_cache_at = 0.0
+        self._events_total = 0
+        self._events_total_at = 0.0
         self._bin_cache: dict[str, tuple[float, bool]] = {}
         # Operator alerts: edge-triggered condition state + throttle (review B3).
         self._alert_state: dict[str, bool] = {}
@@ -811,10 +823,10 @@ class JobManager:
             return False
 
     def _recover_jobs(self) -> None:
-        rows = self.db.execute(
+        rows = self._select_all(
             "SELECT job_id, worker_pid, stop_requested_at, stop_actor, stop_reason, claim_token "
             "FROM jobs WHERE status='running'"
-        ).fetchall()
+        )
         for row in rows:
             if self._pid_alive(row["worker_pid"]):
                 continue
@@ -857,11 +869,11 @@ class JobManager:
     def _reconcile_running_jobs(self) -> None:
         cutoff = datetime.now(timezone.utc) - timedelta(seconds=self.heartbeat_stale_after)
         cutoff_text = cutoff.isoformat().replace("+00:00", "Z")
-        rows = self.db.execute(
+        rows = self._select_all(
             "SELECT job_id, worker_pid, pid, stop_requested_at, stop_actor, stop_reason, claim_token "
             "FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < ?)",
             (cutoff_text,),
-        ).fetchall()
+        )
         for row in rows:
             if self._pid_alive(row["worker_pid"]):
                 continue
@@ -992,7 +1004,13 @@ class JobManager:
                     self.db.commit()
             return bool(changed)
 
-        return self._retry_locked(transition) if transaction else transition()
+        applied = self._retry_locked(transition) if transaction else transition()
+        if applied:
+            # The run is terminal: its capture-failure marker (if any) will
+            # never be read again (only _watch consults it, pre-transition),
+            # so drop it instead of leaking one entry per failed job forever.
+            self._capture_failed.discard(job_id)
+        return applied
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -1224,10 +1242,11 @@ class JobManager:
             # measured between two event-sequence watermarks. The upper bound is
             # the row we just read: a failure committed between the two queries
             # must not be counted here AND again on the next tick.
-            last_terminal = self.db.execute(
+            last_terminal = self._select_all(
                 "SELECT event_id, seq FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
                 (job_id,),
-            ).fetchone()
+            )
+            last_terminal = last_terminal[0] if last_terminal else None
             if last_terminal is None:
                 return
             last_seq = int(last_terminal["seq"])
@@ -1238,9 +1257,9 @@ class JobManager:
                 # not counted a second time after upgrading.
                 legacy_id = state.get("last_failure_event_id")
                 if legacy_id:
-                    legacy = self.db.execute(
+                    legacy = self._row(
                         "SELECT seq FROM events WHERE job_id=? AND event_id=?", (job_id, legacy_id)
-                    ).fetchone()
+                    )
                     if legacy is not None:
                         watermark = int(legacy["seq"])
             if watermark is not None and last_seq <= int(watermark):
@@ -1260,17 +1279,17 @@ class JobManager:
             # collapsed to one.
             if watermark is None:
                 pending = int(
-                    self.db.execute(
+                    self._row(
                         "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq<=?",
                         (job_id, last_seq),
-                    ).fetchone()[0]
+                    )[0]
                 )
             else:
                 pending = int(
-                    self.db.execute(
+                    self._row(
                         "SELECT COUNT(*) FROM events WHERE job_id=? AND type='failed' AND seq>? AND seq<=?",
                         (job_id, int(watermark), last_seq),
-                    ).fetchone()[0]
+                    )[0]
                 )
             new_streak = streak + max(1, pending)
             react = new_streak >= after_n and state.get("reacted_at_streak") != new_streak
@@ -1303,10 +1322,10 @@ class JobManager:
                 state.pop("reacted_at_streak", None)
                 # Move the watermark past the failures that preceded this success
                 # so the next streak counts only failures after the reset.
-                latest_failed = self.db.execute(
+                latest_failed = self._row(
                     "SELECT seq FROM events WHERE job_id=? AND type='failed' ORDER BY seq DESC LIMIT 1",
                     (job_id,),
-                ).fetchone()
+                )
                 state["failure_streak_after_seq"] = int(latest_failed["seq"]) if latest_failed else 0
                 self._save_policy_state(job_id, state)
 
@@ -1963,7 +1982,15 @@ class JobManager:
         return {"schedule_id": schedule_id, "timezone": schedule["timezone"], "next_fires": fires}
 
     def _fire_due_schedules(self) -> None:
-        """Launch a fresh job for every enabled schedule whose fire time passed."""
+        """Launch a fresh job for every enabled schedule whose fire time passed.
+
+        Fires run synchronously on the dispatch thread: the occurrence claim,
+        the overlap check, and the launch stay in one ordered pass, so a
+        second pass never observes "due but no active job yet" and
+        overlap=skip/at-most-once hold without extra coordination. A single
+        fire costs one start() (~tens of ms); pileups only follow an outage,
+        whose missed fires are intentionally not backfilled.
+        """
         try:
             now = now_iso()
             with self.db_lock:
@@ -2374,13 +2401,42 @@ class JobManager:
         return path
 
     def _condition(self, job_id: str) -> threading.Condition:
-        self.conditions.setdefault(job_id, threading.Condition())
-        return self.conditions[job_id]
+        # Bounded: one entry per job ever waited on would otherwise grow for
+        # the daemon's whole lifetime. Eviction is safe: waiters that miss a
+        # notify on a recycled object fall back to the 100ms DB re-poll (the
+        # database, not the condition, is the source of truth), and _emit
+        # recreates the entry on next use.
+        cond = self.conditions.get(job_id)
+        if cond is None:
+            if len(self.conditions) >= _CONDITION_CACHE_MAX:
+                self.conditions.pop(next(iter(self.conditions)))
+            cond = self.conditions.setdefault(job_id, threading.Condition())
+        return cond
+
+    def _note_capture_failed(self, job_id: str) -> None:
+        # Bounded like conditions above; entries are discarded on terminal
+        # transition, so the cap only matters for pathological numbers of
+        # concurrently capture-broken live jobs.
+        if len(self._capture_failed) >= _CAPTURE_FAILED_MAX:
+            self._capture_failed.pop()
+        self._capture_failed.add(job_id)
 
     def _row(self, sql: str, args: tuple[Any, ...]) -> sqlite3.Row | None:
         self._ensure_open()
         with self.db_lock:
             return self.db.execute(sql, args).fetchone()
+
+    def _select_all(self, sql: str, args: tuple[Any, ...] | list[Any] = ()) -> list[sqlite3.Row]:
+        """Locked multi-row SELECT (the fetchall twin of _row).
+
+        Single-statement reads are atomic in SQLite, but sharing one
+        connection across the dispatch/delivery/HTTP threads without the
+        process lock risks transient "database is locked" errors under
+        contention. All cross-thread reads go through here (or _row).
+        """
+        self._ensure_open()
+        with self.db_lock:
+            return self.db.execute(sql, tuple(args)).fetchall()
 
     def _event_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         return {
@@ -3165,6 +3221,11 @@ class JobManager:
         deadline = time.monotonic() + max(1.0, min(timeout_seconds, 60.0))
         poll_interval = float(os.environ.get("VANTH_RELAY_POLL_INTERVAL", "0.5"))
         while True:
+            if self.shutdown_requested.is_set():
+                # Daemon is going away: release this long-poll now so its
+                # non-daemon handler thread does not pin the old process.
+                # The relay re-polls against the new daemon on reconnect.
+                return []
             due = self._relay_due_deliveries(
                 identities, target_type=client_type, identity_keys=identity_keys, claim_client_id=client_id
             )
@@ -4316,7 +4377,7 @@ class JobManager:
         # of the *logical* job, not one runner instance.
         prior_state = self._policy_state(job_id)
         targets = []
-        for target in self.db.execute("SELECT * FROM wake_targets WHERE job_id=?", (job_id,)).fetchall():
+        for target in self._select_all("SELECT * FROM wake_targets WHERE job_id=?", (job_id,)):
             config = json.loads(target["config_json"] or "{}")
             targets.append({
                 "type": target["type"],
@@ -4709,9 +4770,9 @@ class JobManager:
         project. A registration with no directory matches any caller.
         """
         try:
-            rows = self.db.execute(
+            rows = self._select_all(
                 "SELECT destinations_json, last_poll_at FROM relay_subscriptions WHERE client_type='opencode_thread'"
-            ).fetchall()
+            )
         except sqlite3.Error:
             return None
         wanted = (directory if isinstance(directory, str) else "").rstrip("\\/").lower()
@@ -4745,9 +4806,9 @@ class JobManager:
         the newest-match behavior via ``_latest_relay_session``.
         """
         try:
-            rows = self.db.execute(
+            rows = self._select_all(
                 "SELECT destinations_json FROM relay_subscriptions WHERE client_type='opencode_thread'"
-            ).fetchall()
+            )
         except sqlite3.Error:
             return None
         wanted = (directory if isinstance(directory, str) else "").rstrip("\\/").lower()
@@ -4874,7 +4935,7 @@ class JobManager:
 
     def _relay_client_ids(self) -> set[str]:
         try:
-            rows = self.db.execute("SELECT client_id FROM relay_subscriptions").fetchall()
+            rows = self._select_all("SELECT client_id FROM relay_subscriptions")
         except sqlite3.Error:
             return set()
         return {row["client_id"] for row in rows}
@@ -4919,7 +4980,7 @@ class JobManager:
         event_capture_failed = False
 
         def capture_error(exc: OSError) -> None:
-            self._capture_failed.add(job_id)
+            self._note_capture_failed(job_id)
             self.logger.error("log capture failed job_id=%s stream=%s error=%s", job_id, source, exc)
             self._emit_safely(job_id, "log_capture_failed", message=f"{source} log storage failed",
                               data={"stream": source, "error": str(exc)}, level="error")
@@ -5012,14 +5073,14 @@ class JobManager:
                         self._emit_capture_batch(job_id, events, source)
                     except (sqlite3.Error, RuntimeError) as exc:
                         event_capture_failed = True
-                        self._capture_failed.add(job_id)
+                        self._note_capture_failed(job_id)
                         self.logger.exception("event capture failed; draining pipe job_id=%s stream=%s", job_id, source)
                         self._emit_safely(job_id, "log_capture_failed", message=f"{source} event persistence failed",
                                           data={"stream": source, "error": str(exc)}, level="error")
                 if not chunk:
                     break
         except (OSError, sqlite3.Error, RuntimeError) as exc:
-            self._capture_failed.add(job_id)
+            self._note_capture_failed(job_id)
             self.logger.exception("capture failed job_id=%s stream=%s", job_id, source)
             self._emit_safely(job_id, "log_capture_failed", message=f"{source} capture failed",
                               data={"stream": source, "error": str(exc)}, level="error")
@@ -5073,7 +5134,7 @@ class JobManager:
         for thread in threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if any(thread.is_alive() for thread in threads):
-            self._capture_failed.add(job_id)
+            self._note_capture_failed(job_id)
             self._emit_safely(job_id, "pipe_drain_timeout", message="Output pipes remained open after workload exit",
                               data={"drain_timeout_seconds": timeout,
                                     "next_action": "Ensure child processes close inherited stdout/stderr."}, level="error")
@@ -5427,6 +5488,36 @@ class JobManager:
                 "SELECT * FROM events WHERE job_id=? AND type='progress' ORDER BY seq DESC LIMIT 1",
                 (job_id,),
             ).fetchone()
+        began = capture = None
+        if row["status"] == "failed":
+            began, capture = self._failure_probe(job_id, row["started_at"] or row["created_at"])
+        return self._status_dict(row, last, progress, began=began, capture=capture)
+
+    def _failure_probe(self, job_id: str, since: str | None) -> tuple[Any, Any]:
+        """Distinguish workload vs startup vs capture failure for a failed job."""
+        began = self._row(
+            "SELECT 1 FROM events WHERE job_id=? AND type='started' AND created_at>=? LIMIT 1",
+            (job_id, since),
+        )
+        capture = self._row(
+            "SELECT type FROM events WHERE job_id=? AND type IN ('log_capture_failed','pipe_drain_timeout') "
+            "AND created_at>=? ORDER BY seq DESC LIMIT 1",
+            (job_id, since),
+        )
+        return began, capture
+
+    def _status_dict(
+        self,
+        row: sqlite3.Row,
+        last: sqlite3.Row | None,
+        progress: sqlite3.Row | None,
+        *,
+        began: Any = None,
+        capture: Any = None,
+    ) -> dict[str, Any]:
+        """Assemble the status payload from prefetched parts (shared by
+        status() and status_batch() so the shapes can never drift)."""
+        job_id = row["job_id"]
         result = {
             "job_id": job_id,
             "status": row["status"],
@@ -5462,16 +5553,9 @@ class JobManager:
             reason = row["status"]
             action = f"Inspect job_tail for {job_id} before rerunning"
             if reason == "failed":
-                began = self._row(
-                    "SELECT 1 FROM events WHERE job_id=? AND type='started' AND created_at>=? LIMIT 1",
-                    (job_id, row["started_at"] or row["created_at"]),
-                )
+                # `began`/`capture` are prefetched by the caller (per-job in
+                # status(), per-failed-job in status_batch()).
                 reason = "workload_failed" if began else "startup_failed"
-                capture = self._row(
-                    "SELECT type FROM events WHERE job_id=? AND type IN ('log_capture_failed','pipe_drain_timeout') "
-                    "AND created_at>=? ORDER BY seq DESC LIMIT 1",
-                    (job_id, row["started_at"] or row["created_at"]),
-                )
                 if capture:
                     reason = capture["type"]
                     action = "Inspect job_doctor capture diagnostics and check disk space or descendant processes"
@@ -5484,6 +5568,55 @@ class JobManager:
             result.update(failure_reason=reason, recommended_next_action=action)
         return result
 
+    def _status_dicts_for(self, job_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """Batched status payloads keyed by job id (unknown ids included).
+
+        One round of set queries instead of 3-5 per id; shared by
+        status_batch() and agent_view() so their payloads can never drift.
+        """
+        placeholders = ",".join("?" for _ in job_ids)
+        with self.db_lock:
+            rows = {
+                row["job_id"]: row
+                for row in self.db.execute(
+                    f"SELECT * FROM jobs WHERE job_id IN ({placeholders})", job_ids
+                ).fetchall()
+            }
+            lasts = {
+                row["job_id"]: row
+                for row in self.db.execute(
+                    "SELECT e.* FROM events e JOIN "
+                    "(SELECT job_id, MAX(seq) AS m FROM events WHERE job_id IN "
+                    f"({placeholders}) GROUP BY job_id) m "
+                    "ON m.job_id=e.job_id AND m.m=e.seq",
+                    job_ids,
+                ).fetchall()
+            }
+            progresses = {
+                row["job_id"]: row
+                for row in self.db.execute(
+                    "SELECT e.* FROM events e JOIN "
+                    "(SELECT job_id, MAX(seq) AS m FROM events WHERE job_id IN "
+                    f"({placeholders}) AND type='progress' GROUP BY job_id) m "
+                    "ON m.job_id=e.job_id AND m.m=e.seq",
+                    job_ids,
+                ).fetchall()
+            }
+        payloads: dict[str, dict[str, Any]] = {}
+        for job_id in job_ids:
+            row = rows.get(job_id)
+            if row is None:
+                payloads[job_id] = {"job_id": job_id, "status": "unknown", "error": "Unknown job_id"}
+                continue
+            try:
+                began = capture = None
+                if row["status"] == "failed":
+                    began, capture = self._failure_probe(job_id, row["started_at"] or row["created_at"])
+                payloads[job_id] = self._status_dict(row, lasts.get(job_id), progresses.get(job_id), began=began, capture=capture)
+            except ValueError:
+                payloads[job_id] = {"job_id": job_id, "status": "unknown", "error": "Unknown job_id"}
+        return payloads
+
     def status_batch(self, job_ids: list[str], limit: int = 500) -> dict[str, Any]:
         self._ensure_open()
         validate_limit(limit, "limit", 1000)
@@ -5493,14 +5626,14 @@ class JobManager:
             raise ValueError("job_ids must be a list of strings")
         if len(job_ids) > limit:
             raise ValueError(f"job_ids must contain at most {limit} ids")
+        payloads = self._status_dicts_for(job_ids)
         jobs = []
         unknown = []
         for job_id in job_ids:
-            try:
-                jobs.append(self.status(job_id))
-            except ValueError:
+            payload = payloads[job_id]
+            jobs.append(payload)
+            if payload.get("status") == "unknown":
                 unknown.append(job_id)
-                jobs.append({"job_id": job_id, "status": "unknown", "error": "Unknown job_id"})
         return {"jobs": jobs, "count": len(jobs), "unknown": unknown}
 
     def list(self, status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
@@ -5618,14 +5751,21 @@ class JobManager:
                 all_runs.append({**results[-1], "key": key})
             completed = sum(1 for row in group if row["status"] == "completed")
             failed = sum(1 for row in group if row["status"] in {"failed", "timeout"})
-            flaky = 0
-            for index, row in enumerate(group):
-                if row["status"] not in {"failed", "timeout"}:
-                    continue
-                succeeded_before = any(g["status"] == "completed" for g in group[:index])
-                succeeded_after = any(g["status"] == "completed" for g in group[index + 1 :])
-                if succeeded_before and succeeded_after:
-                    flaky += 1
+            # Linear scan (prefix/suffix success runs) instead of an any()
+            # slice per failed row: the naive form is O(n^2) per group and a
+            # 5000-run group with many failures took seconds.
+            succeeded = [row["status"] == "completed" for row in group]
+            before = [False] * (len(group) + 1)
+            for index, ok in enumerate(succeeded):
+                before[index + 1] = before[index] or ok
+            after = [False] * (len(group) + 1)
+            for index in range(len(group) - 1, -1, -1):
+                after[index] = after[index + 1] or succeeded[index]
+            flaky = sum(
+                1
+                for index, row in enumerate(group)
+                if row["status"] in {"failed", "timeout"} and before[index] and after[index + 1]
+            )
             group_slowest = sorted(
                 (r for r in results if r["duration_seconds"] is not None),
                 key=lambda r: r["duration_seconds"],
@@ -6409,8 +6549,10 @@ class JobManager:
                         cursor += len(raw)
                         if seen_bytes >= limit:
                             break
-            current_status = self.status(job_id)["status"]
-            if not got and current_status in TERMINAL_STATUSES:
+            current_row = self._row("SELECT status FROM jobs WHERE job_id=?", (job_id,))
+            if current_row is None:
+                raise ValueError(f"Unknown job_id: {job_id}")
+            if not got and current_row["status"] in TERMINAL_STATUSES:
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -6426,12 +6568,33 @@ class JobManager:
         }
 
     def agent_view(self, thread_id: str | None = None, limit: int = 50) -> dict[str, Any]:
+        listed = self.list(limit=limit, thread_id=thread_id)["jobs"]
+        ids = [row["job_id"] for row in listed]
+        payloads = self._status_dicts_for(ids)
+        # One deliveries query for the whole view instead of one per job;
+        # per-job subsequences keep the same created_at-DESC order (and the
+        # same 100-row cap) as individual deliveries() calls.
+        by_job: dict[str, list[dict[str, Any]]] = {job_id: [] for job_id in ids}
+        if ids:
+            placeholders = ",".join("?" for _ in ids)
+            with self.db_lock:
+                rows = self.db.execute(
+                    f"SELECT * FROM deliveries WHERE job_id IN ({placeholders}) ORDER BY created_at DESC",
+                    ids,
+                ).fetchall()
+            for row in rows:
+                bucket = by_job.get(row["job_id"])
+                if bucket is not None and len(bucket) < 100:
+                    bucket.append(self._delivery_dict(row))
         jobs = []
-        for row in self.list(limit=limit, thread_id=thread_id)["jobs"]:
-            status = self.status(row["job_id"])
-            deliveries = self.deliveries(row["job_id"], limit=100)["deliveries"]
+        for row in listed:
+            status = payloads[row["job_id"]]
+            if status.get("status") == "unknown":
+                # Vanished between list() and prefetch (cleanup race); the old
+                # per-job status() raised here and failed the whole view.
+                continue
             counts: dict[str, int] = {}
-            for delivery in deliveries:
+            for delivery in by_job[row["job_id"]]:
                 counts[delivery["status"]] = counts.get(delivery["status"], 0) + 1
             priority = 0
             if status["status"] in {"failed", "timeout", "orphaned"}:
@@ -6470,6 +6633,29 @@ class JobManager:
         self._orphan_cache = []
         return {"reaped": reaped, "failed": failed, "orphan_count": len(orphans)}
 
+    def _metrics_cache_ttl(self) -> float:
+        """Cache TTL for the events-table row count (seconds).
+
+        `COUNT(*) FROM events` is a full scan on every Prometheus scrape
+        while the events table grows unboundedly (retention defaults off).
+        A briefly-stale gauge (including right after a purge) is harmless;
+        `0` disables.
+        """
+        try:
+            return max(0.0, float(os.environ.get("VANTH_METRICS_CACHE_SECONDS", "60")))
+        except ValueError:
+            return 60.0
+
+    def _cached_events_total(self) -> int:
+        now = time.monotonic()
+        if self._metrics_cache_ttl() > 0 and (now - self._events_total_at) < self._metrics_cache_ttl():
+            return self._events_total
+        with self.db_lock:
+            total = int(self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+        self._events_total = total
+        self._events_total_at = now
+        return total
+
     def metrics_text(self) -> str:
         """Prometheus text exposition of daemon state (review B2, no deps)."""
         self._ensure_open()
@@ -6491,7 +6677,7 @@ class JobManager:
                     "SELECT pool, status, COUNT(*) AS c FROM jobs WHERE pool IS NOT NULL GROUP BY pool, status"
                 ).fetchall()
             }
-            events_total = int(self.db.execute("SELECT COUNT(*) FROM events").fetchone()[0])
+            events_total = self._cached_events_total()
             schema = int(self.db.execute("PRAGMA user_version").fetchone()[0])
             stale_leases = int(
                 self.db.execute(
@@ -6664,27 +6850,49 @@ class JobManager:
         self._orphan_cache_at = now
         return result
 
+    def _integrity_cache_ttl(self) -> float:
+        """Cache TTL for the SQLite integrity scan (seconds).
+
+        `PRAGMA quick_check` reads the whole database (21ms on a 500KB home,
+        seconds on a large one) and `doctor()` is a hot path (every `vanth
+        status`). Corruption does not appear spontaneously, so a cached `ok`
+        is safe; `0` disables.
+        """
+        try:
+            return max(0.0, float(os.environ.get("VANTH_INTEGRITY_CACHE_SECONDS", "300")))
+        except ValueError:
+            return 300.0
+
+    def _cached_quick_check(self) -> str:
+        now = time.monotonic()
+        if self._integrity_cache_ttl() > 0 and (now - self._integrity_cache_at) < self._integrity_cache_ttl():
+            return self._integrity_cache
+        result = self._select_all("PRAGMA quick_check")[0][0]
+        self._integrity_cache = result
+        self._integrity_cache_at = now
+        return result
+
     def doctor(self, verify_artifacts: bool = False) -> dict[str, Any]:
         self._ensure_open()
         tables = {
             row["name"]
-            for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+            for row in self._select_all("SELECT name FROM sqlite_master WHERE type='table'")
         }
         required = {"jobs", "events", "wake_targets", "deliveries", "delivery_attempts", "cleanup_tombstones"}
         delivery_counts = {
             row["status"]: row["count"]
-            for row in self.db.execute("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status").fetchall()
+            for row in self._select_all("SELECT status, COUNT(*) AS count FROM deliveries GROUP BY status")
         }
         stale_delivery_ttl = self._delivery_ttl_seconds()
         stale_cutoff = (datetime.now(timezone.utc) - timedelta(seconds=stale_delivery_ttl)).isoformat().replace("+00:00", "Z")
-        stale_pending_deliveries = self.db.execute(
+        stale_pending_deliveries = self._select_all(
             "SELECT COUNT(*) FROM deliveries WHERE status IN ('pending','retrying') AND attempts=0 AND created_at < ?",
             (stale_cutoff,),
-        ).fetchone()[0]
+        )[0][0]
         recent_jobs_without_wake = self._recent_jobs_without_wake()
         relay_client_ids = self._relay_client_ids()
         undeliverable_wakes = 0
-        for row in self.db.execute("SELECT type, config_json FROM wake_targets").fetchall():
+        for row in self._select_all("SELECT type, config_json FROM wake_targets"):
             try:
                 config = json.loads(row["config_json"] or "{}")
             except (TypeError, ValueError):
@@ -6699,10 +6907,10 @@ class JobManager:
         if integrity["issues"]:
             warnings.append({"type": "artifact_integrity", "issues": integrity["issues"],
                              "detail": "restore missing blobs or republish corrupt artifacts"})
-        diagnostics = self.db.execute(
+        diagnostics = self._select_all(
             "SELECT job_id, type, message, created_at FROM events "
             "WHERE type IN ('pipe_drain_timeout','log_capture_failed','write_contended') ORDER BY created_at DESC LIMIT 20"
-        ).fetchall()
+        )
         if diagnostics:
             warnings.append({"type": "capture_diagnostics", "count": len(diagnostics),
                              "detail": "inspect capture failures and inherited output pipes in the reported jobs"})
@@ -6737,6 +6945,25 @@ class JobManager:
         missing = sorted(required - tables)
         if missing:
             warnings.append({"type": "missing_tables", "tables": missing})
+        if self.max_retention_seconds <= 0:
+            # Automatic retention is off (the default): jobs, events, logs, and
+            # deliveries accumulate until `vanth prune` or VANTH_RETENTION_SECONDS.
+            # Nudge once state is large enough to slow list/doctor/metrics and
+            # make the first real cleanup's sweep heavy — not before.
+            job_count = self._select_all("SELECT COUNT(*) FROM jobs")[0][0]
+            try:
+                db_bytes = (self.home / "jobs.sqlite").stat().st_size
+            except OSError:
+                db_bytes = 0
+            if job_count >= 5000 or db_bytes >= 100 * 1024 * 1024:
+                warnings.append({
+                    "type": "retention_disabled_with_growth",
+                    "jobs": job_count,
+                    "db_bytes": db_bytes,
+                    "detail": ("automatic retention is off and state is growing; "
+                               "set VANTH_RETENTION_SECONDS (plus VANTH_RETENTION_DRY_RUN=0 to enforce) "
+                               "or run `vanth prune --older-than SECONDS --yes`"),
+                })
         codex_bin = os.environ.get("VANTH_CODEX_BIN") or (r"C:\codex\codex.exe" if sys.platform == "win32" else "codex")
         codex_available = self._cached_bin_available(
             f"codex:{codex_bin}",
@@ -6762,15 +6989,15 @@ class JobManager:
                     "reap with `vanth doctor --reap-orphans`",
                 }
             )
-        quick_check = self.db.execute("PRAGMA quick_check").fetchone()[0]
-        stale_leases = self.db.execute(
+        quick_check = self._cached_quick_check()
+        stale_leases = self._select_all(
             "SELECT COUNT(*) FROM deliveries WHERE status='dispatching' AND lease_expires_at IS NOT NULL AND lease_expires_at<=?",
             (now_iso(),),
-        ).fetchone()[0]
+        )[0][0]
         dead_lettered = []
-        for row in self.db.execute(
+        for row in self._select_all(
             "SELECT delivery_id, job_id, attempts, last_error, payload_json FROM deliveries WHERE status='failed' ORDER BY created_at DESC LIMIT 20"
-        ).fetchall():
+        ):
             target = json.loads(row["payload_json"] or "{}").get("target", {})
             max_attempts = int(target.get("max_attempts", 1))
             expired = (row["last_error"] or "").startswith(EXPIRED_DELIVERY_ERROR)
@@ -6792,7 +7019,7 @@ class JobManager:
         # explicitly with `vanth doctor --reap-orphans`), and depend on the
         # ambient process table, so they must not flip the health exit code.
         soft_warning_types = {"codex_unavailable", "opencode_unavailable", "orphaned_mcp_servers",
-                              "capture_diagnostics", "ingestion_contention"}
+                              "capture_diagnostics", "ingestion_contention", "retention_disabled_with_growth"}
         hard_warnings = [w for w in warnings if w.get("type") not in soft_warning_types]
         # A dead maintenance/dispatch loop is a HARD failure: queues stop
         # draining and wake deliveries stop progressing, yet `/ready` (which
@@ -6848,10 +7075,10 @@ class JobManager:
         stale_after = float(os.environ.get("VANTH_RELAY_STALE_SECONDS", "90"))
         now = datetime.now(timezone.utc)
         statuses = []
-        for row in self.db.execute(
+        for row in self._select_all(
             "SELECT client_id, client_type, destinations_json, updated_at, last_poll_at "
             "FROM relay_subscriptions ORDER BY client_type, client_id"
-        ).fetchall():
+        ):
             last_poll = _parse_iso(row["last_poll_at"]) if row["last_poll_at"] else None
             age = (now - last_poll).total_seconds() if last_poll else None
             try:
@@ -6871,23 +7098,54 @@ class JobManager:
 
     def _cleanup_rows(self, older_than_seconds: int) -> list[sqlite3.Row]:
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
-        with self.db_lock:
-            return self.db.execute(
-                "SELECT * FROM jobs WHERE status IN ('completed','failed','timeout','cancelled','orphaned') AND updated_at<=?",
-                (cutoff,),
-            ).fetchall()
+        return self._select_all(
+            "SELECT * FROM jobs WHERE status IN ('completed','failed','timeout','cancelled','orphaned') AND updated_at<=?",
+            (cutoff,),
+        )
 
-    def cleanup(self, older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
-        self._ensure_open()
-        if isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0:
-            raise ValueError("older_than_seconds must be a non-negative integer")
-        rows = self._cleanup_rows(older_than_seconds)
-        job_ids = [row["job_id"] for row in rows]
-        deleted = list(job_ids)
-        if not dry_run and job_ids:
-            with self.db_lock:
-                placeholders = ",".join("?" for _ in job_ids)
-                self.db.execute("BEGIN IMMEDIATE")
+    def _cleanup_batch_size(self) -> int:
+        """Rows per cleanup transaction (batched so a huge terminal backlog
+        neither exhausts SQLite's variable limit in one giant IN clause nor
+        holds the write lock for the whole sweep)."""
+        try:
+            return max(1, int(os.environ.get("VANTH_CLEANUP_BATCH_SIZE", "500")))
+        except ValueError:
+            return 500
+
+    def _cleanup_batch_ids(self, cutoff: str, limit: int) -> list[str]:
+        return [
+            row["job_id"]
+            for row in self._select_all(
+                "SELECT job_id FROM jobs WHERE status IN "
+                "('completed','failed','timeout','cancelled','orphaned') AND updated_at<=? "
+                "ORDER BY updated_at ASC LIMIT ?",
+                (cutoff, limit),
+            )
+        ]
+
+    def _cleanup_all_ids(self, cutoff: str) -> list[str]:
+        """Every terminal job id at or below the cutoff (preview path only).
+
+        Ids are tiny; the unbounded select that batching avoids on the delete
+        path (variable-limit IN clauses, giant write transactions) does not
+        apply to a read-only id list.
+        """
+        return [
+            row["job_id"]
+            for row in self._select_all(
+                "SELECT job_id FROM jobs WHERE status IN "
+                "('completed','failed','timeout','cancelled','orphaned') AND updated_at<=? "
+                "ORDER BY updated_at ASC",
+                (cutoff,),
+            )
+        ]
+
+    def _cleanup_delete_batch(self, job_ids: list[str]) -> list[str]:
+        """Delete one batch of still-terminal jobs; returns the ids actually removed."""
+        with self.db_lock:
+            placeholders = ",".join("?" for _ in job_ids)
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
                 # Re-check terminal status INSIDE the transaction: a restart
                 # recovery can claim a terminal row back to 'launching' between
                 # the selection above and these DELETEs. Deleting the row — or its
@@ -6901,27 +7159,44 @@ class JobManager:
                         job_ids,
                     )
                 ]
-                deleted = still
+                if not still:
+                    self.db.rollback()
+                    return []
                 still_set = set(still)
                 still_ph = ",".join("?" for _ in still)
-                for row in rows:
-                    job_id = row["job_id"]
+                spec_root = self.home / "specs"
+                spec_names = {p.name for p in spec_root.glob("*.json")} if spec_root.exists() else set()
+                path_rows = {
+                    r["job_id"]: r
+                    for r in self.db.execute(
+                        f"SELECT job_id, stdout_path, stderr_path, events_path FROM jobs WHERE job_id IN ({still_ph})",
+                        still,
+                    ).fetchall()
+                }
+                for job_id in job_ids:
                     if job_id not in still_set:
                         continue
-                    artifacts = [
-                        row["stdout_path"],
-                        row["stderr_path"],
-                        row["events_path"],
-                        str(self.logs / f"{job_id}.runner.log"),
-                        str(self.home / "specs" / f"{job_id}.json"),
-                        str(self.home / "stdin" / f"{job_id}.in"),
-                    ]
+                    row = path_rows.get(job_id)
+                    artifacts = (
+                        [
+                            row["stdout_path"],
+                            row["stderr_path"],
+                            row["events_path"],
+                            str(self.logs / f"{job_id}.runner.log"),
+                            str(self.home / "specs" / f"{job_id}.json"),
+                            str(self.home / "stdin" / f"{job_id}.in"),
+                        ]
+                        if row
+                        else []
+                    )
                     # Claim-specific specs (specs/{job_id}-{claim_token}.json)
                     # also belong to this job and must be cleaned up (review
                     # rc33 P1-3 introduced the claim-specific spec naming).
-                    if (self.home / "specs").exists():
-                        for spec_file in (self.home / "specs").glob(f"{job_id}-*.json"):
-                            artifacts.append(str(spec_file))
+                    # Matched against one directory listing per batch, not a
+                    # glob per job.
+                    for name in spec_names:
+                        if name.startswith(f"{job_id}-") and name.endswith(".json"):
+                            artifacts.append(str(spec_root / name))
                     self.db.execute(
                         "INSERT OR IGNORE INTO cleanup_tombstones(tombstone_id, job_id, artifacts_json, created_at) VALUES (?, ?, ?, ?)",
                         ("clean_" + uuid.uuid4().hex[:16], job_id, json.dumps(artifacts, separators=(",", ":")), now_iso()),
@@ -6931,11 +7206,47 @@ class JobManager:
                 self.db.execute(f"DELETE FROM wake_targets WHERE job_id IN ({still_ph})", still)
                 self.db.execute(f"DELETE FROM decisions WHERE job_id IN ({still_ph})", still)
                 self.db.execute(f"DELETE FROM events WHERE job_id IN ({still_ph})", still)
+                # Derived/attached rows have no other owner: metric series are
+                # recomputed from events, artifact rows are metadata pointers,
+                # and idempotency keys are reusable once the job is gone
+                # (replay of a cleaned job already raises a clear error).
+                self.db.execute(f"DELETE FROM metric_series WHERE job_id IN ({still_ph})", still)
+                self.db.execute(f"DELETE FROM artifacts WHERE job_id IN ({still_ph})", still)
+                self.db.execute(f"DELETE FROM local_start_requests WHERE job_id IN ({still_ph})", still)
                 self.db.execute(f"DELETE FROM jobs WHERE job_id IN ({still_ph})", still)
                 self.db.commit()
-        if not dry_run:
-            self._prune_remote_wake_rows(older_than_seconds)
-            self._drain_cleanup_tombstones()
+            except BaseException:
+                self.db.rollback()
+                raise
+        return still
+
+    def cleanup(self, older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
+        self._ensure_open()
+        if isinstance(older_than_seconds, bool) or not isinstance(older_than_seconds, int) or older_than_seconds < 0:
+            raise ValueError("older_than_seconds must be a non-negative integer")
+        batch_size = self._cleanup_batch_size()
+        cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
+        if dry_run:
+            deleted = self._cleanup_all_ids(cutoff)
+            return {"dry_run": True, "older_than_seconds": older_than_seconds, "jobs": deleted, "count": len(deleted)}
+        deleted = []
+        empty_batches = 0
+        while True:
+            batch = self._cleanup_batch_ids(cutoff, batch_size)
+            if not batch:
+                break
+            removed = self._cleanup_delete_batch(batch)
+            deleted.extend(removed)
+            if not removed:
+                # The batch flipped non-terminal between selection and the
+                # guarded delete (a recovery claim or rerun owns it now).
+                # Those rows carry fresh timestamps so the next selection
+                # excludes them; bail out after a few to never spin.
+                empty_batches += 1
+                if empty_batches >= 3:
+                    break
+        self._prune_remote_wake_rows(older_than_seconds)
+        self._drain_cleanup_tombstones()
         return {"dry_run": dry_run, "older_than_seconds": older_than_seconds, "jobs": deleted, "count": len(deleted)}
 
     def _prune_remote_wake_rows(self, older_than_seconds: int) -> int:
@@ -8973,15 +9284,9 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
 
 
 # Global flags that may precede the subcommand (`vanth --json list`); they do not
-# name a command, so the dispatch gate must look past them.
-_VANTH_CLI_GLOBAL_FLAGS = {"--json"}
-_VANTH_CLI_SUBCOMMANDS = {
-    "status", "doctor", "restart", "setup", "--help", "-h", "help",
-    "start", "list", "ps", "logs", "tail", "stop", "rerun", "send", "sleep", "emit", "deliveries", "api",
-    "artifacts", "prune", "backup", "restore", "wait", "diff", "wake",
-    "autostart", "--version", "version", "remote",
-}
-
+# name a command, so the dispatch gate must look past them. The routing sets
+# live in vanth.cli (imported at the top of this module for compatibility);
+# _is_vanth_mcp_command below is the only remaining user here.
 _VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw"}
 
 
@@ -9014,10 +9319,9 @@ def _is_vanth_mcp_command(command_line: str) -> bool:
     reported process, so the matcher accepts only the exact supported launch
     shapes and rejects anything ambiguous:
 
-    - ``<python> -m vanth.server`` / ``-m vanth.mcp`` (``-m`` must be the
-      interpreter's launching argument; ``python unrelated.py -m vanth.server``,
-      ``bash -lc 'python -m vanth.server'`` and ``python -c<payload>`` are
-      rejected), and
+    - ``<python> -m vanth.server`` (``-m`` must be the interpreter's launching
+      argument; ``python unrelated.py -m vanth.server``, ``bash -lc 'python -m
+      vanth.server'`` and ``python -c<payload>`` are rejected), and
     - the ``vanth`` console script (``vanth`` / ``python .../vanth``) run with
       no CLI subcommand — ``vanth logs --follow`` is the CLI, not MCP.
 
@@ -9041,9 +9345,13 @@ def _is_vanth_mcp_command(command_line: str) -> bool:
         return token.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
 
     def _is_cli_script(script_index: int) -> bool:
+        # Imported here (not at module scope): the routing sets live in
+        # vanth.cli and this module must stay importable without it.
+        from .cli import _VANTH_CLI_SUBCOMMANDS as _cli_subcommands
+
         rest = tokens[script_index + 1:]
         # Quoted subcommand (``vanth "logs"``) is still a CLI invocation.
-        return bool(rest) and rest[0].strip("\"'") in _VANTH_CLI_SUBCOMMANDS
+        return bool(rest) and rest[0].strip("\"'") in _cli_subcommands
 
     if _base(tokens[0]).startswith("python"):
         # Walk the interpreter's own options to the launching argument:
@@ -9054,7 +9362,7 @@ def _is_vanth_mcp_command(command_line: str) -> bool:
         while i < len(tokens):
             tok = tokens[i]
             if tok == "-m":
-                return i + 1 < len(tokens) and tokens[i + 1] in {"vanth.server", "vanth.mcp"}
+                return i + 1 < len(tokens) and tokens[i + 1] == "vanth.server"
             if tok == "-c" or tok.startswith("-c"):
                 return False
             if tok in _PY_VALUED_OPTIONS:
@@ -9187,45 +9495,25 @@ def _hint_setup() -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    from .cli import main as cli_main
+    """Program entry for `python -m vanth` and the frozen binary default role.
 
-    args = list(sys.argv[1:] if argv is None else argv)
-    # Human-facing subcommands are dispatched to the CLI; anything else
-    # (including no args) runs the MCP stdio server, which is what MCP
-    # clients expect from `vanth` (bare). Leading global flags are skipped so
-    # `vanth --json list` (the documented global form) routes here too: checking
-    # only args[0] sent it to the MCP stdio server — a hang for an agent, and
-    # "unknown command '--json'" in a terminal.
-    first_non_flag = next((arg for arg in args if arg not in _VANTH_CLI_GLOBAL_FLAGS), None)
-    if args and (first_non_flag in _VANTH_CLI_SUBCOMMANDS or first_non_flag is None):
-        raise SystemExit(cli_main(args))
-    # Interactive misuse guard (user report): bare `vanth` typed in a real
-    # terminal would otherwise start the MCP stdio server and appear to
-    # "hang" reading JSON-RPC from the keyboard. Real MCP clients always
-    # run us with pipes, never a TTY on stdin.
-    interactive = sys.stdin.isatty()
-    if interactive and not args:
-        print(
-            "vanth: refusing to start the MCP stdio server in an interactive "
-            "terminal.\n"
-            "  - Terminal dashboard:            vanth-monitor\n"
-            "  - Human subcommands:             vanth doctor | status | setup\n"
-            "  - MCP clients launch `vanth` with pipes automatically.",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-    if interactive:
-        # An unknown human command (typo like `vanth statsu`) or a bare
-        # invocation with redirected stdout must not silently hang inside the
-        # MCP read loop. Route unknown interactive invocations to the CLI,
-        # which prints usage/errors and exits (review P2-2).
-        print(
-            f"vanth: unknown command {args[0]!r}",
-            file=sys.stderr,
-        )
-        raise SystemExit(2)
-    _hint_setup()
-    _run_mcp_server()
+    Entry routing lives in :func:`vanth.cli.dispatch` (so the `vanth`
+    console script avoids importing this module for human subcommands);
+    this stays as the compatibility entry and behaves identically.
+    """
+    from .cli import dispatch as _cli_dispatch
+
+    _cli_dispatch(argv)
+
+
+def __getattr__(name: str) -> Any:
+    # Compatibility re-export of the CLI routing sets (moved to vanth.cli so
+    # the console script need not import this module). Resolved lazily.
+    if name in {"_VANTH_CLI_SUBCOMMANDS", "_VANTH_CLI_GLOBAL_FLAGS"}:
+        from . import cli as _cli
+
+        return getattr(_cli, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def _run_mcp_server() -> None:

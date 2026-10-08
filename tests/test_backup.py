@@ -65,6 +65,37 @@ def test_backup_restore_round_trip(tmp_path):
     assert (home / "artifacts-store" / "blobs" / "aa" / "bb" / "deadbeef").exists()
 
 
+def test_backup_includes_remote_request_journal(tmp_path):
+    """The remote request journal must survive a backup/restore round trip."""
+    from vanth.remote.journal import RequestJournal
+
+    home = tmp_path / "state"
+    _seed(home)
+    journal = RequestJournal(home / "client-requests.sqlite")
+    try:
+        journal.record({
+            "request_id": "req_1",
+            "remote_id": "r1",
+            "idempotency_key": "key_1",
+            "method": "job.start",
+            "payload": {},
+            "digest": "abc",
+        })
+    finally:
+        journal.close()
+    archive = create_backup(home)
+    with zipfile.ZipFile(archive) as bundle:
+        assert "client-requests.sqlite" in bundle.namelist()
+    (home / "client-requests.sqlite").unlink()
+    result = restore_backup(home, archive)
+    assert result["result"] == "ok"
+    journal = RequestJournal(home / "client-requests.sqlite")
+    try:
+        assert journal.get("req_1") is not None
+    finally:
+        journal.close()
+
+
 def test_restore_refuses_tampered_archive(tmp_path):
     archive = tmp_path / "tampered.zip"
     with zipfile.ZipFile(archive, "w") as bundle:

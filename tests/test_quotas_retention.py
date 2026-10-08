@@ -250,3 +250,75 @@ def test_max_running_jobs_atomic_across_managers(tmp_path, monkeypatch):
     finally:
         m1.close()
         m2.close()
+
+
+def _seed_terminal_job(manager, job_id, updated_at="2026-01-01T00:00:00Z"):
+    with manager.db_lock:
+        manager.db.execute(
+            "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path) VALUES (?, ?, 'completed', ?, ?, ?, ?, ?)",
+            (job_id, "true", updated_at, updated_at,
+             str(manager.logs / f"{job_id}.out"), str(manager.logs / f"{job_id}.err"),
+             str(manager.events_dir / f"{job_id}.jsonl")),
+        )
+        manager.db.execute(
+            "INSERT INTO metric_series(series_id, job_id, metric, x, y, event_id, seq, created_at) VALUES (?, ?, 'loss', 1, 0.5, 'evt_1', 1, ?)",
+            (f"series_{job_id}", job_id, updated_at),
+        )
+        manager.db.execute(
+            "INSERT INTO artifacts(artifact_id, job_id, name, uri, created_at) VALUES (?, ?, 'out.bin', 'file:///tmp/out.bin', ?)",
+            (f"art_{job_id}", job_id, updated_at),
+        )
+        manager.db.execute(
+            "INSERT INTO local_start_requests VALUES (?, ?, ?, ?)",
+            (f"key_{job_id}", "hash", job_id, updated_at),
+        )
+        manager.db.commit()
+
+
+def test_cleanup_removes_metrics_artifacts_and_idempotency_rows(tmp_path):
+    """cleanup() must not leave derived/attached rows behind for swept jobs."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        _seed_terminal_job(manager, "job_gone")
+        assert manager.cleanup(older_than_seconds=0, dry_run=False)["count"] == 1
+        with manager.db_lock:
+            for table in ("jobs", "metric_series", "artifacts", "local_start_requests"):
+                column = "job_id"
+                left = manager.db.execute(f"SELECT COUNT(*) FROM {table} WHERE {column}=?", ("job_gone",)).fetchone()[0]
+                assert left == 0, f"{table} still has rows for the cleaned job"
+    finally:
+        manager.close()
+
+
+def test_cleanup_dry_run_lists_without_deleting(tmp_path):
+    """The batched dry-run path must report the same set as the real sweep."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        for index in range(5):
+            _seed_terminal_job(manager, f"job_dry_{index}")
+        preview = manager.cleanup(older_than_seconds=0, dry_run=True)
+        assert preview["count"] == 5
+        assert sorted(preview["jobs"]) == sorted(f"job_dry_{index}" for index in range(5))
+        with manager.db_lock:
+            assert manager.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 5
+            assert manager.db.execute("SELECT COUNT(*) FROM metric_series").fetchone()[0] == 5
+    finally:
+        manager.close()
+
+
+def test_cleanup_batches_large_backlogs(tmp_path, monkeypatch):
+    """A backlog bigger than one batch must be fully swept across transactions."""
+    monkeypatch.setenv("VANTH_CLEANUP_BATCH_SIZE", "3")
+    manager = JobManager(tmp_path / "state")
+    try:
+        for index in range(10):
+            _seed_terminal_job(manager, f"job_batch_{index}")
+        result = manager.cleanup(older_than_seconds=0, dry_run=False)
+        assert result["count"] == 10
+        with manager.db_lock:
+            assert manager.db.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+            assert manager.db.execute("SELECT COUNT(*) FROM metric_series").fetchone()[0] == 0
+            assert manager.db.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0] == 0
+            assert manager.db.execute("SELECT COUNT(*) FROM local_start_requests").fetchone()[0] == 0
+    finally:
+        manager.close()

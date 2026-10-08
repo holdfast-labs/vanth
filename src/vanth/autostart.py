@@ -33,7 +33,9 @@ LAUNCHAGENT_NAME = "com.vanth.daemon"
 LINUX_UNIT_NAME = "vanth-daemon.service"
 
 _Run = Callable[[Sequence[str]], "subprocess.CompletedProcess[str]"]
-_Write = Callable[[Path, str], None]
+# File writer seam; `encoding` selects the file encoding (the Windows task
+# XML is UTF-16, its wrapper batch file UTF-8 with BOM).
+_Write = Callable[..., None]
 _Remove = Callable[[Path], None]
 _Exists = Callable[[Path], bool]
 
@@ -63,14 +65,16 @@ def _command_line(home: Path) -> list[str]:
     return [sys.executable, "-m", "vanth.daemon"]
 
 
-def _windows_xml(home: Path) -> str:
-    """A Task Scheduler task definition that runs the daemon at logon+startup."""
-    exe, *args = _command_line(home)
-    args_xml = ""
-    if args:
-        args_xml = "\n".join(
-            f'<Argument>{_escape_xml(a)}</Argument>' for a in args
-        )
+def _windows_xml(home: Path, wrapper: Path) -> str:
+    """A Task Scheduler task definition that runs the daemon at logon+startup.
+
+    The Task Scheduler schema has no environment-variable block, so the task
+    runs a small wrapper script (``wrapper``) via ``cmd /d /c call``, and the
+    wrapper sets ``VANTH_HOME`` before exec'ing the daemon. ``call`` (rather
+    than a bare quoted path) keeps wrapper paths with spaces working under
+    cmd.exe's ``/c`` quote-stripping rules.
+    """
+    comspec = os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe")
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -101,15 +105,45 @@ def _windows_xml(home: Path) -> str:
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{_escape_xml(exe)}</Command>
-      {args_xml}
+      <Command>{_escape_xml(comspec)}</Command>
+      <Arguments>/d /c call {_escape_xml(_quote_cmd_arg(str(wrapper)))}</Arguments>
     </Exec>
   </Actions>
-  <EnvironmentVariables>
-    <Variable name="VANTH_HOME"><Value>{_escape_xml(str(home))}</Value></Variable>
-  </EnvironmentVariables>
 </Task>
 """
+
+
+def _windows_cmd(home: Path) -> str:
+    """The wrapper script a Windows scheduled task runs (sets VANTH_HOME).
+
+    A batch file (not inline ``set ... &&``) so home paths with spaces,
+    trailing backslashes, or ``&`` need no fragile inline quoting: the quoted
+    ``set "NAME=value"`` form takes everything literally. ``%`` is doubled
+    because cmd.exe expands it even inside quotes.
+    """
+    exe, *args = _command_line(home)
+    lines = [
+        "@echo off",
+        f'set "VANTH_HOME={_escape_cmd_value(str(home))}"',
+        " ".join([_quote_cmd_arg(exe), *(_quote_cmd_arg(a) for a in args)]),
+    ]
+    return "\r\n".join(lines) + "\r\n"
+
+
+def _escape_cmd_value(text: str) -> str:
+    """Escape a value embedded in a batch file (percent expansion is active)."""
+    if '"' in text or "\n" in text or "\r" in text:
+        raise ValueError(f"cannot encode in a batch file: {text!r}")
+    return text.replace("%", "%%")
+
+
+def _quote_cmd_arg(text: str) -> str:
+    """Quote one argv token for cmd.exe (sibling of cli._quote_for_cmd)."""
+    if '"' in text or "\n" in text or "\r" in text:
+        raise ValueError(f"cannot encode in a batch file: {text!r}")
+    if text and all(c.isalnum() or c in r"/._-+:\=" for c in text):
+        return text
+    return '"' + text.replace("%", "%%") + '"'
 
 
 def _escape_xml(text: str) -> str:
@@ -188,8 +222,8 @@ def _shell_quote(text: str) -> str:
     return "'" + text.replace("'", "'\\''") + "'"
 
 
-def _write_file(path: Path, content: str) -> None:
-    path.write_text(content, encoding="utf-8")
+def _write_file(path: Path, content: str, encoding: str = "utf-8") -> None:
+    path.write_text(content, encoding=encoding)
 
 
 def _remove_file(path: Path) -> None:
@@ -214,6 +248,7 @@ def _targets(home: Path) -> dict[str, Any]:
             "kind": "task",
             "target": TASK_NAME,
             "file": home / "vanthd-task.xml",
+            "wrapper": home / "vanthd-task.cmd",
             "enable_cmd": ["schtasks", "/Create", "/XML", str(home / "vanthd-task.xml"), "/TN", TASK_NAME, "/F"],
             "disable_cmd": ["schtasks", "/Delete", "/F", "/TN", TASK_NAME],
             "query_cmd": ["schtasks", "/Query", "/TN", TASK_NAME],
@@ -241,7 +276,8 @@ def _targets(home: Path) -> dict[str, Any]:
 
 def _render(home: Path, platform_key: str) -> str:
     if platform_key == "windows":
-        return _windows_xml(home)
+        targets = _targets(home)
+        return _windows_xml(home, Path(targets["wrapper"]))
     if platform_key == "macos":
         return _macos_plist(home)
     return _linux_unit(home)
@@ -323,13 +359,20 @@ def enable(
     targets = _targets(home)
     content = _render(home, platform_key)
     if dry_run:
+        files = [targets["file"]] + ([targets["wrapper"]] if "wrapper" in targets else [])
         return {
             "dry_run": True,
-            "would_install": f"write {targets['target']!r} and run {' '.join(targets['enable_cmd'])}",
+            "would_install": f"write {[str(p) for p in files]!r} and run {' '.join(targets['enable_cmd'])}",
             "target": targets["target"],
             "platform": platform_key,
         }
-    _write(Path(targets["file"]), content)
+    if platform_key == "windows":
+        # The task XML declares UTF-16 (Task Scheduler's canonical encoding);
+        # the wrapper batch file is UTF-8 with BOM, which cmd.exe honors.
+        _write(Path(targets["file"]), content, encoding="utf-16")
+        _write(Path(targets["wrapper"]), _windows_cmd(home), encoding="utf-8-sig")
+    else:
+        _write(Path(targets["file"]), content)
     proc = _run(targets["enable_cmd"])
     if proc.returncode != 0:
         raise RuntimeError(
@@ -361,5 +404,16 @@ def disable(
         raise RuntimeError(
             f"autostart disable failed ({proc.returncode}): {proc.stderr.strip()}"
         )
-    _remove(Path(targets["target"]))
+    # Remove what enable() wrote. On Windows the registration "target" is a
+    # task NAME, not a path — removing it would unlink a relative
+    # `./VanthDaemon` file in the caller's CWD (or silently do nothing) while
+    # leaving the real XML (`targets["file"]`) behind. Only unlink the target
+    # when it is an absolute path (the macOS plist / Linux unit symlink).
+    # The Windows wrapper batch file is removed alongside its task XML.
+    _remove(Path(targets["file"]))
+    if "wrapper" in targets:
+        _remove(Path(targets["wrapper"]))
+    target_path = Path(targets["target"])
+    if target_path.is_absolute() and target_path != Path(targets["file"]):
+        _remove(target_path)
     return {"enabled": False, "target": targets["target"], "platform": platform_key}

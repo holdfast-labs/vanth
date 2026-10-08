@@ -14,11 +14,25 @@ import platform
 import re
 import shutil
 import subprocess
+import time
 from typing import Any
 
 _gpu_cache: list[dict[str, str]] | None | bool = False
 _cpu_cache: int | None = None
-_git_cache: dict[str, tuple[str | None, str | None, str | None] | None] = {}
+# (timestamp, state) per cwd: branch/commit go stale on checkout/commit, so
+# entries expire after a TTL instead of living for the daemon's lifetime, and
+# the dict is capped so distinct cwds cannot grow it forever.
+_git_cache: dict[str, tuple[float, dict[str, str] | None]] = {}
+
+
+def _git_cache_ttl() -> float:
+    try:
+        return max(0.0, float(os.environ.get("VANTH_GIT_CACHE_SECONDS", "300")))
+    except ValueError:
+        return 300.0
+
+
+_GIT_CACHE_MAX = 1000
 
 # Interpreters/tools that identify the language a command runs. Matching is done
 # on the basename (path stripped, trailing version digits dropped), so
@@ -204,15 +218,18 @@ def _git_state(cwd: str | None) -> dict[str, str] | None:
     """Return git repo/branch/commit for a directory, cached per cwd."""
     if not cwd:
         return None
+    now = time.monotonic()
+    ttl = _git_cache_ttl()
     cached = _git_cache.get(cwd)
-    if cwd in _git_cache:
-        if cached is None:
+    if cached is not None and ttl > 0 and (now - cached[0]) < ttl:
+        state = cached[1]
+        if state is None:
             return None
-        return dict(cached)
+        return dict(state)
     if not _in_git_repo(cwd):
         # Skip 3 git spawns (~200ms on Windows) for directories that cannot
         # be in a repo; the negative result is cached like everything else.
-        _git_cache[cwd] = None
+        _remember_git_state(cwd, None, now)
         return None
     repo = _git(cwd, "remote", "get-url", "origin")
     branch = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
@@ -224,8 +241,14 @@ def _git_state(cwd: str | None) -> dict[str, str] | None:
         state["commit"] = commit
     if repo:
         state["repository"] = repo
-    _git_cache[cwd] = state or None
+    _remember_git_state(cwd, state or None, now)
     return state or None
+
+
+def _remember_git_state(cwd: str, state: dict[str, str] | None, now: float) -> None:
+    if len(_git_cache) >= _GIT_CACHE_MAX:
+        _git_cache.pop(next(iter(_git_cache)))
+    _git_cache[cwd] = (now, state)
 
 
 def _gpu_info() -> list[dict[str, str]] | None:

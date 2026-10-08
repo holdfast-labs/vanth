@@ -11,8 +11,12 @@ Policy (environment):
   a listed network).
 - ``VANTH_OUTBOUND_BLOCK_PRIVATE=1``: additionally deny loopback + private.
 
-The host is always resolved and *every* resolved address is checked, so a name
-cannot rebind to a denied IP between the check and the connect.
+The host is always resolved and *every* resolved address is checked, so an
+allowlisted name cannot point at a denied IP without being refused. Note the
+remaining TOCTOU gap: the check and the subsequent connect resolve
+independently, so a hostile DNS that rebinds between the two could still steer
+the connection. That is out of scope for a loopback single-user daemon, but
+callers must not treat a passed check as a pinned address.
 """
 
 from __future__ import annotations

@@ -143,3 +143,88 @@ def test_reap_orphans_invalidates_cache(tmp_path, monkeypatch):
         assert len(calls) == 3
     finally:
         manager.close()
+
+
+def test_ensure_waits_for_shutting_daemon_instead_of_duplicating(tmp_path, monkeypatch):
+    """A 503 (daemon mid-shutdown) must wait for quiet, then spawn — never a duplicate."""
+    monkeypatch.setenv("VANTH_ENSURE_QUIET_TIMEOUT_SECONDS", "5")
+    spawned = []
+
+    class ShuttingDaemon(BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload = {"result": "error", "error": "Daemon is shutting down"}
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), ShuttingDaemon)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = VanthClient(url=f"http://127.0.0.1:{server.server_port}", home=tmp_path)
+        assert client._probe_port() == "shutting"
+        monkeypatch.setattr(
+            "vanth.client.subprocess.Popen", lambda *args, **kwargs: spawned.append(args) or FakePopen()
+        )
+        with pytest.raises(RuntimeError, match="did not start"):
+            # Waits out the quiet timeout, spawns once, then the readiness
+            # poll legitimately fails with no real daemon behind the port.
+            client.ensure()
+        assert spawned, "ensure() must spawn after waiting (not raise 'already responding')"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_ensure_503_then_quiet_spawns(tmp_path, monkeypatch):
+    """Once the shutting daemon goes quiet, ensure() proceeds to spawn."""
+    monkeypatch.setenv("VANTH_ENSURE_QUIET_TIMEOUT_SECONDS", "5")
+    spawned = []
+
+    class FlappingDaemon(BaseHTTPRequestHandler):
+        calls = 0
+
+        def do_GET(self):
+            type(self).calls += 1
+            if type(self).calls < 3:
+                payload = {"result": "error", "error": "Daemon is shutting down"}
+                self.send_response(503)
+            else:
+                # Port goes quiet mid-shutdown (listener closed): hang up.
+                self.connection.close()
+                return
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload).encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), FlappingDaemon)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = VanthClient(url=f"http://127.0.0.1:{server.server_port}", home=tmp_path)
+        monkeypatch.setattr(
+            "vanth.client.subprocess.Popen", lambda *args, **kwargs: spawned.append(args) or FakePopen()
+        )
+        with pytest.raises(RuntimeError, match="did not start"):
+            # Spawn happens (no duplicate while shutting down), then the
+            # 5s readiness poll legitimately fails with no real daemon.
+            client.ensure()
+        assert spawned, "ensure() must spawn once the port goes quiet"
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+class FakePopen:
+    """Stand-in for the spawned daemon process (does nothing)."""
+
+    pid = 0

@@ -59,7 +59,7 @@ dev = [
 ]
 
 [project.scripts]
-vanth = "vanth.server:main"
+vanth = "vanth.cli:dispatch"
 vanthd = "vanth.daemon:main"
 vanth-codex-notify = "vanth.codex_bridge:main"
 vanth-monitor = "vanth.monitor:main"

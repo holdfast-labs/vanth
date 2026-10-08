@@ -574,3 +574,63 @@ def test_checkpoint_wal_runs_without_error(tmp_path):
         manager._checkpoint_wal()
     finally:
         manager.close()
+
+
+def test_doctor_nudges_when_retention_off_and_state_large(tmp_path, monkeypatch):
+    """With auto-retention off (the default), a big backlog earns a nudge."""
+    monkeypatch.setenv("VANTH_DELIVERY_POLL_INTERVAL", "3600")
+    manager = JobManager(tmp_path / "state")
+    try:
+        assert manager.max_retention_seconds == 0
+        assert not [w for w in manager.doctor()["warnings"] if w.get("type") == "retention_disabled_with_growth"]
+        with manager.db_lock:
+            manager.db.executemany(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path)"
+                " VALUES (?, 'true', 'completed', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'a', 'b', 'c')",
+                [(f"job_old_{index}",) for index in range(5000)],
+            )
+            manager.db.commit()
+        report = manager.doctor()
+        warnings = [w for w in report["warnings"] if w.get("type") == "retention_disabled_with_growth"]
+        assert len(warnings) == 1
+        assert warnings[0]["jobs"] >= 5000
+        assert report["ok"] is True, "the nudge must stay advisory, not flip health"
+    finally:
+        manager.close()
+
+
+def test_conditions_cache_bounded(tmp_path):
+    """Per-job Condition objects must not accumulate forever."""
+    from vanth.server import _CONDITION_CACHE_MAX, JobManager
+
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        for index in range(_CONDITION_CACHE_MAX + 100):
+            manager._condition(f"job_{index}")
+        assert len(manager.conditions) <= _CONDITION_CACHE_MAX
+        # Fresh entries still resolve (eviction only drops the oldest).
+        assert manager._condition("job_new") is manager._condition("job_new")
+    finally:
+        manager.close()
+
+
+def test_capture_failed_bounded_and_discarded_on_terminal(tmp_path):
+    """Capture-failure markers are bounded and dropped once terminal."""
+    from vanth.server import _CAPTURE_FAILED_MAX, JobManager
+
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        for index in range(_CAPTURE_FAILED_MAX + 100):
+            manager._note_capture_failed(f"job_{index}")
+        assert len(manager._capture_failed) <= _CAPTURE_FAILED_MAX
+        with manager.db_lock:
+            manager.db.execute(
+                "INSERT INTO jobs(job_id, command, status, created_at, updated_at, stdout_path, stderr_path, events_path)"
+                " VALUES ('job_term', 'true', 'running', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z', 'a', 'b', 'c')"
+            )
+            manager.db.commit()
+        manager._note_capture_failed("job_term")
+        assert manager._transition_terminal("job_term", "failed", 1) is True
+        assert "job_term" not in manager._capture_failed
+    finally:
+        manager.close()

@@ -7,11 +7,13 @@ import stat
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 from typing import Any
+
+# NOTE: `urllib` (~40ms with ssl/http.client) is imported function-locally in
+# get()/post() so processes that never speak HTTP (`vanth emit`, `vanth
+# --version`, bare imports) skip it. VanthClient construction itself stays
+# import-light (token/home IO only).
 
 from .paths import canonical_home, secure_home_permissions
 
@@ -117,22 +119,72 @@ class VanthClient:
             and Path(str(payload.get("home", ""))).expanduser().resolve() == self.home
         )
 
+    def _probe_port(self, timeout: float = 1) -> str:
+        """Classify whatever answers on the daemon port: "ready", "healthy",
+        "shutting", or "quiet".
+
+        "ready" means usable by THIS client (home/schema match). "healthy" is
+        a live daemon we cannot use yet (still starting, or another home's).
+        "shutting" is a daemon mid-shutdown (HTTP 503): spawning a second
+        daemon now would duplicate the home (or fail on its lock) while the
+        old process drains, so the caller waits for quiet instead.
+        """
+        import urllib.error
+        import urllib.request
+
+        try:
+            request = urllib.request.Request(
+                self.url + "/health", headers={"Authorization": f"Bearer {self.token}"}
+            )
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read().decode()
+            if json.loads(body) == {"ok": True}:
+                return "ready" if self._ready() else "healthy"
+            return "healthy"
+        except urllib.error.HTTPError as exc:
+            if exc.code == 503:
+                return "shutting"
+            return "healthy"
+        except Exception:
+            return "quiet"
+
     def ensure(self) -> None:
         try:
             if self._ready():
                 return
         except Exception:
             pass
-        try:
-            occupied = self.get("/health", timeout=1) == {"ok": True}
-        except (OSError, ValueError):
-            occupied = False
-        if occupied:
+        state = self._probe_port()
+        if state == "healthy":
+            # Live but unusable: either still starting (grace period, then it
+            # becomes ready) or another home's daemon (the clear error below).
+            deadline = time.monotonic() + float(os.environ.get("VANTH_ENSURE_HEALTHY_GRACE_SECONDS", "3"))
+            while time.monotonic() < deadline:
+                try:
+                    if self._ready():
+                        return
+                except Exception:
+                    pass
+                time.sleep(0.2)
             raise RuntimeError(
                 f"a service is already responding at {self.url}, but Vanth cannot use it with "
                 f"VANTH_HOME={self.home}; use a free VANTH_DAEMON_PORT for a separate home "
                 "or check its token and schema"
             )
+        if state == "shutting":
+            # A previous daemon is draining (restart/shutdown in flight): wait
+            # for the port to go quiet (or a ready daemon to appear) instead
+            # of spawning a duplicate that collides on the home lock/port.
+            deadline = time.monotonic() + float(os.environ.get("VANTH_ENSURE_QUIET_TIMEOUT_SECONDS", "20"))
+            while time.monotonic() < deadline:
+                try:
+                    if self._ready():
+                        return
+                except Exception:
+                    pass
+                if self._probe_port() == "quiet":
+                    break
+                time.sleep(0.2)
         subprocess.Popen(
             [sys.executable, "-m", "vanth.daemon"],
             stdin=subprocess.DEVNULL,
@@ -152,6 +204,10 @@ class VanthClient:
         raise RuntimeError(f"vanthd did not start; inspect {self.home / 'logs' / 'daemon.log'}")
 
     def get(self, path: str, params: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
         url = self.url + path
         if params:
             clean = {key: value for key, value in params.items() if value is not None}
@@ -165,6 +221,9 @@ class VanthClient:
             return json.loads(exc.read().decode())
 
     def post(self, path: str, payload: dict[str, Any] | None = None, *, timeout: float | None = None) -> dict[str, Any]:
+        import urllib.error
+        import urllib.request
+
         data = json.dumps(payload or {}).encode()
         request = urllib.request.Request(
             self.url + path,

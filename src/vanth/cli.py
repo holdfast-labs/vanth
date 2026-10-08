@@ -17,11 +17,13 @@ import re
 import subprocess
 import sys
 import time
-import urllib.error
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+# NOTE: `urllib` (~40ms with ssl/http.client) is imported function-locally at
+# its two HTTP call sites so non-HTTP commands (`emit`, `version`, `--help`)
+# skip it.
 
 from . import autostart
 from .client import VanthClient
@@ -100,6 +102,8 @@ def _daemon_version() -> str:
 
 def _health(url: str, token: str) -> dict[str, Any] | None:
     """Return the /health payload, or None if the daemon is unreachable."""
+    import urllib.request
+
     try:
         request = urllib.request.Request(
             url + "/health", headers={"Authorization": f"Bearer {token}"}
@@ -449,6 +453,9 @@ def cmd_restart(home: Path, *, json_out: bool = False) -> int:
 
     if was_up:
         # Ask the daemon to shut down gracefully.
+        import urllib.error
+        import urllib.request
+
         try:
             request = urllib.request.Request(
                 url + "/shutdown",
@@ -2476,6 +2483,71 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_remote(argv[1:], home, json_out=json_out)
     print(f"vanth: unknown command {command!r}", file=sys.stderr)
     return 2
+
+
+# Entry routing for the `vanth` program (moved here from server.py so the
+# console script need not import the whole daemon/MCP server module for
+# human subcommands). `server.main` delegates to `dispatch`, so both
+# entry points share this exact routing and it cannot drift.
+_VANTH_CLI_SUBCOMMANDS = {
+    "status", "doctor", "restart", "setup", "--help", "-h", "help",
+    "start", "list", "ps", "logs", "tail", "stop", "rerun", "send", "sleep", "emit", "deliveries", "api",
+    "artifacts", "prune", "backup", "restore", "wait", "diff", "wake",
+    "autostart", "--version", "version", "remote",
+}
+
+_VANTH_CLI_GLOBAL_FLAGS = {"--json"}
+
+
+def dispatch(argv: list[str] | None = None) -> None:
+    """Program entry point for the `vanth` console script (see pyproject).
+
+    Human-facing subcommands run in-process via main(); anything else
+    (including no args) runs the MCP stdio server, which is what MCP clients
+    expect from `vanth` (bare). The MCP branch imports the server module
+    lazily so `--version`/`emit`/CLI commands skip its import cost.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    # Human-facing subcommands are dispatched to the CLI; anything else
+    # (including no args) runs the MCP stdio server, which is what MCP
+    # clients expect from `vanth` (bare). Leading global flags are skipped so
+    # `vanth --json list` (the documented global form) routes here too: checking
+    # only args[0] sent it to the MCP stdio server — a hang for an agent, and
+    # "unknown command '--json'" in a terminal.
+    first_non_flag = next((arg for arg in args if arg not in _VANTH_CLI_GLOBAL_FLAGS), None)
+    if args and (first_non_flag in _VANTH_CLI_SUBCOMMANDS or first_non_flag is None):
+        raise SystemExit(main(args))
+    # Interactive misuse guard (user report): bare `vanth` typed in a real
+    # terminal would otherwise start the MCP stdio server and appear to
+    # "hang" reading JSON-RPC from the keyboard. Real MCP clients always
+    # run us with pipes, never a TTY on stdin.
+    interactive = sys.stdin.isatty()
+    if interactive and not args:
+        print(
+            "vanth: refusing to start the MCP stdio server in an interactive "
+            "terminal.\n"
+            "  - Terminal dashboard:            vanth-monitor\n"
+            "  - Human subcommands:             vanth doctor | status | setup\n"
+            "  - MCP clients launch `vanth` with pipes automatically.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if interactive:
+        # An unknown human command (typo like `vanth statsu`) or a bare
+        # invocation with redirected stdout must not silently hang inside the
+        # MCP read loop. Route unknown interactive invocations to the CLI,
+        # which prints usage/errors and exits (review P2-2).
+        print(
+            f"vanth: unknown command {args[0]!r}",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    # Resolve through the module (not a direct import) so tests can
+    # monkeypatch server._run_mcp_server, and so this import stays lazy.
+    from . import server as _server_mod
+
+    _server_mod._hint_setup()
+    _server_mod._run_mcp_server()
 
 
 if __name__ == "__main__":

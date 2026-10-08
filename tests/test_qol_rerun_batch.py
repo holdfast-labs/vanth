@@ -146,3 +146,52 @@ def test_status_batch_empty_raises(tmp_path):
             manager.status_batch([True])
     finally:
         manager.close()
+
+
+def test_status_batch_matches_single_status(tmp_path):
+    """The batched path must return byte-identical payloads to status()."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_ok = start_job(manager, "print('ok')")
+        job_fail = start_job(manager, "import sys; sys.exit(3)")
+        wait_event(manager, job_ok, "completed")
+        wait_event(manager, job_fail, "failed")
+
+        expected = [manager.status(job_ok), manager.status(job_fail)]
+        result = manager.status_batch([job_ok, job_fail, job_ok, "job_bogus"])
+        assert result["count"] == 4
+        assert result["jobs"][0] == expected[0]
+        assert result["jobs"][1] == expected[1]
+        assert result["jobs"][2] == expected[0]
+        assert result["jobs"][3]["status"] == "unknown"
+        assert result["unknown"] == ["job_bogus"]
+        assert expected[1]["failure_reason"] == "workload_failed"
+        assert result["jobs"][1]["failure_reason"] == "workload_failed"
+    finally:
+        manager.close()
+
+
+def test_agent_view_matches_single_statuses(tmp_path):
+    """agent_view must agree with status()+deliveries() computed per job."""
+    manager = JobManager(tmp_path / "state")
+    try:
+        job_ok = start_job(manager, "print('ok')")
+        job_fail = start_job(manager, "import sys; sys.exit(3)")
+        wait_event(manager, job_ok, "completed")
+        wait_event(manager, job_fail, "failed")
+
+        view = {job["job_id"]: job for job in manager.agent_view()["jobs"]}
+        assert set(view) == {job_ok, job_fail}
+        for job_id in (job_ok, job_fail):
+            single = manager.status(job_id)
+            assert view[job_id]["status"] == single["status"]
+            assert view[job_id]["last_event"] == single["last_event"]
+            assert view[job_id]["progress"] == single["progress"]
+            assert view[job_id].get("failure_reason") == single.get("failure_reason")
+            deliveries = manager.deliveries(job_id, limit=100)["deliveries"]
+            assert view[job_id]["delivery_counts"] == (
+                {status: sum(1 for item in deliveries if item["status"] == status) for status in {item["status"] for item in deliveries}}
+                if deliveries else {}
+            )
+    finally:
+        manager.close()

@@ -26,7 +26,12 @@ from .migrations import LATEST_SCHEMA_VERSION
 from .process_watch import process_alive
 
 BACKUP_FORMAT = "vanth-backup/1"
-_SQLITE_FILES = ("jobs.sqlite", "artifacts.sqlite", "remote.sqlite")
+# Every durable SQLite store that must move together. client-requests.sqlite
+# is the remote request journal: without it a restore forgets which
+# controller-initiated remote requests were already answered and can replay
+# them against the remote. Files absent from a home are skipped, so old
+# backups (and homes that never paired a remote) restore unchanged.
+_SQLITE_FILES = ("jobs.sqlite", "artifacts.sqlite", "remote.sqlite", "client-requests.sqlite")
 _TREE_DIRS = ("events",)
 _ARTIFACT_TREE = "artifacts-store"
 _MANAGED_TREE_NAMES = {*_TREE_DIRS, _ARTIFACT_TREE, "logs"}

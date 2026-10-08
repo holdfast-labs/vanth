@@ -348,3 +348,31 @@ def test_camelcase_destination_alias_is_pollable(tmp_path):
         assert [d["payload"]["target"]["session_id"] for d in claimed] == [SESSION]
     finally:
         manager.close()
+
+
+def test_relay_poll_releases_on_shutdown(tmp_path):
+    """A shutdown must release a long relay poll at once (no 30s pin).
+
+    Relay polls run on non-daemon HTTP handler threads; a poll that ignores
+    shutdown keeps the old daemon process alive after `vanth restart`.
+    """
+    import threading
+
+    manager = JobManager(tmp_path / "state")
+    try:
+        register(manager, directory=str(tmp_path))
+        manager.shutdown_requested.set()
+        finished: list[float] = []
+
+        def poll() -> None:
+            started = time.monotonic()
+            assert manager.relay_poll(CLIENT, timeout_seconds=30) == []
+            finished.append(time.monotonic() - started)
+
+        thread = threading.Thread(target=poll, daemon=True)
+        thread.start()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "relay poll ignored shutdown"
+        assert finished and finished[0] < 5, finished
+    finally:
+        manager.close()

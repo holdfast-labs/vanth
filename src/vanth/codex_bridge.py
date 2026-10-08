@@ -217,12 +217,26 @@ class _CodexAppServer:
                 raise CodexBridgeError(self._error(message["error"].get("message", "codex app-server error")))
 
 
+def _timeout_seconds(target: dict[str, Any], key: str, default: int) -> int:
+    """Read an integer timeout from a wake target with a clear error.
+
+    Daemon-stored targets are validated at creation, but direct callers (the
+    `vanth-codex-notify` adapter, tests) can pass anything: a bare int()
+    would surface `invalid literal...` instead of naming the field.
+    """
+    value = target.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise CodexBridgeError(f"{key} must be an integer number of seconds")
+    return value
+
+
 def send_message_to_thread(
     thread_id: str,
     prompt: str,
     *,
     codex_command: Any = None,
     timeout_seconds: int = 30,
+    turn_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     server = _CodexAppServer(codex_command, timeout_seconds)
     try:
@@ -256,6 +270,12 @@ def send_message_to_thread(
         # this function returns, which would kill an in-flight turn before
         # the model acts on it. Wait for turn/completed so "delivered" means
         # the agent actually processed the wake, not merely received it.
+        # The model turn gets its own budget on top of setup: initialize /
+        # resume / start are quick handshakes, while a real turn can take
+        # minutes. Sharing one deadline made slow-but-healthy turns burn the
+        # whole budget and then duplicate on retry.
+        if turn_timeout_seconds is not None:
+            server.deadline = max(server.deadline, time.monotonic() + turn_timeout_seconds)
         completed = server.wait_for_turn_completed(request_id=3, turn_id=turn_id)
         return {"thread_id": thread_id, "turn": completed}
     finally:
@@ -279,7 +299,13 @@ def send_delivery_to_codex(payload: dict[str, Any]) -> dict[str, Any]:
         thread_id,
         prompt,
         codex_command=target.get("codex_command"),
-        timeout_seconds=int(target.get("timeout_seconds", 300)),
+        timeout_seconds=_timeout_seconds(target, "timeout_seconds", 300),
+        # Absent (or explicit null) keeps the historic single-budget behavior;
+        # a set value extends the turn-completion wait past the setup budget.
+        turn_timeout_seconds=(
+            None if target.get("turn_timeout_seconds") is None
+            else _timeout_seconds(target, "turn_timeout_seconds", 300)
+        ),
     )
 
 
@@ -334,7 +360,7 @@ def send_delivery_to_codex_desktop(
             caller_thread_id=caller,
             call_id=f"vanth-{delivery_id}",
             pipe_path=pipe_path,
-            timeout_seconds=int(target.get("timeout_seconds", 300)),
+            timeout_seconds=_timeout_seconds(target, "timeout_seconds", 300),
         )
     except CodexPipeUnavailable:
         raise

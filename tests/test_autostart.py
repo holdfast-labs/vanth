@@ -145,6 +145,26 @@ def test_disable_removes_registration(monkeypatch, tmp_path):
     assert removed, "disable should remove the unit file"
 
 
+def test_disable_windows_removes_xml_not_task_name(monkeypatch, tmp_path):
+    """On Windows the registration target is a task NAME, not a path.
+
+    disable() must unlink the generated XML (`targets["file"]`), never a
+    relative `./VanthDaemon` file in the caller's working directory.
+    """
+    monkeypatch.setattr(autostart, "platform", lambda: "windows")
+    run, calls = _fake_run([FakeProc(returncode=0)])
+    removed: list[Path] = []
+
+    result = autostart.disable(tmp_path, _run=run, _remove=removed.append)
+    assert result["enabled"] is False
+    assert calls, "disable should run the disable command"
+    xml = tmp_path / "vanthd-task.xml"
+    assert xml in removed, "disable must remove the generated task XML"
+    assert all(Path(path).is_absolute() for path in removed), (
+        "disable must never attempt a relative-path removal on Windows"
+    )
+
+
 def test_disable_dry_run_does_not_execute(monkeypatch, tmp_path):
     monkeypatch.setattr(autostart, "platform", lambda: "linux")
     result = autostart.disable(
@@ -155,6 +175,52 @@ def test_disable_dry_run_does_not_execute(monkeypatch, tmp_path):
     )
     assert result["dry_run"] is True
     assert "would_uninstall" in result
+
+
+def test_enable_windows_writes_xml_and_wrapper(monkeypatch, tmp_path):
+    """Windows enable() writes a schema-valid task XML plus a wrapper script."""
+    monkeypatch.setattr(autostart, "platform", lambda: "windows")
+    run, calls = _fake_run([FakeProc(returncode=0)])
+    written: dict[Path, tuple[str, str]] = {}
+
+    def write(path: Path, content: str, encoding: str = "utf-8") -> None:
+        written[path] = (content, encoding)
+
+    result = autostart.enable(tmp_path, _run=run, _write=write)
+    assert result["enabled"] is True
+    assert calls, "enable should run schtasks"
+    xml_path = tmp_path / "vanthd-task.xml"
+    cmd_path = tmp_path / "vanthd-task.cmd"
+    assert set(written) == {xml_path, cmd_path}
+    xml, xml_encoding = written[xml_path]
+    assert xml_encoding == "utf-16"
+    assert "EnvironmentVariables" not in xml
+    assert "vanthd-task.cmd" in xml
+    wrapper, cmd_encoding = written[cmd_path]
+    assert f"VANTH_HOME={tmp_path}" in wrapper.replace('"', "")
+
+
+def test_disable_windows_removes_xml_and_wrapper(monkeypatch, tmp_path):
+    """Windows disable() removes both files it created (see task-name bug)."""
+    monkeypatch.setattr(autostart, "platform", lambda: "windows")
+    run, _ = _fake_run([FakeProc(returncode=0)])
+    removed: list[Path] = []
+
+    result = autostart.disable(tmp_path, _run=run, _remove=removed.append)
+    assert result["enabled"] is False
+    assert tmp_path / "vanthd-task.xml" in removed
+    assert tmp_path / "vanthd-task.cmd" in removed
+    assert all(path.is_absolute() for path in removed)
+
+
+def test_windows_cmd_quoting(tmp_path):
+    """Homes with spaces must survive the wrapper; quotes are refused loudly."""
+    quoted = autostart._quote_cmd_arg(r"C:\Users\some one\.vanth\x.cmd")
+    assert quoted == r'"C:\Users\some one\.vanth\x.cmd"'
+    assert autostart._quote_cmd_arg("vanthd") == "vanthd"
+    assert autostart._escape_cmd_value("100%") == "100%%"
+    with pytest.raises(ValueError):
+        autostart._quote_cmd_arg('say "hi"')
 
 
 def test_cli_autostart_status_json_disabled(monkeypatch, tmp_path, capsys):

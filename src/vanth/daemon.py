@@ -76,16 +76,18 @@ def get_remote_control():
 
 
 _request_journal = None
+_request_journal_lock = threading.Lock()
 
 
 def get_request_journal():
     global _request_journal
-    if _request_journal is None:
-        from pathlib import Path as _Path
+    with _request_journal_lock:
+        if _request_journal is None:
+            from pathlib import Path as _Path
 
-        from .remote.journal import RequestJournal
+            from .remote.journal import RequestJournal
 
-        _request_journal = RequestJournal(_Path(canonical_home()) / "client-requests.sqlite")
+            _request_journal = RequestJournal(_Path(canonical_home()) / "client-requests.sqlite")
     return _request_journal
 
 
@@ -448,6 +450,12 @@ def _remote_wait(remote_id: str, remote_job_id: str, payload: dict[str, Any]) ->
     deadline = time.monotonic() + timeout_seconds
     control = get_remote_control()
     while True:
+        if shutdown_event.is_set():
+            # Daemon is going away (restart/shutdown): answer now so this
+            # non-daemon handler thread does not pin the old process (and its
+            # database connection) until the full wait deadline. The caller
+            # retries against the new daemon like any other wait shutdown.
+            return {"result": "shutdown", "job_id": remote_job_id, "message": "Vanth is shutting down"}
         try:
             result = control.status(
                 remote_id, remote_job_id,
@@ -1400,9 +1408,13 @@ def main() -> None:
     ensure_auth_token(home)
     secure_home_permissions(home)
     logger = _configure_logging(home)
+    # Startup progress records: a daemon that never logs "started" is stuck
+    # before serving (lock, bind, or migration) — without these, a wedged
+    # startup is indistinguishable from a slow one in the log.
     lock = DaemonLock(home / "daemon.lock")
     if not lock.acquire():
         raise SystemExit("another vanthd already owns this VANTH_HOME")
+    logger.info("vanthd starting home=%s pid=%s (home lock acquired)", home, os.getpid())
     try:
         httpd = None
         for attempt in range(6):
@@ -1416,6 +1428,7 @@ def main() -> None:
     except OSError as exc:
         lock.release()
         raise SystemExit(f"cannot bind {host}:{port}: {exc}") from exc
+    logger.info("vanthd starting home=%s pid=%s (bound %s:%s)", home, os.getpid(), host, port)
     _set_httpd(httpd)
     shutdown_event.clear()
     try:

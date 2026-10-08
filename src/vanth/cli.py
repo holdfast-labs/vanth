@@ -115,6 +115,11 @@ def _pid_alive(pid: int) -> bool:
     if not pid:
         return False
     if sys.platform == "win32":
+        from .process_watch import windows_pid_alive
+
+        fast = windows_pid_alive(pid)
+        if fast is not None:
+            return fast
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
@@ -198,11 +203,14 @@ def cmd_status(home: Path, argv: list[str] | None = None, *, json_out: bool = Fa
     up = False
     health = None
     doctor = None
+    client = None
     if url and token:
         health = _health(url, token)
         if health is not None:
             up = True
             try:
+                # One client for both reads: construction re-does token/home
+                # IO, so a second VanthClient here is pure overhead.
                 client = VanthClient(url, home)
                 doctor = client.get("/doctor")
             except Exception:
@@ -225,7 +233,7 @@ def cmd_status(home: Path, argv: list[str] | None = None, *, json_out: bool = Fa
     running = []
     if up:
         try:
-            client = VanthClient(url, home)
+            client = client or VanthClient(url, home)
             running = client.get("/jobs", {"status": ["running"]}).get("jobs", [])
         except Exception:
             running = []
@@ -1955,7 +1963,7 @@ def cmd_wake(argv: list[str], home: Path, *, json_out: bool = False) -> int:
 _HTTP_ROUTES: tuple[tuple[str, str], ...] = (
     ("POST", "/jobs/preview"),
     ("GET", "/health (no auth)"),
-    ("GET", "/ready | /doctor | /metrics"),
+    ("GET", "/ready | /ready-fast | /doctor | /metrics"),
     ("GET", "/jobs?status=&limit=&name=&tags="),
     ("GET", "/jobs/{id}/status | /events | /tail | /metrics | /summary | /diff | /artifacts"),
     ("GET", "/view | /deliveries | /decisions | /schedules | /pools"),

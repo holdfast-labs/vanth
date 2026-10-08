@@ -1414,6 +1414,8 @@ The HTTP daemon also exposes:
 
 - `GET /health` — cheap, unauthenticated liveness probe for supervisors;
 - `GET /ready` — authenticated readiness (doctor report; 503 when not ok);
+- `GET /ready-fast` — cheap authenticated readiness (home + schema only;
+  what per-command `ensure()` checks instead of full `/doctor`);
 - `GET /metrics` — authenticated Prometheus text exposition (jobs by status,
   running/queued, pools, deliveries, dead letters, stale leases, disk/db size,
   schema, maintenance aliveness).
@@ -1486,6 +1488,7 @@ HTTP route.
 | POST | `/deliveries/clear` | Preview or drain matching wake deliveries (`dry_run`, filters, and limit) |
 | POST | `/cleanup` | Cleanup (`older_than_seconds`, `dry_run`) |
 | GET | `/doctor` | Health report |
+| GET | `/ready-fast` | Cheap readiness (home + schema) |
 | GET | `/health` | Unauthenticated liveness |
 | GET | `/remotes` | Paired remote hosts |
 | GET | `/remotes/doctor` | SSH binaries + remote state (`remote_id`) |

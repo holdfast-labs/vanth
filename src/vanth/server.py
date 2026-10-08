@@ -26,19 +26,69 @@ from pathlib import Path
 from typing import Any, Callable
 from logging.handlers import RotatingFileHandler
 
-# mcp's FastMCP has a Settings model with a `lifespan` field whose annotation
-# contains an unresolved forward reference; pydantic-settings >=2.15 warns about
-# it on import and on every console-script invocation (including the ops CLI,
-# which never touches MCP). The warning is upstream noise — suppress it so a
-# fresh install doesn't print a scary traceback-shaped message.
-try:
-    from pydantic_settings.exceptions import IncompleteFieldDefinitionWarning as _IncompleteFieldWarning
+# NOTE: `mcp.server.fastmcp` costs ~1s to import and is needed only by the MCP
+# stdio server, never by the human CLI (`vanth list/logs/start/...` routes
+# through this same module via `server.main`). It is therefore loaded lazily
+# via `_LazyMCP` below: tool functions are recorded with `@_deferred_tool` at
+# import time (cheap) and replayed onto the real FastMCP on first MCP use.
+# (Previously every CLI invocation paid the import via a top-level
+# `from mcp.server.fastmcp import FastMCP`.)
+_PENDING_MCP_TOOLS: list[tuple[tuple, dict, Callable]] = []
 
-    warnings.filterwarnings("ignore", category=_IncompleteFieldWarning)
-except Exception:
-    pass
 
-from mcp.server.fastmcp import FastMCP
+def _deferred_tool(*dargs: Any, **dkwargs: Any) -> Callable:
+    """Record an MCP tool registration without importing FastMCP.
+
+    Returns an identity decorator; the real `mcp.tool(*a, **k)(fn)` call is
+    replayed when the lazy MCP server materializes.
+    """
+
+    def deco(fn: Callable) -> Callable:
+        _PENDING_MCP_TOOLS.append((dargs, dkwargs, fn))
+        return fn
+
+    return deco
+
+
+_MCP_LOCK = threading.Lock()
+
+
+class _LazyMCP:
+    """Lazily-materialized FastMCP server (`server.mcp` stays importable)."""
+
+    def _real_mcp(self) -> Any:
+        real = self.__dict__.get("_real")
+        if real is None:
+            with _MCP_LOCK:
+                real = self.__dict__.get("_real")
+                if real is not None:
+                    return real
+                # mcp's FastMCP has a Settings model with a `lifespan` field
+                # whose annotation contains an unresolved forward reference;
+                # pydantic-settings >=2.15 warns about it on import. The warning
+                # is upstream noise — suppress it (previously done at import).
+                try:
+                    from pydantic_settings.exceptions import (
+                        IncompleteFieldDefinitionWarning as _IncompleteFieldWarning,
+                    )
+
+                    warnings.filterwarnings("ignore", category=_IncompleteFieldWarning)
+                except Exception:
+                    pass
+                from mcp.server.fastmcp import FastMCP
+
+                real = FastMCP("vanth")
+                for args, kwargs, fn in _PENDING_MCP_TOOLS:
+                    real.tool(*args, **kwargs)(fn)
+                self.__dict__["_real"] = real
+        return real
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real_mcp(), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._real_mcp(), name, value)
+
 
 from .client import VanthClient
 from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
@@ -47,6 +97,7 @@ from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .outbound import OutboundDenied, check_outbound_url
 from .paths import canonical_home
 from .probes import evaluate_probe, validate_probe
+from .process_watch import windows_pid_alive
 from .runtime_info import capture_run_metadata, serialize_run_metadata
 from .schedules import compute_next_fire, next_cron_fires, validate_schedule_spec, validate_timezone
 
@@ -617,6 +668,19 @@ def validate_limit(value: int, name: str, maximum: int = 1000) -> int:
     return value
 
 
+def _orphan_cache_ttl() -> float:
+    """Cache TTL for the orphaned-MCP process-table scan (seconds).
+
+    The Windows WMI scan costs ~700ms and `doctor()` is a hot path
+    (`/ready` health checks, `vanth status`). Orphaned servers are an
+    advisory hygiene signal, so a cached value is fine; `0` disables.
+    """
+    try:
+        return max(0.0, float(os.environ.get("VANTH_ORPHAN_CACHE_SECONDS", "60")))
+    except ValueError:
+        return 60.0
+
+
 class JobManager:
     def __init__(self, home: str | Path | None = None, *, recover: bool = True) -> None:
         self.home = canonical_home(home)
@@ -694,6 +758,9 @@ class JobManager:
         self._started_monotonic = time.monotonic()
         self._last_delivery_expiry = 0.0
         self._last_wal_checkpoint = 0.0
+        self._orphan_cache_at = 0.0
+        self._orphan_cache: list[dict[str, Any]] = []
+        self._bin_cache: dict[str, tuple[float, bool]] = {}
         # Operator alerts: edge-triggered condition state + throttle (review B3).
         self._alert_state: dict[str, bool] = {}
         self._last_alert_check: float | None = None
@@ -718,6 +785,12 @@ class JobManager:
             return False
         try:
             if sys.platform == "win32":
+                # Handle query (µs) first: a full tasklist enumeration (~240ms)
+                # in _terminate_pid's 50ms poll loop made every stop pay seconds
+                # of child-process spam before detecting death.
+                fast = windows_pid_alive(pid)
+                if fast is not None:
+                    return fast
                 result = subprocess.run(
                     ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
                     stdout=subprocess.PIPE,
@@ -943,18 +1016,36 @@ class JobManager:
                 time.sleep(0.02 * (attempt + 1))
         raise RuntimeError("unreachable")  # pragma: no cover
 
+    def _slow_pass_every(self) -> int:
+        """Maintenance passes between slow-path sweeps (fast path runs every pass).
+
+        The 0.2s loop previously ran all 9 subroutines 5x/s (~dozens of
+        queries/s idle, contending with runner event ingestion during bursts).
+        Wake delivery, dead-runner detection, and queued launches stay fast;
+        minute-scale semantics (schedules, policies, cleanup, decisions,
+        launch-claim grace) move to every Nth pass (default 10 ~= 2s).
+        """
+        try:
+            return max(1, int(os.environ.get("VANTH_SLOW_PASS_EVERY", "10")))
+        except ValueError:
+            return 10
+
     def _dispatch_loop(self) -> None:
+        slow_every = self._slow_pass_every()
+        ticks = 0
         while not self.dispatcher_stop.wait(float(os.environ.get("VANTH_DELIVERY_POLL_INTERVAL", "0.2"))):
             try:
+                ticks += 1
                 self._dispatch_due_deliveries()
                 self._reconcile_running_jobs()
-                self._recover_stale_launch_claims()
-                self._fire_due_schedules()
                 self._dispatch_queued_jobs()
-                self._watch_policies()
-                self._maybe_auto_cleanup()
-                self._expire_decisions()
-                self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
+                if ticks % slow_every == 0:
+                    self._recover_stale_launch_claims()
+                    self._fire_due_schedules()
+                    self._watch_policies()
+                    self._maybe_auto_cleanup()
+                    self._expire_decisions()
+                    self.relay_expire_stale(stale_after_seconds=int(os.environ.get("VANTH_RELAY_SUBSCRIPTION_TTL", "300")))
                 # Sweep at most once a minute: the UPDATE takes the write lock, so
                 # running it on every 0.2s pass would add needless contention.
                 delivery_ttl = self._delivery_ttl_seconds()
@@ -5252,10 +5343,13 @@ class JobManager:
                 )
                 if since_row is not None:
                     since_seq = int(since_row["seq"])
+            # One status read per iteration: the old code re-queried it per
+            # candidate (up to 3x per 100ms per waiter) plus once on timeout.
+            current_status = self.status(job_id)["status"]
             if events:
                 candidates.append((
                     int(events[0].get("seq") or 0),
-                    {"result": "event", "job_id": job_id, "status": self.status(job_id)["status"], "event": events[0]},
+                    {"result": "event", "job_id": job_id, "status": current_status, "event": events[0]},
                 ))
             if metric_ge:
                 try:
@@ -5270,7 +5364,7 @@ class JobManager:
                             {
                                 "result": "metric",
                                 "job_id": job_id,
-                                "status": self.status(job_id)["status"],
+                                "status": current_status,
                                 "metric": metric,
                                 "threshold": threshold,
                                 "value": value,
@@ -5291,7 +5385,7 @@ class JobManager:
                             "result": "progress",
                             "job_id": job_id,
                             "event": progress[0],
-                            "status": self.status(job_id)["status"],
+                            "status": current_status,
                             "progress": progress[0].get("data"),
                         },
                     ))
@@ -5300,11 +5394,11 @@ class JobManager:
                 return candidates[0][1]
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                return {"result": "timeout", "job_id": job_id, "status": self.status(job_id)["status"], "message": "No matching event before timeout"}
+                return {"result": "timeout", "job_id": job_id, "status": current_status, "message": "No matching event before timeout"}
             with self._condition(job_id):
                 if not self._condition(job_id).wait(timeout=min(0.1, remaining)):
                     if remaining <= 0:
-                        return {"result": "timeout", "job_id": job_id, "status": self.status(job_id)["status"], "message": "No matching event before timeout"}
+                        return {"result": "timeout", "job_id": job_id, "status": current_status, "message": "No matching event before timeout"}
                     continue
                 else:
                     continue
@@ -6355,6 +6449,11 @@ class JobManager:
                 reaped.append(pid)
             except Exception as exc:
                 failed.append({"pid": pid, "error": str(exc)})
+        # The process table changed: drop the advisory cache so the next
+        # `doctor` reflects the reap instead of reporting dead PIDs for up to
+        # the cache TTL.
+        self._orphan_cache_at = 0.0
+        self._orphan_cache = []
         return {"reaped": reaped, "failed": failed, "orphan_count": len(orphans)}
 
     def metrics_text(self) -> str:
@@ -6507,6 +6606,50 @@ class JobManager:
                 connection.close()
         return report
 
+    def ready_fast(self) -> dict[str, Any]:
+        """Cheap readiness probe for per-command `ensure()` (no WMI/quick_check).
+
+        Returns just enough to validate the daemon belongs to this home and
+        schema (`_ready()` previously paid a full ~700ms `/doctor` with a
+        Windows process-table scan on EVERY CLI invocation).
+        """
+        self._ensure_open()
+        with self.db_lock:
+            schema_version = int(self.db.execute("PRAGMA user_version").fetchone()[0])
+        return {"result": "ok", "home": str(self.home), "schema_version": schema_version}
+
+    def _bin_cache_ttl(self) -> float:
+        try:
+            return max(0.0, float(os.environ.get("VANTH_BIN_CACHE_SECONDS", "300")))
+        except ValueError:
+            return 300.0
+
+    def _cached_bin_available(self, key: str, check: Callable[[], bool]) -> bool:
+        """Cached agent-binary availability probe (PATH search ~8ms x2 per doctor).
+
+        `check` keeps each call site's exact resolution semantics; only the
+        boolean is cached. Safe: dispatch re-resolves the binary at every
+        actual use (`_command_argv`), so a stale entry only affects the
+        advisory warning.
+        """
+        now = time.monotonic()
+        ttl = self._bin_cache_ttl()
+        cached = self._bin_cache.get(key)
+        if ttl > 0 and cached is not None and (now - cached[0]) < ttl:
+            return cached[1]
+        available = bool(check())
+        self._bin_cache[key] = (now, available)
+        return available
+
+    def _cached_orphaned_mcp_servers(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if _orphan_cache_ttl() > 0 and (now - self._orphan_cache_at) < _orphan_cache_ttl():
+            return self._orphan_cache
+        result = _orphaned_mcp_servers()
+        self._orphan_cache = result
+        self._orphan_cache_at = now
+        return result
+
     def doctor(self, verify_artifacts: bool = False) -> dict[str, Any]:
         self._ensure_open()
         tables = {
@@ -6581,14 +6724,20 @@ class JobManager:
         if missing:
             warnings.append({"type": "missing_tables", "tables": missing})
         codex_bin = os.environ.get("VANTH_CODEX_BIN") or (r"C:\codex\codex.exe" if sys.platform == "win32" else "codex")
-        codex_available = bool(Path(codex_bin).exists() if ("\\" in codex_bin or "/" in codex_bin) else shutil.which(codex_bin))
+        codex_available = self._cached_bin_available(
+            f"codex:{codex_bin}",
+            lambda: Path(codex_bin).exists() if ("\\" in codex_bin or "/" in codex_bin) else shutil.which(codex_bin),
+        )
         if not codex_available:
             warnings.append({"type": "codex_unavailable", "command": codex_bin})
         opencode_bin = os.environ.get("VANTH_OPENCODE_BIN", "opencode")
-        opencode_available = bool(shutil.which(opencode_bin) or Path(opencode_bin).exists())
+        opencode_available = self._cached_bin_available(
+            f"opencode:{opencode_bin}",
+            lambda: shutil.which(opencode_bin) or Path(opencode_bin).exists(),
+        )
         if not opencode_available:
             warnings.append({"type": "opencode_unavailable", "command": opencode_bin})
-        orphaned_mcp = _orphaned_mcp_servers()
+        orphaned_mcp = self._cached_orphaned_mcp_servers()
         if orphaned_mcp:
             warnings.append(
                 {
@@ -7586,7 +7735,7 @@ def _normalize_decision_options(options: list[str] | None) -> list[str]:
 
 
 client: VanthClient | None = None
-mcp = FastMCP("vanth")
+mcp = _LazyMCP()
 
 
 _client_lock = threading.Lock()
@@ -7609,7 +7758,7 @@ def tool_error(message: str) -> dict[str, Any]:
     return {"result": "error", "error": message}
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_start(
     command: str,
     cwd: str | None = None,
@@ -7772,7 +7921,7 @@ def job_start(
     return client.confirm_local_start(started) if not remote_id and not dry_run else started
 
 
-@mcp.tool()
+@_deferred_tool()
 async def job_start_and_wait(command: str, cwd: str | None = None, name: str | None = None,
                              env: dict[str, str] | None = None, timeout_seconds: int | None = None,
                              wait_timeout_seconds: int = 20, tags: list[str] | None = None,
@@ -7807,7 +7956,7 @@ async def job_start_and_wait(command: str, cwd: str | None = None, name: str | N
     return {"job_id": job_id, "status": summary["status"], "wait": waited, "summary": summary}
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | None = None,
               timeout_seconds: int | None = None, name: str | None = None, tags: list[str] | None = None,
               notes: str | None = None, cwd: str | None = None, interactive: bool | None = None,
@@ -7837,25 +7986,25 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
     return client.confirm_local_start(started) if not remote_id else started
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_status_batch(job_ids: list[str], limit: int = 500) -> dict[str, Any]:
     """Core: Get status for several job IDs in one call; use when tracking a batch of jobs."""
     return get_client().get("/status/batch", {"job_ids": ",".join(job_ids), "limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_status(job_id: str, remote_id: str | None = None) -> dict[str, Any]:
     """Core: Check one job's current state and summary; pass ``remote_id`` for a paired host."""
     return get_client().get(f"/jobs/{job_id}/status", {"remote_id": remote_id})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_send(job_id: str, input: str, eof: bool = False) -> dict[str, Any]:
     """Core: Send stdin to an interactive job; set ``eof=True`` when input is complete."""
     return get_client().post(f"/jobs/{job_id}/send", {"input": input, "eof": eof})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_request_decision(
     job_id: str,
     prompt: str,
@@ -7879,19 +8028,19 @@ def job_request_decision(
     return get_client().post(f"/jobs/{job_id}/decision", payload)
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_resolve(job_id: str, token: str, choice: str) -> dict[str, Any]:
     """Answer a pending decision with one of its ``options`` (see job_request_decision)."""
     return get_client().post(f"/jobs/{job_id}/decision/{token}/resolve", {"choice": choice})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_withdraw_decision(job_id: str, token: str) -> dict[str, Any]:
     """Withdraw a pending decision that no longer needs an answer."""
     return get_client().post(f"/jobs/{job_id}/decision/{token}/withdraw")
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_decisions(job_id: str | None = None, status: str | None = None, limit: int = 50) -> dict[str, Any]:
     """List decisions (newest first), optionally filtered by job and/or status.
 
@@ -7900,7 +8049,7 @@ def job_decisions(job_id: str | None = None, status: str | None = None, limit: i
     return get_client().get("/decisions", {"job_id": job_id, "status": status, "limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_list(status: list[str] | None = None, limit: int = 50, thread_id: str | None = None,
              name: str | None = None, tags: list[str] | None = None,
              remote_id: str | None = None) -> dict[str, Any]:
@@ -7926,7 +8075,7 @@ def job_list(status: list[str] | None = None, limit: int = 50, thread_id: str | 
     return get_client().get("/jobs", {"status": status, "limit": limit, "thread_id": thread_id, "name": name, "tags": tags})
 
 
-@mcp.tool()
+@_deferred_tool()
 def remote_list() -> dict[str, Any]:
     """List paired remote execution hosts.
 
@@ -7938,50 +8087,50 @@ def remote_list() -> dict[str, Any]:
     return get_client().get("/remotes")
 
 
-@mcp.tool()
+@_deferred_tool()
 def remote_doctor(remote_id: str | None = None) -> dict[str, Any]:
     """Report SSH availability and remote state; omit ``remote_id`` for all hosts."""
     return get_client().get("/remotes/doctor", {"remote_id": remote_id})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_view(thread_id: str | None = None, limit: int = 50) -> dict[str, Any]:
     """Core: Show recent jobs, optionally scoped to a thread; use to rediscover job IDs."""
     return get_client().get("/view", {"thread_id": thread_id, "limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_events(job_id: str, since_event_id: str | None = None, types: list[str] | None = None, limit: int = 20,
                reverse: bool = False) -> dict[str, Any]:
     """Core: Read a job's structured event history; pass ``since_event_id`` to continue from a prior result."""
     return get_client().get(f"/jobs/{job_id}/events", {"since_event_id": since_event_id, "types": types, "limit": limit, "reverse": reverse})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_deliveries(job_id: str | None = None, status: str | None = None, limit: int = 20) -> dict[str, Any]:
     """Core: Inspect wake notification deliveries; filter by job or status when diagnosing a missed wake."""
     return get_client().get("/deliveries", {"job_id": job_id, "status": status, "limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_mark_delivery(delivery_id: str, status: str, error: str | None = None) -> dict[str, Any]:
     """Advanced: Record a delivery outcome manually; use after external delivery handling or to stop retries."""
     return get_client().post(f"/deliveries/{delivery_id}/mark", {"status": status, "error": error})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_retry_delivery(delivery_id: str) -> dict[str, Any]:
     """Core: Retry a failed or retrying wake delivery; inspect ``job_delivery_attempts`` if it fails again."""
     return get_client().post(f"/deliveries/{delivery_id}/retry")
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_delivery_attempts(delivery_id: str, limit: int = 20) -> dict[str, Any]:
     """Core: Inspect attempt history for one wake delivery to find why it was not delivered."""
     return get_client().get(f"/deliveries/{delivery_id}/attempts", {"limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_clear_deliveries(
     job_id: str | None = None,
     status: str | None = None,
@@ -8056,7 +8205,7 @@ def _job_wait_blocking(client: VanthClient, job_id: str, filters: list[str], sin
     )
 
 
-@mcp.tool()
+@_deferred_tool()
 async def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, offset: int | None = None,
                    follow: bool = False, timeout_seconds: float = 5.0, grep: str | None = None,
                    remote_id: str | None = None) -> dict[str, Any]:
@@ -8101,7 +8250,7 @@ async def job_tail(job_id: str, stream: str = "stdout", max_bytes: int = 8192, o
     )
 
 
-@mcp.tool()
+@_deferred_tool()
 async def job_wait(
     job_id: str,
     filters: list[str],
@@ -8157,7 +8306,7 @@ async def job_wait(
     return result
 
 
-@mcp.tool()
+@_deferred_tool()
 async def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: int = 10,
                    reason: str | None = None,
                    remote_id: str | None = None, idempotency_key: str | None = None) -> dict[str, Any]:
@@ -8194,31 +8343,31 @@ async def job_stop(job_id: str, signal: str = "terminate", kill_after_seconds: i
         }
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_pause(job_id: str) -> dict[str, Any]:
     """Hold a queued job so the dispatcher will not launch it (pool/trigger)."""
     return get_client().post(f"/jobs/{job_id}/pause", {})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_resume(job_id: str) -> dict[str, Any]:
     """Release a paused queued job back to the dispatcher."""
     return get_client().post(f"/jobs/{job_id}/resume", {})
 
 
-@mcp.tool()
+@_deferred_tool()
 def pool_configure(pool: str, max_parallel: int = 0, paused: bool | None = None) -> dict[str, Any]:
     """Create/update a concurrency pool. ``max_parallel`` 0 = unlimited."""
     return get_client().post("/pools", {"pool": pool, "max_parallel": max_parallel, "paused": paused})
 
 
-@mcp.tool()
+@_deferred_tool()
 def pool_list() -> dict[str, Any]:
     """List concurrency pools with queued/running counts."""
     return get_client().get("/pools")
 
 
-@mcp.tool()
+@_deferred_tool()
 def schedule_create(command: str, cron: str | None = None, interval_seconds: int | None = None,
                     name: str | None = None, timezone_name: str = "UTC", cwd: str | None = None,
                     env: dict[str, str] | None = None, timeout_seconds: int | None = None,
@@ -8238,51 +8387,51 @@ def schedule_create(command: str, cron: str | None = None, interval_seconds: int
     })
 
 
-@mcp.tool()
+@_deferred_tool()
 def schedule_list() -> dict[str, Any]:
     """List all schedules."""
     return get_client().get("/schedules")
 
 
-@mcp.tool()
+@_deferred_tool()
 def schedule_update(schedule_id: str, changes: dict[str, Any]) -> dict[str, Any]:
     """Edit a schedule in place (name/cron/interval_seconds/timezone/command/
     cwd/env/timeout_seconds/tags/notes/secret_env/overlap/enabled)."""
     return get_client().post(f"/schedules/{schedule_id}/update", changes)
 
 
-@mcp.tool()
+@_deferred_tool()
 def schedule_delete(schedule_id: str) -> dict[str, Any]:
     """Delete a schedule (already-created jobs are unaffected)."""
     return get_client().post(f"/schedules/{schedule_id}/delete", {})
 
 
-@mcp.tool()
+@_deferred_tool()
 def schedule_next(schedule_id: str, count: int = 5) -> dict[str, Any]:
     """Preview the next ``count`` fire times for a schedule."""
     return get_client().get(f"/schedules/{schedule_id}/next", {"count": count})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_doctor(verify_artifacts: bool = False) -> dict[str, Any]:
     """Core: Check daemon and job-store health; use when Vanth tools fail or report inconsistent state."""
     return get_client().get("/doctor", {"verify_artifacts": verify_artifacts})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_cleanup(older_than_seconds: int, dry_run: bool = True) -> dict[str, Any]:
     """Advanced: Preview or delete terminal jobs older than the given age; inspect the dry run before deleting."""
     return get_client().post("/cleanup", {"older_than_seconds": older_than_seconds, "dry_run": dry_run})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_metrics_query(job_id: str, metric: str | None = None, from_ms: int | None = None,
                       to_ms: int | None = None, limit: int = 1000) -> dict[str, Any]:
     """Return stored scalar metric series for a job (loss, accuracy, progress.percent, ...)."""
     return get_client().get(f"/jobs/{job_id}/metrics", {"metric": metric, "from_ms": from_ms, "to_ms": to_ms, "limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_metric_compare(job_ids: list[str], metric: str, aggregation: str = "latest",
                        from_ms: int | None = None, to_ms: int | None = None) -> dict[str, Any]:
     """Compare one metric across jobs (e.g. val_loss across training runs)."""
@@ -8290,7 +8439,7 @@ def job_metric_compare(job_ids: list[str], metric: str, aggregation: str = "late
                                                  "from_ms": from_ms, "to_ms": to_ms})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_duration_stats(name: str | None = None, tags: list[str] | None = None, limit: int = 20,
                        runs_per_group: int = 200, since_ms: int | None = None, slowest: int = 10) -> dict[str, Any]:
     """Duration, queue-time, and flakiness analytics grouped by logical job.
@@ -8307,7 +8456,7 @@ def job_duration_stats(name: str | None = None, tags: list[str] | None = None, l
     })
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_run_summary(job_id: str, include_stderr_excerpt: bool = False,
                     include_stdout_excerpt: bool = False) -> dict[str, Any]:
     """One-call summary with optional bounded stderr (2 KiB) and stdout (8 KiB)."""
@@ -8317,7 +8466,7 @@ def job_run_summary(job_id: str, include_stderr_excerpt: bool = False,
     })
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_diff(base_job_id: str, other_job_id: str) -> dict[str, Any]:
     """Diff the run specs of two jobs (command, env, cwd, timeout, tags, wake targets).
 
@@ -8328,7 +8477,7 @@ def job_diff(base_job_id: str, other_job_id: str) -> dict[str, Any]:
     return get_client().get(f"/jobs/{base_job_id}/diff", {"other": other_job_id})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_artifact_add(job_id: str, name: str, uri: str, kind: str | None = None,
                      size_bytes: int | None = None, sha256: str | None = None,
                      meta: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -8337,31 +8486,31 @@ def job_artifact_add(job_id: str, name: str, uri: str, kind: str | None = None,
                                                            "size_bytes": size_bytes, "sha256": sha256, "meta": meta})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_artifacts(job_id: str, limit: int = 50) -> dict[str, Any]:
     """List artifacts attached to a job."""
     return get_client().get(f"/jobs/{job_id}/artifacts", {"limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_dashboard(job_ids: list[str] | None = None, limit: int = 5000) -> dict[str, Any]:
     """Chart-data view (downsampled series per job + job list) for any chart renderer."""
     return get_client().get("/dashboard", {"job_ids": job_ids, "limit": limit})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_metric_ingest(job_id: str, metrics: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
     """Record scalar metric points for a job (loss, accuracy, ...) programmatically."""
     return get_client().post(f"/jobs/{job_id}/metrics", {"metrics": metrics, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_artifact_read(artifact_id: str, max_bytes: int = 262144) -> dict[str, Any]:
     """Fetch the content of an artifact (base64-encoded) for direct consumption."""
     return get_client().get(f"/artifacts/{artifact_id}/content", {"max_bytes": max_bytes})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_put(path: str, name: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Publish a local file into the managed artifact store as an immutable version.
 
@@ -8371,7 +8520,7 @@ def artifact_put(path: str, name: str, idempotency_key: str | None = None) -> di
     return get_client().post("/artifacts/put", {"path": path, "name": name, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_put_dir(source_path: str, name: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Publish a local directory tree into the managed artifact store as an immutable v1 version.
 
@@ -8382,51 +8531,51 @@ def artifact_put_dir(source_path: str, name: str, idempotency_key: str | None = 
                              {"source_path": source_path, "name": name, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_resolve(name: str, alias: str | None = None, version_id: str | None = None) -> dict[str, Any]:
     """Resolve a root (latest), alias pin, or explicit version to one immutable version."""
     return get_client().get("/artifacts/resolve", {"name": name, "alias": alias, "version_id": version_id})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_info(version_id: str) -> dict[str, Any]:
     """Manifest plus blob existence and verification flag for one artifact version."""
     return get_client().get(f"/artifacts/info/{version_id}")
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_materialize(version_id: str, dest_path: str, overwrite: bool = False) -> dict[str, Any]:
     """Write an artifact version's content to dest_path atomically (existing destinations fail unless overwrite)."""
     return get_client().post("/artifacts/materialize",
                              {"version_id": version_id, "dest_path": dest_path, "overwrite": overwrite})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_verify(version_id: str) -> dict[str, Any]:
     """Re-hash the stored content of an artifact version and report ok/expected/actual."""
     return get_client().post("/artifacts/verify", {"version_id": version_id})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_collection_create(name: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Create a named artifact collection for monotonic immutable version lists."""
     return get_client().post("/artifacts/collections", {"name": name, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_collection_append(collection: str, version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Append an immutable version to a collection with a monotonic ordinal (duplicate append is a no-op)."""
     return get_client().post("/artifacts/collections/append",
                              {"collection": collection, "version_id": version_id, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_collection_get(name: str) -> dict[str, Any]:
     """Get a collection's ordered versions (by monotonic ordinal)."""
     return get_client().get(f"/artifacts/collections/{name}")
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_alias_set(alias_name: str, root_id: str, new_version_id: str,
                        expected_version_id: str | None = None, updated_by: str | None = None,
                        idempotency_key: str | None = None) -> dict[str, Any]:
@@ -8441,7 +8590,7 @@ def artifact_alias_set(alias_name: str, root_id: str, new_version_id: str,
                               "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_link_lineage(producer_kind: str, producer_id: str, consumer_kind: str, consumer_id: str,
                           version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Link a producer/consumer identity ('job'|'remote_job'|'version'|'alias') to one immutable version."""
@@ -8451,83 +8600,83 @@ def artifact_link_lineage(producer_kind: str, producer_id: str, consumer_kind: s
                               "version_id": version_id, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_lineage_for(version_id: str) -> dict[str, Any]:
     """List all lineage links recorded against one immutable version."""
     return get_client().get(f"/artifacts/lineage/{version_id}")
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_delete_request(version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Logically delete an artifact version (content stays until GC reclaims it); rejects aliased versions."""
     return get_client().post("/artifacts/delete-request",
                              {"version_id": version_id, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_restore(version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Clear a pending delete request on an artifact version."""
     return get_client().post("/artifacts/restore-version",
                              {"version_id": version_id, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_pin(version_id: str, hold_reason: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Pin/hold an artifact version so GC can never reclaim it."""
     return get_client().post("/artifacts/pin", {"version_id": version_id, "hold_reason": hold_reason,
                                                 "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_unpin(version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Remove a pin/hold from an artifact version."""
     return get_client().post("/artifacts/unpin", {"version_id": version_id,
                                                   "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_gc(dry_run: bool = True, idempotency_key: str | None = None) -> dict[str, Any]:
     """Fenced garbage collection of unreachable versions/blobs; dry_run=True only reports candidates."""
     return get_client().post("/artifacts/gc", {"dry_run": dry_run, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_backup() -> dict[str, Any]:
     """Take a manual sqlite backup of the artifacts catalog."""
     return get_client().post("/artifacts/backup", {})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_begin_restore(backup_path: str) -> dict[str, Any]:
     """Restore the artifacts catalog from a backup copy; rotates instance identity and locks mutations until complete-restore."""
     return get_client().post("/artifacts/begin-restore", {"backup_path": backup_path})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_complete_restore() -> dict[str, Any]:
     """Clear the recovery_required marker after a restore so mutations are allowed again."""
     return get_client().post("/artifacts/complete-restore", {})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_storage_profile_create(kind: str = "s3", config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Register a storage profile (immutable revisions; creates revision 1)."""
     return get_client().post("/artifacts/storage-profiles", {"kind": kind, "config": config})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_storage_profile_get(profile_id: str) -> dict[str, Any]:
     """Get the latest revision of a storage profile (config + capabilities)."""
     return get_client().get(f"/artifacts/storage-profiles/{profile_id}")
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_storage_profile_probe(profile_id: str) -> dict[str, Any]:
     """Probe a storage profile's endpoint capabilities and store them on the latest revision."""
     return get_client().post(f"/artifacts/storage-profiles/{profile_id}/probe", {})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_storage_profile_update(profile_id: str, config: dict[str, Any],
                                     idempotency_key: str | None = None) -> dict[str, Any]:
     """Insert the NEXT immutable revision of a storage profile; old revisions stay queryable."""
@@ -8535,7 +8684,7 @@ def artifact_storage_profile_update(profile_id: str, config: dict[str, Any],
                              {"config": config, "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_push_remote(remote_id: str, version_id: str, idempotency_key: str | None = None) -> dict[str, Any]:
     """Publish a local managed artifact version to a paired remote (chunked, resumable; no credentials cross the wire)."""
     return get_client().post("/artifacts/push-remote",
@@ -8543,7 +8692,7 @@ def artifact_push_remote(remote_id: str, version_id: str, idempotency_key: str |
                               "idempotency_key": idempotency_key})
 
 
-@mcp.tool()
+@_deferred_tool()
 def artifact_pull_remote(remote_id: str, version_id: str, dest_path: str,
                          idempotency_key: str | None = None) -> dict[str, Any]:
     """Materialize a remote artifact version onto this machine via the controller broker (chunked, resumable)."""
@@ -8683,7 +8832,7 @@ def _mcp_origin_thread_id() -> str | None:
     return os.environ.get("CODEX_THREAD_ID") or os.environ.get("VANTH_CODEX_DESKTOP_THREAD")
 
 
-@mcp.tool(name="job_add_wake_target")
+@_deferred_tool(name="job_add_wake_target")
 def mcp_job_add_wake_target(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -8725,7 +8874,7 @@ def mcp_job_add_wake_target(
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
-@mcp.tool(name="job_wake_now")
+@_deferred_tool(name="job_wake_now")
 def mcp_job_wake_now(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -8762,7 +8911,7 @@ def mcp_job_wake_now(
     return get_client().post(f"/jobs/{job_id}/wake-now", {"target": resolved})
 
 
-@mcp.tool(name="daemon_wake")
+@_deferred_tool(name="daemon_wake")
 def mcp_daemon_wake(
     job_id: str,
     target: dict[str, Any] | None = None,
@@ -8789,7 +8938,7 @@ def mcp_daemon_wake(
     return get_client().post(f"/jobs/{job_id}/wake", {"target": resolved})
 
 
-@mcp.tool()
+@_deferred_tool()
 def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
     """Dry-run preview of what job_cleanup would remove, without deleting anything."""
     return get_client().get("/cleanup/preview", {"older_than_seconds": older_than_seconds})

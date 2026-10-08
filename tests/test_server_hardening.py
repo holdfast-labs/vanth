@@ -424,6 +424,15 @@ def test_job_start_mcp_tool_is_not_a_coroutine_function():
     assert inspect.iscoroutinefunction(tool.fn) is False
 
 
+def test_deferred_tool_replay_keeps_renamed_tools():
+    """`@_deferred_tool(name=...)` must replay exactly like `@mcp.tool(name=...)`."""
+    from vanth.server import mcp
+
+    tools = mcp._tool_manager._tools
+    for name in ("job_add_wake_target", "job_wake_now", "daemon_wake"):
+        assert name in tools, name
+
+
 def test_launch_claim_clears_stale_workload_pid(tmp_path):
     """A re-claim must not carry the previous run's workload pid.
 

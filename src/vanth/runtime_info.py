@@ -188,6 +188,18 @@ def _git(cwd: str | None, *args: str) -> str | None:
     return result.stdout.strip() or None
 
 
+def _in_git_repo(cwd: str) -> bool:
+    """Whether ``cwd`` sits inside a git working tree (no subprocess)."""
+    current = os.path.realpath(cwd)
+    while True:
+        if os.path.lexists(os.path.join(current, ".git")):
+            return True
+        parent = os.path.dirname(current)
+        if parent == current:
+            return False
+        current = parent
+
+
 def _git_state(cwd: str | None) -> dict[str, str] | None:
     """Return git repo/branch/commit for a directory, cached per cwd."""
     if not cwd:
@@ -197,6 +209,11 @@ def _git_state(cwd: str | None) -> dict[str, str] | None:
         if cached is None:
             return None
         return dict(cached)
+    if not _in_git_repo(cwd):
+        # Skip 3 git spawns (~200ms on Windows) for directories that cannot
+        # be in a repo; the negative result is cached like everything else.
+        _git_cache[cwd] = None
+        return None
     repo = _git(cwd, "remote", "get-url", "origin")
     branch = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
     commit = _git(cwd, "rev-parse", "HEAD")

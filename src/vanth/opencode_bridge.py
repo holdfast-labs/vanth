@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -48,6 +49,20 @@ def _command_argv(command: Any) -> list[str]:
     return ["opencode"]
 
 
+# Probe results keyed (session_id, directory, command): `session list` costs a
+# full subprocess (~100ms+) per wake delivery and stalls one of 4 delivery
+# threads. Sessions die rarely; a brief cache is safe (a miss only wastes one
+# turn, exactly like skip_probe; ids are never reused).
+_session_probe_cache: dict[tuple, tuple[float, bool | None]] = {}
+
+
+def _session_probe_ttl() -> float:
+    try:
+        return max(0.0, float(os.environ.get("VANTH_SESSION_PROBE_TTL_SECONDS", "60")))
+    except ValueError:
+        return 60.0
+
+
 def _session_exists(session_id: str, opencode_command: Any, timeout_seconds: float = 5, directory: str | None = None) -> bool | None:
     """Probe whether an opencode session id is still live.
 
@@ -62,7 +77,16 @@ def _session_exists(session_id: str, opencode_command: Any, timeout_seconds: flo
     only ``--max-count``/``--format`` (not ``--dir``), so the working directory
     is passed to the subprocess via ``cwd=`` rather than an unsupported flag
     (review P0-3).
+
+    Conclusive answers are cached briefly (see ``_session_probe_ttl``); only
+    ambiguity (None) is never cached, so a transient failure always retries.
     """
+    key = (session_id, directory or "", str(opencode_command))
+    ttl = _session_probe_ttl()
+    if ttl > 0 and key in _session_probe_cache:
+        at, cached = _session_probe_cache[key]
+        if time.monotonic() - at < ttl:
+            return cached
     argv = _command_argv(opencode_command) + ["session", "list", "--format", "json"]
     try:
         result = subprocess.run(
@@ -84,8 +108,17 @@ def _session_exists(session_id: str, opencode_command: Any, timeout_seconds: flo
         return None
     for item in sessions:
         if isinstance(item, dict) and item.get("id") == session_id:
-            return True
-    return False
+            found: bool | None = True
+            break
+    else:
+        found = False
+    if ttl > 0:
+        # Bound the cache: distinct session ids are otherwise unbounded over a
+        # months-long daemon lifetime (each entry is tiny, but never evicted).
+        if len(_session_probe_cache) >= 1000:
+            _session_probe_cache.pop(next(iter(_session_probe_cache)))
+        _session_probe_cache[key] = (time.monotonic(), found)
+    return found
 
 
 def send_message_to_session(

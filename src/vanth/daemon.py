@@ -803,6 +803,8 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/ready":
                 report = get_manager().doctor()
                 ok(self, report, 200 if report["ok"] else 503)
+            elif parsed.path == "/ready-fast":
+                ok(self, get_manager().ready_fast())
             elif parsed.path == "/doctor":
                 ok(self, get_manager().doctor(
                     query.get("verify_artifacts", ["false"])[0].lower() in {"1", "true", "yes"}

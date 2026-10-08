@@ -99,7 +99,17 @@ class VanthClient:
             return None
 
     def _ready(self) -> bool:
-        payload = self.get("/doctor")
+        # Prefer the cheap `/ready-fast` probe (home + schema only, ~10ms);
+        # fall back to full `/doctor` for pre-1.14.1 daemons without the route.
+        try:
+            payload: dict = self.get("/ready-fast")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("result") == "error" or payload.get("schema_version") is None:
+            try:
+                payload = self.get("/doctor")
+            except Exception:
+                return False
         return (
             isinstance(payload, dict)
             and payload.get("result") != "error"

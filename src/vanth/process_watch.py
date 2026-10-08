@@ -48,6 +48,58 @@ _MIN_IDLE = 10
 
 _NULL_PIDS = {0, 1}
 
+# Least privilege that still opens virtually any same-user process, plus the
+# SYNCHRONIZE right the zero-timeout wait needs (a query-only handle makes
+# WaitForSingleObject fail with WAIT_FAILED instead of reporting liveness).
+_PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_SYNCHRONIZE = 0x100000
+# WaitForSingleObject outcomes for a zero-timeout liveness probe.
+_WAIT_OBJECT_0 = 0
+_WAIT_TIMEOUT = 258
+
+
+def windows_pid_alive(pid: int) -> bool | None:
+    """Fast liveness check via OpenProcess (no child-process spawn).
+
+    A ``tasklist`` enumeration costs ~240ms per call and is used in tight
+    poll loops (stop grace, heartbeat reconciliation, watchdog); a handle
+    query costs microseconds. Liveness comes from ``WaitForSingleObject``
+    (a signaled process handle means exited) — never from comparing the
+    exit code, since 259 means both STILL_ACTIVE and a real exit code.
+    Returns None when uncertain so the caller can fall back to ``tasklist``
+    and keep its existing failure contract.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid)
+        if not handle:
+            err = ctypes.get_last_error()
+            if err == 5:  # ACCESS_DENIED: exists but unqueryable
+                return True
+            if err == 87:  # INVALID_PARAMETER: no such pid
+                return False
+            return None
+        try:
+            result = kernel32.WaitForSingleObject(handle, 0)
+            if result == _WAIT_OBJECT_0:
+                return False
+            if result == _WAIT_TIMEOUT:
+                return True
+            return None
+        finally:
+            kernel32.CloseHandle(handle)
+    except Exception:
+        return None
+
 
 def _env_float(name: str, default: float) -> float:
     try:
@@ -66,15 +118,19 @@ def _env_int(name: str, default: int) -> int:
 def process_alive(pid: int | None) -> bool:
     """Return whether a process with the given PID is running.
 
-    Cross-platform and permission-agnostic: on Windows uses ``tasklist``
-    (OpenProcess access may be denied for other users' processes, while
-    tasklist's CSV output still reports existence), on POSIX uses
+    Cross-platform and permission-agnostic: on Windows prefers a handle query
+    (``OpenProcess`` + ``WaitForSingleObject``) and falls back to ``tasklist``
+    when uncertain (OpenProcess access may be denied for other users'
+    processes, while tasklist's output still reports existence); on POSIX uses
     ``os.kill(pid, 0)``. On probe failure we conservatively report alive so a
     transient probe error never terminates a healthy server.
     """
     if not pid or pid in _NULL_PIDS:
         return False
     if sys.platform == "win32":
+        fast = windows_pid_alive(pid)
+        if fast is not None:
+            return fast
         try:
             result = subprocess.run(
                 ["tasklist", "/FI", f"PID eq {pid}", "/NH"],

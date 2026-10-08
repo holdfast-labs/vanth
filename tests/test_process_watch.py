@@ -13,6 +13,7 @@ from vanth.process_watch import (
     parent_pid,
     process_alive,
     start_watchdog,
+    windows_pid_alive,
 )
 
 
@@ -20,6 +21,39 @@ def test_process_alive_false_for_dead_pid():
     assert process_alive(1) is False
     assert process_alive(None) is False
     assert process_alive(0) is False
+
+
+def test_windows_pid_alive_agrees_with_process_alive():
+    """Handle-query fast path must match the tasklist result (and cost ~nothing)."""
+    if sys.platform != "win32":
+        assert windows_pid_alive(os.getpid()) is None
+        return
+    assert windows_pid_alive(os.getpid()) is True
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        assert windows_pid_alive(proc.pid) is True
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+    # Reaped child: a fixed high PID could exist on a busy host, so use the
+    # real dead PID (also covers exit-code-259 ambiguity: any exit means dead).
+    assert windows_pid_alive(proc.pid) is False
+    assert process_alive(os.getpid()) is True
+    assert process_alive(proc.pid) is False
+    start = time.perf_counter()
+    for _ in range(20):
+        windows_pid_alive(os.getpid())
+    assert (time.perf_counter() - start) < 1.0
+
+
+def test_windows_pid_alive_exit_code_259_is_dead():
+    """A process that exits with code 259 (STILL_ACTIVE) must read as dead."""
+    if sys.platform != "win32":
+        pytest.skip("Windows handle semantics")
+    proc = subprocess.Popen([sys.executable, "-c", "import sys; sys.exit(259)"])
+    proc.wait(timeout=10)
+    assert windows_pid_alive(proc.pid) is False
+    assert process_alive(proc.pid) is False
 
 
 def test_process_alive_true_for_running_child():

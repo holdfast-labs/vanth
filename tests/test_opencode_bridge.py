@@ -11,6 +11,8 @@ from vanth.opencode_bridge import (
     OpenCodeSessionNotFound,
     send_delivery_to_opencode,
     _command_argv,
+    _session_exists,
+    _session_probe_cache,
 )
 
 
@@ -341,3 +343,41 @@ def test_auth_rejects_literal_values(monkeypatch: pytest.MonkeyPatch) -> None:
                 },
             }
         )
+
+
+
+def test_session_probe_caches_conclusive_answers(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '[{"id": "ses_cached"}]', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    _session_probe_cache.clear()
+    try:
+        assert _session_exists("ses_cached", ["opencode"]) is True
+        assert _session_exists("ses_cached", ["opencode"]) is True
+        assert len(calls) == 1
+        assert _session_exists("ses_missing", ["opencode"]) is False
+        assert len(calls) == 2
+    finally:
+        _session_probe_cache.clear()
+
+
+def test_session_probe_ttl_zero_disables_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list = []
+
+    def fake_run(argv, **kwargs):
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, '[{"id": "ses_x"}]', "")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("VANTH_SESSION_PROBE_TTL_SECONDS", "0")
+    _session_probe_cache.clear()
+    try:
+        assert _session_exists("ses_x", ["opencode"]) is True
+        assert _session_exists("ses_x", ["opencode"]) is True
+        assert len(calls) == 2
+    finally:
+        _session_probe_cache.clear()

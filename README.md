@@ -1096,15 +1096,18 @@ spawns a second app-server and never falls back to the CLI thread bridge:
 }
 ```
 
-Desktop wake is delivered by a client-side relay: the Vanth MCP integration
-registers the task id it can wake, long-polls the daemon for due deliveries,
-submits the follow-up into the already-running Desktop task through the pipe,
+The host connection uses a Windows named pipe or a Unix domain socket on
+Linux/macOS. Desktop wake is delivered by a client-side relay: the Vanth MCP
+integration registers the task id it can wake, long-polls the daemon for due
+deliveries, submits the follow-up into the already-running Desktop task through the pipe,
 and acknowledges only after admission succeeds. The private pipe stays inside
 the Codex MCP process and is provisioned through a supported handoff — run
 `vanth setup desktop` inside a Codex Desktop session with the app-tools
 capability active (it writes a per-home `codex_desktop.json` capability file),
 or launch Vanth with `VANTH_CODEX_DESKTOP_PIPE` /
-`VANTH_CODEX_DESKTOP_THREAD` set. Without a pipe capability the delivery fails
+`VANTH_CODEX_DESKTOP_THREAD` set. If the MCP server was already running without
+the capability when you first ran setup, restart that MCP server so it starts
+the relay. Without a pipe capability the delivery fails
 closed with an actionable "Desktop integration unavailable" error and is never
 routed to the CLI.
 

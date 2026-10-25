@@ -24,8 +24,10 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -47,24 +49,34 @@ import shellcmd
 
 class FakePipeServer:
     """A fake Desktop app-tools host speaking the length-prefixed JSON-RPC
-    protocol over a socketpair.
+    protocol over a socketpair or a bound Unix socket.
 
     Reproduces the LIVE Desktop tool catalog shape: each tool is reported as
     separate ``namespace`` and ``name`` fields (review rc37 P0), not a combined
     qualified name.
     """
 
-    def __init__(self, tools=(("codex_app", "send_message_to_thread"), ("codex_app", "list_threads"))):
+    def __init__(self, tools=(("codex_app", "send_message_to_thread"), ("codex_app", "list_threads")), *, path=None):
         self.tools = tools
         self.seen_requests = []
         self.deliveries = []
-        self._sock, self._client = socket.socketpair()
+        self._listener = None
+        if path is None:
+            self._sock, self._client = socket.socketpair()
+        else:
+            self._sock = self._client = None
+            self._listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._listener.bind(path)
+            self._listener.listen(1)
+            self._listener.settimeout(5)
         self._server_thread = threading.Thread(target=self._serve, daemon=True)
         self._server_thread.start()
 
     def _serve(self):
-        conn = self._sock
         try:
+            if self._listener is not None:
+                self._sock, _ = self._listener.accept()
+            conn = self._sock
             while True:
                 header = self._read_exact(conn, 4)
                 if not header:
@@ -87,12 +99,18 @@ class FakePipeServer:
                     }
                 elif method == "tools/call":
                     params = message.get("params", {})
+                    if params.get("callerSource") != "codex":
+                        self._write_frame(conn, {
+                            "jsonrpc": "2.0", "id": message.get("id"),
+                            "error": {"code": -32602, "message": "Invalid app tool request"},
+                        })
+                        continue
                     arguments = params.get("arguments", {})
                     self.deliveries.append(arguments)
                     response = {
                         "jsonrpc": "2.0",
                         "id": message.get("id"),
-                        "result": {"success": True, "content": [{"type": "text", "text": "accepted"}]},
+                        "result": {"success": True, "contentItems": [{"type": "inputText", "text": "accepted"}]},
                     }
                 else:
                     response = {
@@ -123,14 +141,103 @@ class FakePipeServer:
         return self._client
 
     def close(self):
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-        try:
-            self._client.close()
-        except OSError:
-            pass
+        for handle in (self._sock, self._client, self._listener):
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Desktop uses named pipes on Windows")
+class TestUnixSocketTransport:
+    @pytest.mark.parametrize("use_helper", [False, True], ids=["client", "helper-subprocess"])
+    def test_named_socket_round_trip(self, use_helper):
+        # A short directory avoids AF_UNIX's platform-dependent path limit.
+        # Unlike socketpair/_handle tests, this exercises the real constructor.
+        with tempfile.TemporaryDirectory(prefix="vanth-") as directory:
+            path = os.path.join(directory, "desktop.sock")
+            server = FakePipeServer(path=path)
+            client = None
+            try:
+                kwargs = dict(
+                    destination_thread_id="thread_dest", prompt="wake up",
+                    caller_thread_id="thread_caller", call_id="vanth-del_unix",
+                )
+                if use_helper:
+                    result = send_desktop_message(**kwargs, pipe_path=path, timeout_seconds=5)
+                else:
+                    client = CodexPipeClient(path, timeout_seconds=5)
+                    result = client.send_message_to_thread(**kwargs)
+                assert result["success"] is True
+                assert [req["method"] for req in server.seen_requests] == ["tools/list", "tools/call"]
+                params = server.seen_requests[-1]["params"]
+                assert params["threadId"] == "thread_caller"
+                assert params["arguments"] == {"threadId": "thread_dest", "prompt": "wake up"}
+            finally:
+                if client is not None:
+                    client.close()
+                server.close()
+                server._server_thread.join(timeout=6)
+
+    def test_unreachable_socket_error_is_sanitized(self):
+        with tempfile.TemporaryDirectory(prefix="vanth-") as directory:
+            path = os.path.join(directory, "private.sock")
+            # Binding without listening deterministically refuses connections.
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as listener:
+                listener.bind(path)
+                with pytest.raises(CodexPipeUnavailable) as caught:
+                    send_desktop_message(
+                        destination_thread_id="t", prompt="p", caller_thread_id="c",
+                        call_id="x", pipe_path=path, timeout_seconds=2,
+                    )
+                assert path not in str(caught.value)
+
+    def test_unresponsive_socket_obeys_deadline(self, monkeypatch):
+        monkeypatch.setattr(FakePipeServer, "_write_frame", staticmethod(lambda *_: None))
+        with tempfile.TemporaryDirectory(prefix="vanth-") as directory:
+            path = os.path.join(directory, "stalled.sock")
+            server = FakePipeServer(path=path)
+            started = time.monotonic()
+            try:
+                with pytest.raises(CodexPipeError, match="timed out"):
+                    send_desktop_message(
+                        destination_thread_id="t", prompt="p", caller_thread_id="c",
+                        call_id="x", pipe_path=path, timeout_seconds=1,
+                    )
+                assert time.monotonic() - started < 3
+                assert server.deliveries == []
+            finally:
+                server.close()
+                server._server_thread.join(timeout=6)
+
+
+def test_windows_named_pipe_still_uses_unbuffered_file_handle(monkeypatch):
+    import vanth.codex_pipe as pipe_mod
+
+    server = FakePipeServer()
+    opened = []
+
+    def open_pipe(path, mode, *, buffering):
+        opened.append((path, mode, buffering))
+        return server.client_socket()
+
+    # Patch only this module's platform view; changing the global sys.platform
+    # could affect pytest or unrelated filesystem code on the host OS.
+    monkeypatch.setattr(pipe_mod, "sys", SimpleNamespace(platform="win32"))
+    monkeypatch.setattr(pipe_mod, "open", open_pipe, raising=False)
+    client = None
+    try:
+        client = CodexPipeClient(r"\\.\pipe\desktop", timeout_seconds=5)
+        result = client.send_message_to_thread(
+            destination_thread_id="t", prompt="p", caller_thread_id="c", call_id="x",
+        )
+        assert result["success"] is True
+        assert opened == [(r"\\.\pipe\desktop", "r+b", 0)]
+    finally:
+        if client is not None:
+            client.close()
+        server.close()
 
 
 def _frame(payload):
@@ -423,6 +530,7 @@ class TestDesktopDelivery:
             call = next(req for req in server.seen_requests if req.get("method") == "tools/call")
             params = call["params"]
             assert params["namespace"] == "codex_app"
+            assert params["callerSource"] == "codex"
             assert params["tool"] == "send_message_to_thread"
             assert params["arguments"]["threadId"] == "thread_dest"
             assert params["arguments"]["prompt"] == "wake up"
@@ -449,6 +557,18 @@ class TestDesktopDelivery:
             assert not server.seen_requests
         finally:
             server.close()
+
+    def test_host_error_uses_native_text_content(self, monkeypatch):
+        client = CodexPipeClient.__new__(CodexPipeClient)
+        monkeypatch.setattr(client, "has_capability", lambda *_: True)
+        monkeypatch.setattr(client, "call", lambda *_: {
+            "success": False,
+            "contentItems": [{"type": "inputText", "text": "Desktop task is unavailable"}],
+        })
+        with pytest.raises(CodexPipeError, match="Desktop task is unavailable"):
+            client.send_message_to_thread(
+                destination_thread_id="t", prompt="p", caller_thread_id="c", call_id="x",
+            )
 
     def test_one_delivery_per_call_id(self):
         call_ids = []
@@ -1340,6 +1460,41 @@ class TestRelay:
 
         relay = DesktopRelay(OkClient(), "client_x")
         relay._ack({"delivery_id": "del_ok", "lease_token": "tok"}, "delivered")  # must not raise
+
+    @pytest.mark.parametrize("known_error", [True, False])
+    def test_relay_records_error_without_exposing_pipe(self, monkeypatch, known_error):
+        from vanth.relay import DesktopRelay
+
+        acknowledgements = []
+
+        class Client:
+            def post(self, path, payload):
+                if path == "/relay/ack":
+                    acknowledgements.append(payload)
+                return {"result": "ok"}
+
+        private_path = "/private/desktop-endpoint.sock"
+        relay = DesktopRelay(Client(), "client_error", pipe_path=private_path)
+        relay._register = lambda: True
+        relay._poll = lambda: [{"delivery_id": "del_error", "lease_token": "tok"}]
+
+        def fail(_delivery):
+            relay._stop.set()
+            error = CodexPipeError if known_error else RuntimeError
+            raise error(f"Invalid app tool request at {private_path}")
+
+        relay._deliver = fail
+        monkeypatch.setattr("vanth.relay.time.sleep", lambda _: None)
+        relay._run()
+        assert len(acknowledgements) == 1
+        recorded = acknowledgements[0]
+        assert recorded["status"] == "failed"
+        assert private_path not in recorded["error"]
+        if known_error:
+            assert "Invalid app tool request" in recorded["error"]
+        else:
+            assert "RuntimeError" in recorded["error"]
+        assert "will retry" not in recorded["error"]
 
 
 class TestRelayProvisioning:

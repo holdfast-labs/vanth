@@ -1,5 +1,11 @@
 import json
+import os
+import signal
+import socket
+import subprocess
+import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
@@ -228,3 +234,45 @@ class FakePopen:
     """Stand-in for the spawned daemon process (does nothing)."""
 
     pid = 0
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group cleanup")
+def test_autostarted_daemon_survives_mcp_process_group_cleanup(tmp_path):
+    # MCP stdio clients may terminate the server's whole process group when
+    # disconnecting. A shared daemon must live in a separate session/group.
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    home = tmp_path / "state"
+    ready = tmp_path / "ready"
+    env = {**os.environ, "VANTH_HOME": str(home), "VANTH_DAEMON_PORT": str(port)}
+    env.pop("VANTH_DAEMON_URL", None)
+    launcher = subprocess.Popen(
+        [sys.executable, "-c",
+         "from pathlib import Path; import sys; from vanth.client import VanthClient; "
+         "VanthClient().ensure(); Path(sys.argv[1]).write_text('ready'); sys.stdin.read()", str(ready)],
+        env=env, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    client = VanthClient(f"http://127.0.0.1:{port}", home)
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists() and time.monotonic() < deadline:
+            assert launcher.poll() is None, "launcher exited before starting its daemon"
+            time.sleep(0.05)
+        assert ready.exists(), "daemon did not become ready"
+        daemon_pid = json.loads((home / "daemon.json").read_text())["pid"]
+        assert os.getsid(daemon_pid) != os.getsid(launcher.pid)
+        os.killpg(launcher.pid, signal.SIGTERM)
+        launcher.wait(timeout=5)
+        assert client._ready(), "MCP cleanup terminated the shared daemon"
+    finally:
+        if launcher.poll() is None:
+            os.killpg(launcher.pid, signal.SIGTERM)
+            launcher.wait(timeout=5)
+        try:
+            if client._ready():
+                client.post("/shutdown")
+        finally:
+            launcher.stdin.close()
+            launcher.stderr.close()

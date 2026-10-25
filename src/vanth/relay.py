@@ -459,14 +459,29 @@ class DesktopRelay:
                         time.sleep(self._outage_backoff)
                         self._outage_backoff = min(self._outage_backoff * 2, self.max_reconnect_delay)
                         break
-                    except Exception:
+                    except Exception as exc:
                         # A failed delivery (or failed ack) must not kill the
                         # relay: mark the delivery failed so it retries per the
                         # normal backoff, then continue polling. If even the ack
                         # cannot be sent (daemon down), the lease expires and the
                         # daemon reclaims the delivery later.
+                        from .codex_pipe import CodexPipeError
+                        import logging
+
+                        # Bridge/relay exceptions are suitable for diagnostics;
+                        # unexpected exceptions may contain paths or payloads.
+                        if isinstance(exc, (CodexPipeError, RelayError)):
+                            error = f"{type(exc).__name__}: {exc}"
+                        else:
+                            error = f"Desktop delivery failed ({type(exc).__name__})"
+                        if self.pipe_path:
+                            error = error.replace(self.pipe_path, "<desktop endpoint>")
+                        error = error[:1000]
+                        logging.getLogger("vanth").warning(
+                            "Desktop wake delivery %s failed: %s", delivery.get("delivery_id"), error,
+                        )
                         try:
-                            self._ack(delivery, "failed", "delivery failed; will retry")
+                            self._ack(delivery, "failed", error)
                         except Exception:
                             # Ack unavailable (daemon down); the lease will
                             # expire and the daemon reclaims the delivery.

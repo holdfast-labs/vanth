@@ -192,6 +192,9 @@ class VanthClient:
             stderr=subprocess.DEVNULL,
             env=os.environ.copy(),
             creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if sys.platform == "win32" else 0,
+            # MCP clients may terminate their server's entire process group.
+            # The shared daemon must survive that client/session cleanup.
+            start_new_session=sys.platform != "win32",
         )
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline:

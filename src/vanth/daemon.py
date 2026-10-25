@@ -1117,6 +1117,10 @@ class Handler(BaseHTTPRequestHandler):
                     }
                     ok(self, _remote_submit(remote_id, "job.stop", {"job_id": parsed.path.split("/")[2], **remote_payload}))
                 else:
+                    # MCP includes this remote-only field even when it is null.
+                    # Local stops are already idempotent; the manager does not
+                    # accept a remote request-journal key.
+                    payload.pop("idempotency_key", None)
                     ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/send"):
                 ok(self, get_manager().send_sync(parsed.path.split("/")[2], **payload))

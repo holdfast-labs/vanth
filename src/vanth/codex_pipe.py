@@ -1,7 +1,8 @@
 """Native app-tools host-pipe client for Codex Desktop wake (review rc36 P0).
 
 Codex Desktop runs a private app-tools JSON-RPC server on a Windows named pipe
-whose path is inherited by the MCP process as ``CODEX_APP_TOOLS_PIPE_PATH``.
+or a Unix domain socket on Linux/macOS. Its path is inherited by the MCP process
+as ``CODEX_APP_TOOLS_PIPE_PATH``.
 The bundled app-tools MCP server exposes ``codex_app/send_message_to_thread``
 on that pipe; calling it submits a follow-up prompt into the already-running
 Desktop task — the visible app owns the task writer, so this never hits the
@@ -149,7 +150,7 @@ def _write_all(handle, data: bytes) -> None:
 
 
 class CodexPipeClient:
-    """Serialize one JSON-RPC request/response over the Desktop named pipe.
+    """Serialize one JSON-RPC request/response over the Desktop pipe or socket.
 
     A single client instance is used for ONE call sequence (tools/list preflight
     then tools/call) and then closed. The blocking read loop runs on a worker
@@ -168,12 +169,22 @@ class CodexPipeClient:
         # tools/call) share ONE budget so a slow preflight cannot consume a
         # second full timeout (review rc39 P1).
         self.sequence_deadline = time.monotonic() + wake_sequence_budget(timeout_seconds)
-        # `open(path, "r+b", buffering=0)` opens a Windows named pipe handle
-        # (also works for a POSIX socket/FIFO for tests). Buffering=0 is
-        # required for a true byte stream over a named pipe. Tests may pass a
-        # raw socket instead (socket.socketpair) which also works.
         try:
-            self.handle = open(pipe_path, "r+b", buffering=0)  # noqa: SIM115 - raw pipe handle
+            if sys.platform == "win32":
+                # Windows named pipes expose a file-like byte stream.
+                self.handle = open(pipe_path, "r+b", buffering=0)  # noqa: SIM115
+            else:
+                # Unix socket paths cannot be opened as files (ENXIO on Linux).
+                # Connect within the same budget as the subsequent RPC calls.
+                handle = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    handle.settimeout(max(0.0, self.sequence_deadline - time.monotonic()))
+                    handle.connect(pipe_path)
+                    handle.settimeout(None)
+                except OSError:
+                    handle.close()
+                    raise
+                self.handle = handle
         except OSError as exc:
             # Never embed the raw OSError: Windows errors contain the full
             # named-pipe path, which must not reach delivery errors (P2).
@@ -367,6 +378,7 @@ class CodexPipeClient:
         arguments: dict[str, Any] = {"threadId": destination_thread_id, "prompt": prompt}
         params: dict[str, Any] = {
             "arguments": arguments,
+            "callerSource": "codex",
             "callId": call_id,
             "namespace": "codex_app",
             "tool": "send_message_to_thread",
@@ -375,7 +387,11 @@ class CodexPipeClient:
         }
         result = self.call("tools/call", params)
         if result.get("success") is not True:
-            error_text = result.get("error") or result.get("message") or "send_message_to_thread did not report success"
+            native_text = " ".join(
+                item["text"] for item in result.get("contentItems", [])
+                if isinstance(item, dict) and item.get("type") == "inputText" and isinstance(item.get("text"), str)
+            )
+            error_text = result.get("error") or result.get("message") or native_text or "send_message_to_thread did not report success"
             raise CodexPipeError(str(error_text))
         return result
 
@@ -392,14 +408,14 @@ def send_desktop_message(
 ) -> dict[str, Any]:
     """Open the inherited pipe and submit a Desktop wake prompt.
 
-    ``pipe_path`` overrides the inherited ``CODEX_APP_TOOLS_PIPE_PATH`` (used by
-    tests); production always reads the inherited environment. ``_handle`` is a
-    test-only raw socket/file handle that bypasses ``open(pipe_path)``.
+    ``pipe_path`` supplies the relay's resolved capability, overriding the
+    inherited ``CODEX_APP_TOOLS_PIPE_PATH``. ``_handle`` is a test-only socket/file
+    handle that bypasses the transport connection.
 
     Production runs the blocking pipe I/O in a killable helper subprocess with a
     hard deadline (review rc37 P1) so a stalled named-pipe read can never hang
-    the relay thread; the subprocess reads the pipe path from its inherited
-    environment only. The hard deadline is strictly shorter than the delivery
+    the relay thread; the resolved path is passed to the helper on stdin.
+    The hard deadline is strictly shorter than the delivery
     claim lease (review rc38 P1).
     """
     if not isinstance(caller_thread_id, str) or not caller_thread_id:

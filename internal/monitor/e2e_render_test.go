@@ -63,14 +63,14 @@ func TestRenderRealProgressData(t *testing.T) {
 			t.Errorf("metric %q not rendered:\n%s", metric, view)
 		}
 	}
-	// The chart body must contain braille dots (U+2800+) proving ntcharts
+	// The chart body must contain braille dots (U+2800+) proving the plot
 	// actually drew line segments rather than an empty pane.
 	if !strings.ContainsAny(view, brailleRange) {
 		t.Errorf("no braille chart glyphs rendered:\n%s", view)
 	}
-	// The sidebar must show the selected job's final progress.
-	if !strings.Contains(view, "100%") {
-		t.Logf("note: progress readout not matched (formatting may vary):\n%s", view)
+	// The Overview must show the selected job's final progress.
+	if !strings.Contains(view, "100 / 100") {
+		t.Errorf("final step not shown in the Overview:\n%s", view)
 	}
 }
 

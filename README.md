@@ -563,10 +563,11 @@ Notes:
 ### Monitor panels: choose what the monitor shows for your job
 
 Print one `panels` event (usually right after start) to declare the job's own
-visuals. The monitor draws them on the job's card in the glance view and in
-the detail dashboard's Metrics pane; jobs that declare nothing get line charts
-of their first metrics. The newest `panels` event wins, and it is stored like
-any event, so the view survives monitor restarts.
+visuals. The monitor puts them in its chart grid while the job is running (or
+selected): `line` and `gauge` panels become charts, `stat` a big-number tile,
+and `text` a row in the sidebar's Overview. Jobs that declare nothing get a
+chart per metric. The newest `panels` event wins, and it is stored like any
+event, so the view survives monitor restarts.
 
 ```sh
 # shell / any language: one line
@@ -583,10 +584,10 @@ agent_event("metric", gpu=71, loss=0.42)   # the values the panels read
 
 | `kind` | Shows | Fields |
 |---|---|---|
-| `gauge` | bar of the latest value in `min`..`max` (default 0..100) | `metric`, optional `min`, `max`, `unit`, `label` |
-| `line` | small chart of the metric's history + latest value and trend | `metric`, optional `unit`, `label` |
-| `stat` | the latest value as a big number | `metric`, optional `unit`, `label` |
-| `text` | a short status line: fixed `text`, or the latest value of event data field `key` (e.g. `stage`, `phase`) | `text` or `key`, optional `label` |
+| `gauge` | a chart with a fixed `min`..`max` axis (default 0..100) and the latest value | `metric`, optional `min`, `max`, `unit`, `label` |
+| `line` | a chart of the metric's history and its latest value | `metric`, optional `min`, `max`, `unit`, `label` |
+| `stat` | the latest value as a big number, with a sparkline | `metric`, optional `unit`, `label` |
+| `text` | an Overview row: fixed `text`, or the latest value of event data field `key` (e.g. `stage`, `phase`) | `text` or `key`, optional `label` |
 
 Panels read the job's `metric` / `progress` series (including points sent with
 `job_metric_ingest`). The schema is forgiving: `kind` is case-insensitive and
@@ -594,8 +595,8 @@ accepts `progress`/`bar`, `chart`/`sparkline`, `number`/`big`, `status`; extra
 fields are dropped; at most 8 panels; `label` is cut to 32 chars, `unit` to 12,
 `text` to 120; `metric`/`key` names must be at most 64 chars. Invalid entries
 are ignored, never fatal: the stored event lists them under `invalid`, gets
-level `warning`, and shows in the event pane; the card notes how many were
-ignored. See `examples/panels_job.py`.
+level `warning`, and shows in the event pane; the Overview notes how many were
+ignored. See `examples/panels_job.py` and `examples/demo/train.py`.
 
 ### Example: a tracked downloader
 
@@ -1327,14 +1328,26 @@ rejected.
 
 ### The Go terminal monitor
 
-The native Go dashboard reads the same home **read-only**. It opens on a
-glance view: one card per running or queued job with a status-coloured
-progress bar, percent, elapsed time, ETA, rate (from the `progress` unit) and
-liveness (time since the last event; `late` and `STALLED` once a job is quiet
-for 3x / 6x its usual event interval), plus the job's declared panels. Finished
-runs sit in a compact strip below, failures from the last day first and in
-red. When nothing is running it says so and shows the fleet timeline. Press `v`
-for the detail dashboard with live plots, the exact event table, and log tails:
+The native Go dashboard reads the same home **read-only**. Its layout follows
+W&B LEET:
+
+- **Header**: status counts (running, queued, done, failed, stalled), the data
+  source, job count and clock.
+- **Sidebar**: *Running* jobs, each with a colour swatch and its percent (red
+  `✖ stalled 9m` once a job has been quiet for 6x its usual event interval,
+  `◔ late` at 3x); *Queued*; *Finished*, failures first in red with their exit
+  code or `timeout`; and an *Overview* of the selected run (state, host,
+  elapsed, step, phase, ETA and rate, last output, `text` panels).
+- **Charts**: a grid of braille line charts over time (`-30m … now`), one per
+  metric: progress of every running job first, then the jobs' declared panels,
+  then their other metrics. Each job keeps one colour everywhere (swatch, line,
+  values); the latest values sit on the chart's top border, and a stalled
+  job's value turns red. More charts than fit are paged.
+- When nothing runs, the selected (most recent) run's charts stay up, or the
+  fleet timeline and recent run durations if it has none.
+- Below 90 columns (or after `[`/`]`) the sidebar folds into a compact list of
+  the running runs above the charts. Without colour (`NO_COLOR`), each job's
+  lines and swatch use its own marker character instead.
 
 ```cmd
 vanth-monitor
@@ -1352,9 +1365,17 @@ mkdir dist 2>nul & go build -o dist\vanth-monitor.exe .\cmd\vanth && dist\vanth-
 The source checkout's `vanth-monitor` wrapper does not build or discover that
 output automatically; run the executable produced by `go build` directly.
 
-Keys: `up/down` or `j/k` select jobs · `v` glance / detail view · `enter` pins a job's series · `e` event
-table · `l` log tail · `s` slowest-runs table · `+`/`-` zoom a chart · `[`/`]`
-pan · `t` back to live tail · `?` help · `q` or `Ctrl+C` quit.
+Keys: `up/down` or `j/k` select a run · `tab`/`shift+tab` focus a chart ·
+`left`/`right` page the charts · `+`/`-` or the mouse wheel zoom a chart's
+time window (`t` resets) · `[`/`]` sidebar / compact list · `enter` pins a run
+on the charts · `e` events, `l` log tail, `s` slowest runs in place of the
+charts (`pgup`/`pgdn` scroll, `esc` closes) · click a run or chart to select it ·
+`?` help · `q` or `Ctrl+C` quit.
+
+To try it on realistic jobs, `uv run python scripts/demo_jobs.py --home DIR`
+starts six demo jobs (training with panels, a stalling eval, an ingest, a
+backup without progress, a failing deploy, and a job queued in a pool) through
+`vanth start`; then run the monitor with `VANTH_HOME=DIR`.
 
 ---
 

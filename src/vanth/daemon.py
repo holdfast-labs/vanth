@@ -1098,6 +1098,9 @@ class Handler(BaseHTTPRequestHandler):
                     }
                     ok(self, _remote_submit(remote_id, "job.rerun", {"job_id": job_id, **remote_payload}))
                 else:
+                    # idempotency_key is remote-only; rerun_sync does not accept
+                    # it, so forwarding it would fail with a TypeError (a 500).
+                    payload.pop("idempotency_key", None)
                     ok(self, asyncio.run(get_manager().rerun(parsed.path.split("/")[2], **payload)))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/wait"):
                 remote_id = payload.pop("remote_id", None)
@@ -1117,6 +1120,10 @@ class Handler(BaseHTTPRequestHandler):
                     }
                     ok(self, _remote_submit(remote_id, "job.stop", {"job_id": parsed.path.split("/")[2], **remote_payload}))
                 else:
+                    # idempotency_key is a remote-only protocol field; stop_sync
+                    # does not accept it, so forwarding it would fail with a
+                    # TypeError (a 500) for the local stop path.
+                    payload.pop("idempotency_key", None)
                     ok(self, get_manager().stop_sync(parsed.path.split("/")[2], **payload))
             elif parsed.path.startswith("/jobs/") and parsed.path.endswith("/send"):
                 ok(self, get_manager().send_sync(parsed.path.split("/")[2], **payload))

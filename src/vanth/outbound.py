@@ -77,7 +77,14 @@ def check_outbound_url(url: str) -> None:
     """Raise :class:`OutboundDenied` if ``url`` violates the destination policy."""
     if not isinstance(url, str) or not url:
         raise OutboundDenied("outbound URL must be a non-empty string")
-    parts = urlsplit(url)
+    try:
+        parts = urlsplit(url)
+        # ``.port`` parses lazily and raises ValueError for a non-numeric or
+        # out-of-range port; urlsplit itself raises for a malformed IPv6 host.
+        # Both are policy denials, not raw errors escaping into the caller.
+        port = parts.port
+    except ValueError as exc:
+        raise OutboundDenied(f"invalid outbound URL: {exc}") from exc
     if parts.scheme not in {"http", "https"}:
         raise OutboundDenied(f"unsupported outbound scheme: {parts.scheme!r}")
     host = parts.hostname
@@ -86,7 +93,7 @@ def check_outbound_url(url: str) -> None:
     lowered = host.lower().rstrip(".")
     allow = _allowlist()
     allow_by_name = bool(allow) and lowered in allow
-    port = parts.port or (443 if parts.scheme == "https" else 80)
+    port = port or (443 if parts.scheme == "https" else 80)
     # Always resolve — an allowlisted NAME must not bypass the address checks
     # (a name can resolve to link-local/metadata, or rebind). The tripwire set
     # is denied even in allowlist mode.

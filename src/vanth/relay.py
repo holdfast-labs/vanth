@@ -263,7 +263,14 @@ class DesktopRelay:
         # so only the claiming client can complete a delivery (review rc37 P1).
         params = {"client_id": self.client_id, "timeout_seconds": "15"}
         result = self.client.get("/relay/poll", params)
-        return result.get("deliveries") if isinstance(result, dict) else []
+        deliveries = result.get("deliveries") if isinstance(result, dict) else None
+        # An error response (auth/schema/validation) carries no ``deliveries``.
+        # Returning None there crashed the relay thread on the enumerate() in
+        # _run, which silently stopped ALL future wake deliveries until the MCP
+        # process restarted. Treat a malformed response as an empty poll.
+        if not isinstance(deliveries, list):
+            return []
+        return [delivery for delivery in deliveries if isinstance(delivery, dict)]
 
     def _reload_capability(self) -> bool:
         """Re-resolve the Desktop capability (pipe + thread) after a failure.

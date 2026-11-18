@@ -427,11 +427,15 @@ Add to `~/.config/opencode/opencode.json`:
       "type": "local",
       "command": ["vanth"],
       "enabled": true,
-      "timeout": 15000
+      "timeout": 60000
     }
   }
 }
 ```
+
+`timeout` is the per-tool-call budget in milliseconds. Keep it at 60000 (the
+reference MCP client budget): blocking tools such as `job_wait` return within
+the wait slice (`VANTH_MCP_WAIT_SLICE`, 25 s default) plus a small margin.
 
 From a source checkout, use `uv` directly instead of a bare `vanth`:
 
@@ -442,7 +446,7 @@ From a source checkout, use `uv` directly instead of a bare `vanth`:
       "type": "local",
       "command": ["uv", "run", "--directory", "/path/to/vanth", "vanth"],
       "enabled": true,
-      "timeout": 15000
+      "timeout": 60000
     }
   }
 }

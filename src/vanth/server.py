@@ -618,11 +618,15 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             # thread_id/threadId is accepted as a legacy alias for session_id.
             session_id = target.get("session_id") or target.get("sessionId") or target.get("thread_id") or target.get("threadId")
             if not isinstance(session_id, str) or not session_id:
+                directory = target.get("cwd")
+                where = f" for directory {directory}" if isinstance(directory, str) and directory else ""
                 raise ValueError(
-                    "opencode_thread target requires session_id — the OpenCode session id "
-                    "(`ses_...`, from `opencode session list` or the destination shown by "
-                    "`vanth doctor`), NOT the relay client id (`opencode-<pid>-<rand>`); "
-                    "omit it to resolve the live plugin relay for the job's directory"
+                    "opencode_thread target requires session_id: no live OpenCode "
+                    f"plugin relay is registered{where}; is the vanth OpenCode plugin "
+                    "loaded in that session? Pass the OpenCode session id (`ses_...`, "
+                    "from `opencode session list` or the destination shown by "
+                    "`vanth doctor`), NOT the relay client id "
+                    "(`opencode-<pid>-<rand>`)."
                 )
             # ``attach`` is OPTIONAL: a plain TUI session exposes no server URL
             # (review P0-3), so without it the wake is delivered by the
@@ -8246,12 +8250,16 @@ def job_start(
     if wake_me and wake_targets is None:
         # Mirror the CLI shorthand: the events MUST be present (a wake target
         # with neither events nor notify_on is rejected as empty), and the
-        # caller's directory pins relay resolution so an omitted session_id does
-        # not resolve an unrelated project's relay.
+        # CALLER's directory pins relay resolution so an omitted session_id does
+        # not resolve an unrelated project's relay. The job may run in another
+        # directory (a worktree or temp dir), but the plugin relay registers the
+        # directory the MCP server process runs in, so the target must use that
+        # same directory, not the job's cwd.
+        caller_directory = os.getcwd()
         wake_targets = [{
             "type": "opencode_thread",
             "events": ["completed", "failed", "timeout", "cancelled", "orphaned"],
-            "cwd": cwd or os.getcwd(),
+            "cwd": caller_directory,
         }]
     if wake_targets is not None:
         copied_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sys
 import threading
 
@@ -131,7 +132,9 @@ def test_mcp_job_start_wake_me_payload(monkeypatch):
     assert target["events"] == ["completed", "failed", "timeout", "cancelled", "orphaned"]
     assert target["cwd"]  # pins relay resolution to the caller's directory
     server_mod.job_start(command="echo hi", wake_me=True, cwd="D:\\proj")
-    assert captured["payload"]["wake_targets"][0]["cwd"] == "D:\\proj"
+    # The job runs in D:\proj, but the relay registered the caller's directory.
+    assert captured["payload"]["cwd"] == "D:\\proj"
+    assert captured["payload"]["wake_targets"][0]["cwd"] == os.getcwd()
     # Explicit wake_targets win over the shorthand.
     explicit = [{"type": "local_command", "events": ["checkpoint"], "command": ["echo", "hi"]}]
     server_mod.job_start(command="echo hi", wake_me=True, wake_targets=explicit)

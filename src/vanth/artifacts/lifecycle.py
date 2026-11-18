@@ -424,7 +424,30 @@ class Lifecycle:
             try:
                 prepared_db.row_factory = sqlite3.Row
                 migrate_artifacts(prepared_db, home)
-                prepared_db.execute("SELECT 1 FROM catalog LIMIT 1").fetchone()
+                # A syntactically valid SQLite file is not a Vanth catalog.
+                # Require the restored database to carry the catalog row and
+                # core tables before ANY live content is replaced; otherwise a
+                # bogus file would wipe the live catalog (leaving an empty,
+                # locked database and no usable error).
+                if prepared_db.execute("SELECT id FROM catalog LIMIT 1").fetchone() is None:
+                    raise ValueError(
+                        "backup is not a Vanth artifacts catalog: missing the catalog row"
+                    )
+                required = {
+                    "catalog", "versions", "roots", "aliases", "operations", "catalog_state",
+                }
+                present = {
+                    row[0]
+                    for row in prepared_db.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'"
+                    )
+                }
+                missing_tables = sorted(required - present)
+                if missing_tables:
+                    raise ValueError(
+                        "backup is not a Vanth artifacts catalog: missing tables "
+                        + ", ".join(missing_tables)
+                    )
                 from .catalog import set_recovery_required
 
                 prepared_db.execute("BEGIN IMMEDIATE")

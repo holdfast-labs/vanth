@@ -595,6 +595,12 @@ class TransferRegistry:
                 (transfer_id, direction, root_name, manifest_digest, total_bytes, sha256,
                  staging_path, epoch, now, now),
             )
+            if direction == "push":
+                # A zero-byte push sends no chunks, so nothing would otherwise
+                # create the staging file and completion would fail trying to
+                # read it. Create (or reset) it up front for every push.
+                with self._open_staging(Path(staging_path), write=True, create=True) as handle:
+                    handle.truncate(0)
             self.db.commit()
         except BaseException:
             self.db.rollback()
@@ -1249,8 +1255,10 @@ class RemoteArtifactBroker:
             # Keep the staging file on INCOMPLETE pulls (review rc14 P1-10):
             # the ledger's acknowledged offset refers to it; deleting forced
             # the retry to zero-fill a "completed" prefix and fail verification.
-            # Only an interrupted-before-first-byte transfer has nothing to keep.
-            if offset == 0:
+            # Only an interrupted-before-first-byte transfer has nothing to keep;
+            # a zero-byte transfer (offset == total == 0) is COMPLETE and its
+            # (empty) staging file is the content that must still be verified.
+            if offset == 0 and total > 0:
                 try:
                     staging.unlink(missing_ok=True)
                 except OSError:

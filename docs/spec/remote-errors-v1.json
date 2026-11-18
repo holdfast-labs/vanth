@@ -30,6 +30,14 @@
       "status": 409,
       "message": "request was bound to a stale remote state epoch"
     },
+    "INSTANCE_ID_MISMATCH": {
+      "status": 409,
+      "message": "request was bound to a different remote instance"
+    },
+    "SNAPSHOT_EXPIRED": {
+      "status": 409,
+      "message": "snapshot expired; restart sync"
+    },
     "OPERATION_RETRY_PENDING": {
       "status": 503,
       "message": "outcome not yet terminal; retry with the same idempotency key"

@@ -8,10 +8,8 @@ import (
 	"time"
 )
 
-// The glance view (the default; `v` toggles the detail dashboard) puts active
-// work first: one card per running or queued job with a big progress bar,
-// elapsed time, ETA, rate and a liveness readout, then a compact strip of
-// recently finished runs. Colour, glyphs and bar length carry the meaning.
+// Run state the view reads: status classes, liveness (stalled / late), ETA
+// and rate, and the order of the run list.
 
 // isActive reports whether a job is still in flight.
 func isActive(status string) bool {
@@ -208,8 +206,8 @@ func (m Model) jobMessage(jobID string) string {
 	return ""
 }
 
-// activeJobs orders the cards: stalled jobs first (they need a look), then
-// running jobs oldest first, then queued ones, so cards keep their place
+// activeJobs orders active runs: stalled jobs first (they need a look), then
+// running jobs oldest first, then queued ones, so rows keep their place
 // between refreshes.
 func (m Model) activeJobs(now time.Time) []int {
 	type item struct {
@@ -244,9 +242,9 @@ func (m Model) activeJobs(now time.Time) []int {
 	return out
 }
 
-// glanceOrder is the order up/down walks in the glance view: active cards,
-// then recent runs, then anything else.
-func (m Model) glanceOrder() []int {
+// runOrder is the order of the run list and of up/down: active runs, then
+// recent runs, then anything else.
+func (m Model) runOrder() []int {
 	var out []int
 	seen := map[int]bool{}
 	for _, i := range m.activeJobs(time.Now()) {
@@ -265,9 +263,9 @@ func (m Model) glanceOrder() []int {
 	return out
 }
 
-// moveGlance steps the selection along glanceOrder.
-func (m *Model) moveGlance(delta int) {
-	order := m.glanceOrder()
+// moveRun steps the selection along runOrder.
+func (m *Model) moveRun(delta int) {
+	order := m.runOrder()
 	for p, i := range order {
 		if i == m.selected {
 			if n := p + delta; n >= 0 && n < len(order) {

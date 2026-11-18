@@ -61,7 +61,7 @@ func frameBlock(block string, w, h int) string {
 func (m Model) chartJobs() []int {
 	sel := m.selectedJobID()
 	var out []int
-	for _, i := range m.glanceOrder() {
+	for _, i := range m.runOrder() {
 		j := m.jobs[i]
 		if isRunning(j.Status) || j.JobID == sel || m.pinned[j.JobID] {
 			out = append(out, i)
@@ -341,7 +341,7 @@ func (m Model) window(list []int, c int) (shown []int, more int) {
 func (m Model) sidebarLines(w, h int) []sideLine {
 	ch := m.chrome()
 	var running, queued []int
-	for _, i := range m.glanceOrder() {
+	for _, i := range m.runOrder() {
 		switch st := m.jobs[i].Status; {
 		case isRunning(st):
 			running = append(running, i)
@@ -570,7 +570,7 @@ func (m Model) overviewRows(w int) []overviewRow {
 func (m Model) compactEntries(w, gh int) ([]compactEntry, int) {
 	var list []int
 	sel := m.selectedJobID()
-	for _, i := range m.glanceOrder() {
+	for _, i := range m.runOrder() {
 		if j := m.jobs[i]; isRunning(j.Status) || j.JobID == sel || m.pinned[j.JobID] {
 			list = append(list, i)
 		}

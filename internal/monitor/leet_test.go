@@ -586,7 +586,7 @@ func TestBigNumberAndSparkline(t *testing.T) {
 	}
 }
 
-// ---------- liveness, ETA and panels (shared with the earlier glance view) ----------
+// ---------- liveness, ETA and panels ----------
 
 // progressEvents makes n progress events every `every`, the last one `last` ago.
 func progressEvents(jobID string, n int, every, last time.Duration, total float64) []Event {

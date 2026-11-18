@@ -206,7 +206,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			delta = -1
 		}
 		gen := m.gen
-		m.moveGlance(delta)
+		m.moveRun(delta)
 		if m.showLogs && m.gen != gen {
 			m.logLoading = true
 			return m, m.logTailCmd()
@@ -384,7 +384,7 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 		first := len(m.jobs) == 0
 		m.setJobs(res.Jobs)
 		if first && len(m.jobs) > 0 {
-			m.selected = m.glanceOrder()[0] // the first run of the sidebar, not of the raw list
+			m.selected = m.runOrder()[0] // the first run of the sidebar, not of the raw list
 		}
 	}
 	m.notePanels(res.Events)
@@ -496,7 +496,7 @@ func (m *Model) constantSeries(metric string) (float64, bool) {
 }
 
 // loadTargets returns the bounded set of jobs whose events are loaded: the
-// selected job, pinned jobs, then active jobs (their cards need progress and
+// selected job, pinned jobs, then active jobs (their rows need progress and
 // liveness), capped at MaxOverlays.
 func (m Model) loadTargets() []string {
 	targets := map[string]bool{}

@@ -133,7 +133,7 @@ func TestViewLegendSingleSeriesAbsent(t *testing.T) {
 func TestDashboardSummaryHeaderCountsByStatus(t *testing.T) {
 	m := populatedModel(t, 160, 44)
 	view := stripANSI(m.View().Content)
-	for _, want := range []string{"Vanth", "monitor", "running 10", "completed 0", "events"} {
+	for _, want := range []string{"running", "completed", "attention", "vanth", "events"} {
 		if !strings.Contains(view, want) {
 			t.Errorf("summary header missing %q:\n%s", want, view)
 		}

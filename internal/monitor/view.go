@@ -9,6 +9,8 @@ import (
 	"strings"
 	"time"
 
+	"bloomfx.dev/bloom"
+	"bloomfx.dev/bloom/fx"
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
 	"github.com/NimbleMarkets/ntcharts/v2/canvas"
@@ -58,8 +60,8 @@ func (m Model) render() string {
 	lay := m.computeLayout()
 
 	var jobsPane, metricsPane, chartsPane, lowerPane, status string
-	headerPane := m.renderSummaryHeader(lay.header)
-	if m.help {
+	headerPane := m.renderHeader(lay.header)
+	if m.help && m.helpOnly() {
 		jobsPane = m.renderJobs(lay.jobs)
 		chartsPane = ""
 		metricsPane = ""
@@ -90,7 +92,11 @@ func (m Model) render() string {
 	if lay.narrow {
 		top = lipgloss.JoinVertical(lipgloss.Top, jobsPane, "", chartsPane)
 	} else {
-		top = lipgloss.JoinHorizontal(lipgloss.Top, jobsPane, " ", metricsPane, " ", chartsPane)
+		left := jobsPane
+		if metricsPane != "" {
+			left = lipgloss.JoinVertical(lipgloss.Left, jobsPane, metricsPane)
+		}
+		top = lipgloss.JoinHorizontal(lipgloss.Top, left, " ", chartsPane)
 	}
 	top = padToHeight(top, lay.body.h)
 
@@ -107,30 +113,19 @@ func (m Model) render() string {
 	}
 	parts = append(parts, lowerPane)
 	parts = append(parts, status)
-	return strings.Join(parts, "\n")
+	frame := strings.Join(parts, "\n")
+	if m.help && !m.helpOnly() {
+		if out, ok := m.helpDialog(frame); ok {
+			return out
+		}
+	}
+	return frame
 }
 
-// panelBox renders a rounded, titled border around content, exactly r.w×r.h
-// terminal cells. The title is embedded in the top border (header style);
-// content is truncated and padded to the interior width (r.w-2).
-func (m Model) panelBox(r rect, title string, content string) string {
-	if r.w < 2 || r.h < 2 {
-		return ""
-	}
-	innerW := r.w - 2
-	lines := []string{boxTopLine(r.w, title)}
-	contentH := r.h - 2
-	cl := strings.Split(content, "\n")
-	for i := 0; i < contentH; i++ {
-		l := ""
-		if i < len(cl) {
-			l = cl[i]
-		}
-		lines = append(lines, lipgloss.NewStyle().Foreground(lipgloss.Color(panelBorderHex)).
-			Render("│"+fillLine(l, innerW)+"│"))
-	}
-	lines = append(lines, boxBottomLine(r.w))
-	return strings.Join(lines, "\n")
+// helpOnly reports whether help must use the old lower-pane form because the
+// terminal is too small for a dialog over the dashboard.
+func (m Model) helpOnly() bool {
+	return m.width < 44 || m.height < 22
 }
 
 // boxTopLine builds a rounded top border with the title embedded, exactly
@@ -177,10 +172,57 @@ func fillLine(line string, width int) string {
 	return l
 }
 
+// jobRows is the number of content rows job i occupies: unselected jobs take
+// one row (two when they have a progress bar), the selected job adds a
+// details row. renderJobs, the scroll window and the mouse hit-test all use it.
+func (m Model) jobRows(i int) int {
+	n := 1
+	if m.jobProgressPercent(m.jobs[i].JobID) >= 0 || m.jobSparkMetric(m.jobs[i].JobID) != "" {
+		n = 2
+	}
+	if i == m.selected {
+		return max(n, 2) + boolInt(n == 2)
+	}
+	return n
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// jobWindowStart returns the first visible job so the selected job (with some
+// rows of context below it) stays on screen.
+func (m Model) jobWindowStart(contentH int) int {
+	if m.selected <= 0 || m.selected >= len(m.jobs) {
+		return 0
+	}
+	budget := max(contentH-contentH/3, m.jobRows(m.selected))
+	rows, start := m.jobRows(m.selected), m.selected
+	for start > 0 && rows+m.jobRows(start-1) <= budget {
+		start--
+		rows += m.jobRows(start)
+	}
+	return start
+}
+
+// jobAtRow maps a content row of the jobs pane to a job index (or -1).
+func (m Model) jobAtRow(row, contentH int) int {
+	y := 0
+	for i := m.jobWindowStart(contentH); i < len(m.jobs); i++ {
+		y += m.jobRows(i)
+		if row < y {
+			return i
+		}
+	}
+	return -1
+}
+
 // renderJobs renders the job list pane as a titled, bordered box. Row 0 of the
-// box is the top border carrying the title, so job blocks start at content row
-// 0 (rect row 1) — matching the mouse hit-test in handleMouseClick, which
-// divides the content row by jobBlockHeight.
+// box is the top border carrying the title, so job rows start at content row 0
+// (rect row 1), matching handleMouseClick via jobAtRow.
 func (m Model) renderJobs(r rect) string {
 	title := "Jobs"
 	if len(m.jobs) > 0 {
@@ -189,7 +231,7 @@ func (m Model) renderJobs(r rect) string {
 	innerW := r.w - 2
 	contentH := r.h - 2
 	var lines []string
-	for i := range m.jobs {
+	for i := m.jobWindowStart(contentH); i < len(m.jobs); i++ {
 		if len(lines) >= contentH {
 			break
 		}
@@ -201,13 +243,26 @@ func (m Model) renderJobs(r rect) string {
 		}
 	}
 	styledTitle := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render(title)
-	return m.panelBox(r, styledTitle, strings.Join(lines, "\n"))
+	return m.panelBoxOpts(r, styledTitle, strings.Join(lines, "\n"), panelOpts{
+		hint:    "↑↓ select · enter pin",
+		focused: m.focus == focusJobs,
+		pulse:   m.pulsePhase(m.summary().running),
+	})
 }
 
-// jobBlock renders the jobBlockHeight content lines for one job: a header line
-// with cursor/icon/pin/name and right-aligned status, a progress-bar line, and
-// a metadata line (events, tags, exit code). Every line is exactly innerW cells
-// wide so the selected block's amber highlight spans the full column.
+// selectedStyle is the accent-tinted, bold highlight of the selected job: loud
+// enough to find at a glance, calm enough not to glare.
+func (m Model) selectedStyle() lipgloss.Style {
+	if m.dark {
+		return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#f4f0ff")).Background(lipgloss.Color("#3b2f78"))
+	}
+	return lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#1d1540")).Background(lipgloss.Color("#d9d0fb"))
+}
+
+// jobBlock renders jobRows(i) lines for one job: a header line (cursor, icon,
+// pin, name, right-aligned status); a progress-bar line with events when the job
+// has progress; and, for the selected job only, a details line (events, tags,
+// exit code). Every line is exactly innerW cells wide.
 func (m Model) jobBlock(i int, innerW int) []string {
 	j := m.jobs[i]
 	sel := i == m.selected
@@ -221,7 +276,13 @@ func (m Model) jobBlock(i int, innerW int) []string {
 	}
 	prefix := cursor + statusIcon(j.Status) + pin + " "
 
+	// The status word repeats what glyph and color already say, so only the
+	// selected row spells it out; other rows spend the room on the name and a
+	// dim right-aligned age/duration.
 	status := j.Status
+	if !sel {
+		status = m.jobAgeText(j)
+	}
 	if sw := lipgloss.Width(status); sw > innerW-2 {
 		status = truncate(status, innerW-2)
 	}
@@ -230,43 +291,64 @@ func (m Model) jobBlock(i int, innerW int) []string {
 	if nameArea < 1 {
 		nameArea = 1
 	}
-	row1 := fillLine(prefix+truncate(j.DisplayName(), nameArea-lipgloss.Width(prefix)), nameArea) + " " + status
+	right := status
+	if !sel {
+		right = dimStyle.Render(status)
+	}
+	out := []string{fillLine(prefix+truncate(j.DisplayName(), nameArea-lipgloss.Width(prefix)), nameArea) + " " + right}
 
-	// Progress bar line: 2-cell indent, bar, gap, then "NN%".
+	evt := fmt.Sprintf("evt %d", j.EventCount)
 	pct := m.jobProgressPercent(j.JobID)
-	row2 := ""
-	if pct >= 0 {
-		barW := innerW - 2 - 5 // indent (2) + gap (1) + "100%"
-		if barW < 1 {
-			barW = 1
+	spark := ""
+	if k := m.jobSparkMetric(j.JobID); k != "" && innerW >= 30 {
+		sc := lipgloss.NewStyle().Foreground(statusColor(j.Status, m.dark))
+		spark = " " + sc.Render(sparkline(m.seriesValues(j.JobID, k, 10), 10))
+	}
+	switch {
+	case pct >= 0:
+		pctText := fmt.Sprintf(" %3.0f%%", pct)
+		barW := innerW - 2 - lipgloss.Width(pctText) - lipgloss.Width(spark)
+		if barW < 5 {
+			spark, barW = "", innerW-2-lipgloss.Width(pctText)
 		}
-		row2 = fillLine("  "+progressBar(pct, barW)+" "+fmt.Sprintf("%.0f%%", pct), innerW)
-	} else {
-		row2 = fillLine("", innerW)
+		out = append(out, fillLine("  "+m.styledBar(j.Status, pct, max(barW, 1), sel)+pctText+spark, innerW))
+	case spark != "":
+		out = append(out, fillLine("  "+strings.TrimLeft(spark, " ")+dimStyle.Render(" "+m.jobSparkMetric(j.JobID)), innerW))
 	}
-
-	meta := fmt.Sprintf("evt %d", j.EventCount)
-	if len(j.Tags) > 0 {
-		meta += " · tags " + strings.Join(j.Tags, ",")
-	}
-	if j.ExitCode != nil {
-		meta += fmt.Sprintf(" · exit %d", *j.ExitCode)
-	}
-	row3 := fillLine("  "+truncate(meta, max(innerW-2, 0)), innerW)
-
-	out := []string{row1, row2, row3}
 	if sel {
-		amber := lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(selectedFgHex)).
-			Background(lipgloss.Color(selectedBgHex))
+		meta := evt
+		if len(j.Tags) > 0 {
+			meta += " · tags " + strings.Join(j.Tags, ",")
+		}
+		if j.ExitCode != nil {
+			meta += fmt.Sprintf(" · exit %d", *j.ExitCode)
+		}
+		out = append(out, fillLine("  "+truncate(meta, max(innerW-2, 0)), innerW))
+		st := m.selectedStyle()
 		for i := range out {
-			out[i] = amber.Render(out[i])
+			out[i] = keepBg(st, out[i])
 		}
 	} else {
 		accent := lipgloss.NewStyle().Foreground(statusColor(j.Status, m.dark))
-		out[0] = accent.Render(out[0])
-		faint := lipgloss.NewStyle().Faint(true)
-		out[1] = faint.Render(out[1])
-		out[2] = faint.Render(out[2])
+		out[0] = accent.Bold(j.Status == "failed" || j.Status == "running").Render(out[0])
+		if len(out) > 1 {
+			out[1] = lipgloss.NewStyle().Faint(true).Render(out[1])
+		}
+	}
+	if f, t := m.flashPhase(j.JobID); t > 0 && !sel {
+		// A status change glows for a few refreshes: Bloom sweeps a band of the
+		// new status color across the block, one step per refresh.
+		note := fillLine("  ↳ now "+lipgloss.NewStyle().Bold(true).Foreground(statusColor(f.to, m.dark)).Render(f.to), innerW)
+		if len(out) == 1 {
+			out = append(out, note)
+		} else {
+			out[len(out)-1] = note
+		}
+		glow := bloom.Render(innerW, len(out), bloom.Transition(t, bloom.Text(strings.Join(out, "\n")),
+			fx.Shimmer{Color: statusColor(f.to, m.dark), Width: 14}))
+		if gl := strings.Split(glow, "\n"); len(gl) == len(out) && lipgloss.Width(glow) == innerW {
+			out = gl
+		}
 	}
 	return out
 }
@@ -283,8 +365,8 @@ func (m Model) jobProgressPercent(jobID string) float64 {
 
 // summaryCounts aggregates jobs by status plus durable event totals.
 type summaryCounts struct {
-	running, completed, failed, cancelled, orphaned, other int
-	events, pendingDeliveries                              int64
+	queued, running, completed, failed, cancelled, orphaned, other int
+	events, pendingDeliveries                                      int64
 }
 
 func (m Model) summary() summaryCounts {
@@ -292,6 +374,8 @@ func (m Model) summary() summaryCounts {
 	for _, j := range m.jobs {
 		s.events += j.EventCount
 		switch j.Status {
+		case "queued", "pending":
+			s.queued++
 		case "running":
 			s.running++
 		case "completed":
@@ -315,18 +399,30 @@ func (m Model) summary() summaryCounts {
 // the header box has a stable height (headerH).
 func (m Model) renderSummaryHeader(r rect) string {
 	s := m.summary()
-	title := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render("Vanth monitor")
+	title := gradientText("Vanth monitor", true)
 
-	var badges []string
-	badges = append(badges, statusBadge("running", s.running, "#008300"))
-	badges = append(badges, statusBadge("completed", s.completed, "#2a78d6"))
-	badges = append(badges, statusBadge("failed", s.failed, "#e34948"))
-	badges = append(badges, statusBadge("cancelled", s.cancelled, "#eda100"))
-	badges = append(badges, statusBadge("orphaned", s.orphaned, "#eb6834"))
-	if s.other > 0 {
-		badges = append(badges, lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b")).Render(fmt.Sprintf("other %d", s.other)))
+	innerW := max(r.w-2, 1)
+	type badge struct {
+		status string
+		count  int
 	}
-	countLine := strings.Join(badges, "  ")
+	all := []badge{{"running", s.running}, {"queued", s.queued}, {"completed", s.completed},
+		{"failed", s.failed}, {"cancelled", s.cancelled}, {"orphaned", s.orphaned}}
+	var full, compact []string
+	for _, b := range all {
+		full = append(full, m.statusBadge(b.status, b.count, false))
+		compact = append(compact, m.statusBadge(b.status, b.count, true))
+	}
+	if s.other > 0 {
+		o := lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b")).Render(fmt.Sprintf("other %d", s.other))
+		full, compact = append(full, o), append(compact, o)
+	}
+	countLine := strings.Join(full, "  ")
+	if lipgloss.Width(countLine) > innerW {
+		// Narrow terminals: glyph + count only; the glyph keeps the status
+		// identifiable without color.
+		countLine = strings.Join(compact, " ")
+	}
 
 	// Row 2: "needs attention" triage (LEET's health badge): failed and
 	// orphaned jobs plus running jobs still below 100% progress.
@@ -338,8 +434,12 @@ func (m Model) renderSummaryHeader(r rect) string {
 	} else {
 		attnLine = lipgloss.NewStyle().Faint(true).Render("attention 0")
 	}
+	if bar := m.statusDistBar(s, min(innerW-lipgloss.Width(attnLine)-2, 24)); bar != "" {
+		attnLine += "  " + bar
+	}
 
-	// Row 3: volume totals + pinned comparisons + longest-running job.
+	// Volume totals share the triage row; mode, refresh age and stale/malformed
+	// flags live in the status bar, so the header stays two content rows.
 	totals := []string{fmt.Sprintf("jobs %d", len(m.jobs)), fmt.Sprintf("events %d", s.events)}
 	if n := len(m.pinned); n > 0 {
 		totals = append(totals, fmt.Sprintf("pinned %d", n))
@@ -347,24 +447,22 @@ func (m Model) renderSummaryHeader(r rect) string {
 	if age := m.oldestRunningAge(); age > 0 {
 		totals = append(totals, "oldest running "+formatAge(age))
 	}
-	totalsLine := strings.Join(totals, " · ")
+	totalsLine := dimStyle.Render(strings.Join(totals, " · "))
 
-	// Row 4: data source, refresh age, and durability/health flags.
-	mode := lipgloss.NewStyle().Faint(true).Render("mode " + m.mode)
-	refresh := lipgloss.NewStyle().Faint(true).Render("refresh " + refreshAge(m.lastRefresh))
-	meta := []string{mode, refresh}
-	if m.staleSince != nil {
-		meta = append(meta, lipgloss.NewStyle().Foreground(lipgloss.Color("#eda100")).Render("stale"))
+	if r.h-2 <= 1 {
+		// Compact strip: one row of badges, attention and the status bar;
+		// totals move onto the border.
+		short := dimStyle.Render("⚑ 0")
+		if attn > 0 {
+			short = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#e34948")).Render(fmt.Sprintf("⚑ %d", attn))
+		}
+		line := countLine + "  " + short
+		if room := innerW - lipgloss.Width(line) - 2; room >= 8 {
+			line += "  " + m.statusDistBar(s, min(room, 24))
+		}
+		return m.panelBoxOpts(r, title, line, panelOpts{hint: strings.Join(totals, " · ")})
 	}
-	if m.malformed > 0 {
-		meta = append(meta, lipgloss.NewStyle().Foreground(lipgloss.Color("#e34948")).Render(fmt.Sprintf("malformed %d", m.malformed)))
-	}
-	if m.warnings > 0 {
-		meta = append(meta, lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b")).Render(fmt.Sprintf("warn %d", m.warnings)))
-	}
-	metaLine := strings.Join(meta, "  ·  ")
-
-	content := lipgloss.JoinVertical(lipgloss.Top, countLine, attnLine, totalsLine, metaLine)
+	content := lipgloss.JoinVertical(lipgloss.Top, countLine, attnLine+"   "+totalsLine)
 	return m.panelBox(r, title, content)
 }
 
@@ -425,103 +523,80 @@ func formatAge(d time.Duration) string {
 	return fmt.Sprintf("%dm%02ds", m, int(d.Seconds())%60)
 }
 
-func statusBadge(label string, count int, hex string) string {
-	if count == 0 {
-		return lipgloss.NewStyle().Faint(true).Render(fmt.Sprintf("%s 0", label))
+// statusBadge renders "glyph label count" (or "glyph count" when compact) in the
+// status color; zero counts are dimmed so non-empty buckets pop.
+func (m Model) statusBadge(status string, count int, compact bool) string {
+	text := fmt.Sprintf("%s %s %d", statusIcon(status), status, count)
+	if compact {
+		text = fmt.Sprintf("%s %d", statusIcon(status), count)
 	}
-	return lipgloss.NewStyle().Foreground(lipgloss.Color(hex)).Render(fmt.Sprintf("%s %d", label, count))
+	if count == 0 {
+		return lipgloss.NewStyle().Faint(true).Render(text)
+	}
+	return lipgloss.NewStyle().Bold(true).Foreground(statusColor(status, m.dark)).Render(text)
 }
 
-// renderMetrics renders the key-metrics panel for the selected job: a progress
-// bar, durable event/delivery counts, and the latest value of every visible
-// metric series (LEET run-overview style).
-func (m Model) renderMetrics(r rect) string {
-	title := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render("Metrics")
-	if r.w < 4 || r.h < 4 {
-		return m.panelBox(r, title, "")
+// statusDistBar is a stacked bar of job counts per status, width cells wide.
+// Every non-empty status gets at least one cell. Returns "" when it cannot fit.
+func (m Model) statusDistBar(s summaryCounts, width int) string {
+	total := s.running + s.queued + s.completed + s.failed + s.cancelled + s.orphaned
+	if total == 0 || width < 8 {
+		return ""
 	}
-	innerW := r.w - 2
-	contentH := r.h - 2
-	var lines []string
-	job, ok := m.selectedJob()
-	if !ok {
-		lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render("(no job selected)"), innerW))
-		return m.panelBox(r, title, strings.Join(lines, "\n"))
-	}
-	name := lipgloss.NewStyle().Bold(true).Foreground(statusColor(job.Status, m.dark)).Render(fillLine(job.DisplayName(), innerW))
-	lines = append(lines, name)
-
-	pct := m.jobProgressPercent(job.JobID)
-	if pct >= 0 {
-		lines = append(lines, fillLine(progressBar(pct, innerW), innerW))
-	}
-
-	meta := fmt.Sprintf("events %d", job.EventCount)
-	if job.ExitCode != nil {
-		meta += fmt.Sprintf(" · exit %d", *job.ExitCode)
-	}
-	lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(meta), innerW))
-
-	// Run overview (W&B-style): notes, author@host, runtime, git branch.
-	if job.Notes != "" {
-		lines = append(lines, fillLine(lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b")).Render(truncate("notes: "+job.Notes, innerW)), innerW))
-	}
-	if overview := parseRunOverview(job.RunJSON); len(overview) > 0 {
-		for _, row := range overview {
-			if len(lines) >= contentH {
-				break
-			}
-			lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(truncate(row, innerW)), innerW))
+	order := []struct {
+		status string
+		n      int
+	}{{"running", s.running}, {"queued", s.queued}, {"completed", s.completed},
+		{"failed", s.failed}, {"cancelled", s.cancelled}, {"orphaned", s.orphaned}}
+	cells := make([]int, len(order))
+	used, nonEmpty := 0, 0
+	for i, o := range order {
+		if o.n > 0 {
+			nonEmpty++
+			cells[i] = max(1, o.n*width/total)
+			used += cells[i]
 		}
 	}
+	// Trim or pad the largest segment so the bar is exactly width cells.
+	big := 0
+	for i := range cells {
+		if cells[i] > cells[big] {
+			big = i
+		}
+	}
+	cells[big] += width - used
+	var b strings.Builder
+	for i, o := range order {
+		if cells[i] > 0 {
+			b.WriteString(lipgloss.NewStyle().Foreground(statusColor(o.status, m.dark)).
+				Render(strings.Repeat("█", cells[i])))
+		}
+	}
+	return b.String()
+}
 
-	if len(job.Tags) > 0 {
-		lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(truncate("tags "+strings.Join(job.Tags, ", "), innerW)), innerW))
+// styledBar draws a progress bar whose fill is tinted by job status and whose
+// track is dimmed. Selected rows keep the plain bar (the amber background owns
+// the colors there).
+func (m Model) styledBar(status string, pct float64, width int, selected bool) string {
+	bar := progressBar(pct, width)
+	if width <= 4 {
+		return bar
 	}
+	filled := strings.Count(bar, "█")
+	return lipgloss.NewStyle().Foreground(statusColor(status, m.dark)).Render(strings.Repeat("█", filled)) +
+		lipgloss.NewStyle().Faint(true).Render(strings.Repeat("░", width-filled))
+}
 
-	for _, metric := range m.metrics {
-		if len(lines) >= contentH {
-			break
-		}
-		pts := m.points[SeriesKey{JobID: job.JobID, Metric: metric}]
-		if len(pts) == 0 {
-			continue
-		}
-		last := pts[len(pts)-1]
-		value := lipgloss.NewStyle().Bold(true).Render(compactFmt(last.Y))
-		row := fmt.Sprintf("%-20s %s", truncate(metric, 20), value)
-		if metric == "progress.percent" {
-			row += "  " + progressBar(last.Y, max(0, innerW-28))
-		}
-		lines = append(lines, fillLine(row, innerW))
+// keepBg renders row in style st even when the row already contains styled
+// segments: their SGR resets would otherwise end st's background early.
+func keepBg(st lipgloss.Style, row string) string {
+	const mark = "\x00"
+	pre, _, ok := strings.Cut(st.Render(mark), mark)
+	if !ok || pre == "" {
+		return st.Render(row)
 	}
-
-	// Pinned jobs summary (LEET "pin to top" comparison line).
-	var pinnedIDs []string
-	for id := range m.pinned {
-		pinnedIDs = append(pinnedIDs, id)
-	}
-	if len(pinnedIDs) > 0 {
-		if len(lines) < contentH {
-			lines = append(lines, "")
-		}
-		for _, id := range pinnedIDs {
-			if len(lines) >= contentH {
-				break
-			}
-			if j, ok := m.jobByID[id]; ok {
-				pj := m.jobs[j]
-				pt := m.points[SeriesKey{JobID: id, Metric: "progress.percent"}]
-				val := ""
-				if len(pt) > 0 {
-					val = fmt.Sprintf(" %3.0f%%", pt[len(pt)-1].Y)
-				}
-				line := fmt.Sprintf("P %s%s", truncate(pj.DisplayName(), innerW-8), val)
-				lines = append(lines, fillLine(lipgloss.NewStyle().Faint(true).Render(line), innerW))
-			}
-		}
-	}
-	return m.panelBox(r, title, strings.Join(lines, "\n"))
+	return st.Render(strings.ReplaceAll(row, "\x1b[m", "\x1b[m"+pre))
 }
 
 // progressBar renders a filled progress bar of the given width for a 0-100
@@ -547,18 +622,16 @@ func progressBar(percent float64, width int) string {
 // renderCharts builds every metric chart inside its own bordered box.
 func (m Model) renderCharts(lay layout) string {
 	if len(m.metrics) == 0 {
-		title := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render("Plots")
-		if lay.chartsArea.w < 2 || lay.chartsArea.h < 2 {
+		// No per-job metrics: show fleet-level visuals instead of an empty box.
+		a := lay.chartsArea
+		if a.w < 2 || a.h < 2 {
 			return ""
 		}
-		innerW := lay.chartsArea.w - 2
-		innerH := lay.chartsArea.h - 2
-		if innerW < 1 || innerH < 1 {
-			return m.panelBox(lay.chartsArea, title, "")
+		if out := m.renderFleet(a); out != "" && lipgloss.Height(out) == a.h {
+			return out
 		}
-		msg := lipgloss.NewStyle().Faint(true).Render("no metric events yet")
-		content := lipgloss.Place(innerW, innerH, lipgloss.Center, lipgloss.Center, msg)
-		return m.panelBox(lay.chartsArea, title, content)
+		return m.panelBox(a, lipgloss.NewStyle().Bold(true).Render("Plots"),
+			lipgloss.Place(a.w-2, max(a.h-2, 1), lipgloss.Center, lipgloss.Center, dimStyle.Render("no metric events yet")))
 	}
 	if len(lay.charts) == 0 || lay.chartsArea.h <= 0 {
 		return ""
@@ -615,6 +688,13 @@ func (m Model) renderChart(cr chartRect, slots map[string]int) string {
 	if canvasW < 10 || canvasH < 3 {
 		return m.panelBox(cr.rect, title, "")
 	}
+	// Legend swatches get their own row inside the box (instead of crowding
+	// the title) whenever the chart is tall enough to spare it.
+	legend := ""
+	if len(draw) > 1 && canvasH >= 6 {
+		legend = m.chartLegend(draw, hidden, canvasW) + "\n"
+		canvasH--
+	}
 	minY, maxY, series := m.chartDomain(draw, metric, minX, maxX)
 	if minY > maxY {
 		minY, maxY = 0, 1
@@ -656,7 +736,7 @@ func (m Model) renderChart(cr chartRect, slots map[string]int) string {
 			}
 		}
 	}
-	return m.panelBox(cr.rect, title, lc.View())
+	return m.panelBoxOpts(cr.rect, title, legend+lc.View(), panelOpts{hint: m.chartReadout(metric, draw, minX, maxX), focused: m.focus == focusCharts && cr.metric == m.chartFocus})
 }
 
 type drawJob struct {
@@ -753,8 +833,9 @@ func (m Model) filteredPoints(jobID, metric string, minX, maxX float64) []Point 
 }
 
 func (m Model) newChart(w, h int, minX, maxX, minY, maxY float64) linechart.Model {
-	xStep := max(1, w/7)
-	yStep := max(1, h/4)
+	// Few labels: the shape matters more than tick values.
+	xStep := max(1, w/4)
+	yStep := yStepFor(h - 2)
 	axis := lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b"))
 	label := lipgloss.NewStyle().Foreground(lipgloss.Color("#8b8b8b"))
 	return linechart.New(w, h, minX, maxX, minY, maxY,
@@ -825,35 +906,10 @@ func nearestPoint(pts []Point, target float64) *Point {
 // caller embeds the result in the box's top border, which truncates it safely.
 func (m Model) chartTitle(metric string, draw []drawJob, hidden int, minX, maxX float64, width int) string {
 	title := lipgloss.NewStyle().Bold(true).Render(metric)
-	var legend []string
-	if len(draw) > 1 {
-		if hidden > 0 {
-			legend = append(legend, lipgloss.NewStyle().Faint(true).Render(fmt.Sprintf("+%d hidden", hidden)))
-		}
-		for _, j := range m.legendOrder(draw) {
-			c := slotColor(j.slot, m.dark)
-			legend = append(legend, lipgloss.NewStyle().Foreground(c).Render("●"+j.job.DisplayName()))
-		}
-	}
-	var readout string
-	if p := m.lastVisiblePoint(m.selectedJobID(), metric, minX, maxX); p != nil {
-		sel := m.selectedJobID()
-		for _, dj := range draw {
-			if dj.job.JobID == sel {
-				c := slotColor(dj.slot, m.dark)
-				readout = lipgloss.NewStyle().Foreground(c).Render(
-					dj.job.DisplayName() + ": " + compactFmt(p.Y))
-				break
-			}
-		}
+	if hidden > 0 && len(draw) > 1 {
+		title += "  " + lipgloss.NewStyle().Faint(true).Render(fmt.Sprintf("+%d hidden", hidden))
 	}
 	line := title
-	if len(legend) > 0 {
-		line += "  [" + strings.Join(legend, " ") + "]"
-	}
-	if readout != "" {
-		line += "  " + readout
-	}
 	if width > 0 {
 		return lipgloss.NewStyle().MaxWidth(width).Render(line)
 	}
@@ -889,33 +945,6 @@ func (m Model) lastVisiblePoint(jobID, metric string, minX, maxX float64) *Point
 
 // renderLower renders the exact event table (the default), the log tail, or a
 // hint when both panes are toggled off.
-func (m Model) renderLower(r rect) string {
-	if r.h <= 0 || r.w <= 0 {
-		return ""
-	}
-	if m.showEvents {
-		return m.renderEvents(r)
-	}
-	if m.showLogs {
-		return m.renderLogs(r)
-	}
-	if m.showSlowest {
-		return m.renderSlowest(r)
-	}
-	title := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render("Activity")
-	innerW := r.w - 2
-	innerH := r.h - 2
-	if innerW < 1 || innerH < 1 {
-		return m.panelBox(r, title, "")
-	}
-	// The event table is the default pane, so this neutral state only occurs
-	// after 'e' toggled events off; the hint advertises how to bring a pane
-	// back (and '?' opens the full key map).
-	hint := lipgloss.NewStyle().Faint(true).Render("press e: event table · l: log tail · s: slowest runs · ?: help")
-	content := lipgloss.Place(innerW, innerH, lipgloss.Center, lipgloss.Center, hint)
-	return m.panelBox(r, title, content)
-}
-
 // renderSlowest renders the top terminal runs by runtime (#6). Durations come
 // from started_at/ended_at, so running and remote-shadow rows are excluded.
 func (m Model) renderSlowest(r rect) string {
@@ -961,7 +990,10 @@ func (m Model) eventLines(events []Event, width int) []string {
 	}
 	timeW := 12
 	seqW := 7
-	typeW := 10
+	typeW := 6
+	for _, ev := range events {
+		typeW = max(typeW, min(lipgloss.Width(ev.Type), 18))
+	}
 	levelW := 7
 	fixed := timeW + seqW + typeW + levelW
 	rest := width - fixed
@@ -975,11 +1007,11 @@ func (m Model) eventLines(events []Event, width int) []string {
 		ts := truncate(FormatTimestamp(ev.CreatedAt), timeW)
 		seq := fmt.Sprintf("%6d", ev.Seq)
 		typ := truncate(ev.Type, typeW)
-		lvl := truncate(ev.Level, levelW)
+		lvl := levelStyle(ev.Level, m.dark).Render(fmt.Sprintf("%-*s", levelW, truncate(ev.Level, levelW)))
 		msg := truncate(ev.Message, msgW)
-		data := truncate(CompactJSON(ev.Data), dataW)
-		out = append(out, fmt.Sprintf("%-*s %s %-*s %-*s %-*s %s",
-			timeW, ts, seq, typeW, typ, levelW, lvl, msgW, msg, data))
+		data := truncate(CompactJSON(roundFloats(ev.Data).(map[string]any)), dataW)
+		out = append(out, fmt.Sprintf("%-*s %s %-*s %s %-*s %s",
+			timeW, ts, seq, typeW, typ, lvl, msgW, msg, data))
 	}
 	return out
 }
@@ -1033,7 +1065,10 @@ func (m Model) renderScrollPane(title string, lines []string, r rect) string {
 		}
 	}
 	styledTitle := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render(title)
-	return m.panelBox(r, styledTitle, strings.Join(out, "\n"))
+	return m.panelBoxOpts(r, styledTitle, strings.Join(out, "\n"), panelOpts{
+		hint:    "↑↓ scroll · t tail",
+		focused: m.focus == focusLower,
+	})
 }
 
 func (m Model) renderHelp(r rect) string {
@@ -1061,36 +1096,6 @@ func (m Model) renderHelp(r rect) string {
 	return m.panelBox(r, title, lipgloss.JoinVertical(lipgloss.Top, lines...))
 }
 
-// renderStatusBar renders a separator rule over a full-width status strip.
-func (m Model) renderStatusBar(lay layout) string {
-	parts := []string{
-		fmt.Sprintf("jobs: %d", len(m.jobs)),
-		fmt.Sprintf("sel: %s", truncate(m.selectedJobID(), 24)),
-		fmt.Sprintf("mode: %s", m.mode),
-	}
-	if m.staleSince != nil {
-		parts = append(parts, "stale")
-	}
-	if m.mode == ModeFallback {
-		parts = append(parts, "fallback")
-	}
-	if m.warnings > 0 {
-		parts = append(parts, fmt.Sprintf("warn: %d", m.warnings))
-	}
-	if m.malformed > 0 {
-		parts = append(parts, fmt.Sprintf("malformed: %d", m.malformed))
-	}
-	parts = append(parts, fmt.Sprintf("refresh %s ago", refreshAge(m.lastRefresh)))
-	parts = append(parts, "q quit · ? help")
-	line := strings.Join(parts, " · ")
-	line = fillLine(line, lay.lower.w)
-	rule := lipgloss.NewStyle().Foreground(lipgloss.Color(panelBorderHex)).
-		Render(strings.Repeat("─", lay.lower.w))
-	fg, bg := statusBarColors(m.dark)
-	bar := lipgloss.NewStyle().Foreground(fg).Background(bg).Render(line)
-	return rule + "\n" + bar
-}
-
 func refreshAge(t time.Time) string {
 	if t.IsZero() {
 		return "–"
@@ -1114,6 +1119,12 @@ func (m Model) centeredPane(msg string, r rect) string {
 	}
 	content := lipgloss.Place(innerW, innerH, lipgloss.Center, lipgloss.Center,
 		lipgloss.NewStyle().Faint(true).Render(msg))
+	if m.loading && innerH >= 5 && innerW >= 20 {
+		// First load: Bloom skeleton bars above the message.
+		skel := loadingSkeleton(innerW-4, innerH-2)
+		content = lipgloss.JoinVertical(lipgloss.Left, "  "+strings.ReplaceAll(skel, "\n", "\n  "),
+			lipgloss.PlaceHorizontal(innerW, lipgloss.Center, dimStyle.Render(msg)))
+	}
 	return m.panelBox(r, title, content)
 }
 
@@ -1200,54 +1211,6 @@ func compactFmt(v float64) string {
 	return strconv.FormatFloat(v, 'g', 4, 64)
 }
 
-func statusIcon(status string) string {
-	switch status {
-	case "running":
-		return "●"
-	case "completed":
-		return "✓"
-	case "failed":
-		return "✗"
-	case "cancelled":
-		return "■"
-	case "orphaned":
-		return "!"
-	default:
-		return "?"
-	}
-}
-
-func statusColor(status string, dark bool) color.Color {
-	var hex string
-	switch status {
-	case "running":
-		hex = "#008300"
-	case "completed":
-		hex = "#2a78d6"
-		if dark {
-			hex = "#3987e5"
-		}
-	case "failed":
-		hex = "#e34948"
-		if dark {
-			hex = "#e66767"
-		}
-	case "cancelled":
-		hex = "#eda100"
-		if dark {
-			hex = "#c98500"
-		}
-	case "orphaned":
-		hex = "#eb6834"
-		if dark {
-			hex = "#d95926"
-		}
-	default:
-		hex = "#8b8b8b"
-	}
-	return lipgloss.Color(hex)
-}
-
 func truncate(s string, width int) string {
 	if width <= 0 {
 		return ""
@@ -1307,4 +1270,109 @@ func padToHeight(s string, h int) string {
 		return strings.Join(lines[:h], "\n")
 	}
 	return s
+}
+
+// roundFloats returns v with every float rounded to 6 significant digits, so a
+// payload preview reads 0.864 instead of 0.8639999999999999. Values that are
+// not floats pass through; maps and slices are copied, never mutated.
+func roundFloats(v any) any {
+	switch x := v.(type) {
+	case float64:
+		r, err := strconv.ParseFloat(strconv.FormatFloat(x, 'g', 6, 64), 64)
+		if err != nil {
+			return x
+		}
+		return r
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, e := range x {
+			out[k] = roundFloats(e)
+		}
+		return out
+	case []any:
+		out := make([]any, len(x))
+		for i, e := range x {
+			out[i] = roundFloats(e)
+		}
+		return out
+	}
+	return v
+}
+
+// chartReadout is the big current value of the selected job on a chart: bold,
+// in the job's series color, with its trend arrow. It sits on the box border.
+func (m Model) chartReadout(metric string, draw []drawJob, minX, maxX float64) string {
+	sel := m.selectedJobID()
+	p := m.lastVisiblePoint(sel, metric, minX, maxX)
+	if p == nil {
+		return ""
+	}
+	for _, dj := range draw {
+		if dj.job.JobID == sel {
+			arrow := trendArrow(m.points[SeriesKey{JobID: sel, Metric: metric}])
+			return lipgloss.NewStyle().Bold(true).Foreground(slotColor(dj.slot, m.dark)).
+				Render(compactFmt(p.Y) + " " + arrow)
+		}
+	}
+	return ""
+}
+
+// jobAgeText is a compact duration for finished jobs, or the age for running
+// ones: "45s", "12m", "5h", "9d".
+func (m Model) jobAgeText(j JobSummary) string {
+	if sec, ok := j.DurationSeconds(); ok {
+		return compactDuration(time.Duration(sec * float64(time.Second)))
+	}
+	ref := j.UpdatedAt
+	if j.Status == "running" || j.Status == "queued" {
+		ref = j.CreatedAt
+		if j.StartedAt != "" {
+			ref = j.StartedAt
+		}
+	}
+	if d := ageOf(ref); d > 0 {
+		return compactDuration(d)
+	}
+	return ""
+}
+
+func compactDuration(d time.Duration) string {
+	switch {
+	case d < time.Minute:
+		return fmt.Sprintf("%ds", int(d.Seconds()))
+	case d < time.Hour:
+		return fmt.Sprintf("%dm", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("%dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("%dd", int(d.Hours()/24))
+}
+
+// yStepFor picks a y-label step that divides the graph height exactly. ntcharts
+// sizes the label gutter by sampling heights 0, step, 2*step, ... but draws the
+// top label at the full height too; when the step does not divide the height
+// the top (often widest, e.g. "100") label was never measured and got clipped.
+func yStepFor(graphH int) int {
+	if graphH <= 1 {
+		return 1
+	}
+	best, bestScore := graphH, 1<<30 // fall back to labelling just the two ends
+	for d := 1; d <= graphH; d++ {
+		if graphH%d != 0 {
+			continue
+		}
+		if labels := graphH / d; labels >= 2 && labels <= 6 {
+			if score := abs(labels - 4); score < bestScore {
+				best, bestScore = d, score
+			}
+		}
+	}
+	return best
+}
+
+func abs(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

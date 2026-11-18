@@ -91,6 +91,9 @@ type Model struct {
 	loading     bool
 	staleSince  *time.Time
 	lastRefresh time.Time
+	beat        int // refresh counter; drives the heartbeat border (no timer)
+	flash       map[string]statusFlash
+	constants   map[string]float64 // flat metrics, shown as values only
 	mode        string
 	empty       bool
 	emptyMsg    string
@@ -118,8 +121,7 @@ func New(cfg Config, q *Querier) Model {
 		// The event table is the default lower pane so the dashboard shows
 		// durable event activity immediately; 'e' and 'l' toggle between the
 		// event table, the log tail, and the neutral hint.
-		showEvents: true,
-		mode:       ModeSQLite,
+		mode: ModeSQLite,
 	}
 }
 
@@ -408,7 +410,7 @@ func (m Model) handleMouseClick(mouse tea.Mouse) (tea.Model, tea.Cmd) {
 		// the content row divided by the block height.
 		row := mouse.Y - lay.jobs.y - 1
 		if row >= 0 {
-			if idx := row / jobBlockHeight; idx < len(m.jobs) {
+			if idx := m.jobAtRow(row, lay.jobs.h-2); idx >= 0 {
 				m.selected = idx
 				m.bumpGen()
 			}
@@ -526,12 +528,15 @@ func (m Model) autoWindow(idx int) (float64, float64, bool) {
 
 func padRange(minX, maxX, frac, minPad float64) (float64, float64) {
 	r := maxX - minX
-	if r < 1e-12 {
-		pad := math.Max(math.Abs(minX)*frac, minPad)
-		return minX - pad, maxX + pad
-	}
 	pad := r * frac
-	return minX - pad, maxX + pad
+	if r < 1e-12 {
+		pad = math.Max(math.Abs(minX)*frac, minPad)
+	}
+	lo := minX - pad
+	if minX >= 0 && lo < 0 {
+		lo = 0 // data that starts at zero (steps, progress) never gets a negative axis
+	}
+	return lo, maxX + pad
 }
 
 // visibleOverlayJobs returns the jobs drawn for a metric: pinned first, then
@@ -622,6 +627,7 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 	m.mode = res.Mode
 	m.loading = false
 	m.lastRefresh = time.Now()
+	m.beat++
 	if res.Stale {
 		now := time.Now()
 		m.staleSince = &now
@@ -638,6 +644,7 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) setJobs(jobs []JobSummary) {
+	m.noteTransitions(jobs)
 	m.jobs = jobs
 	m.jobByID = map[string]int{}
 	for i, j := range jobs {
@@ -664,13 +671,43 @@ func (m *Model) setJobs(jobs []JobSummary) {
 func (m *Model) rebuildMetrics() {
 	set := m.metricSet()
 	m.metrics = m.metrics[:0]
+	m.constants = map[string]float64{}
 	for k := range set {
+		if v, ok := m.constantSeries(k); ok {
+			// A flat line (e.g. progress.total) is a fact, not a chart: it is
+			// shown as a value in the Metrics pane only.
+			m.constants[k] = v
+			continue
+		}
 		m.metrics = append(m.metrics, k)
 	}
 	sort.Strings(m.metrics)
 	if m.chartFocus >= len(m.metrics) {
 		m.chartFocus = max(0, len(m.metrics)-1)
 	}
+}
+
+// constantSeries reports whether every series of the metric has at least two
+// points and they all share one value.
+func (m *Model) constantSeries(metric string) (float64, bool) {
+	var val float64
+	seen := false
+	for key, pts := range m.points {
+		if key.Metric != metric {
+			continue
+		}
+		if len(pts) < 2 {
+			return 0, false
+		}
+		for _, p := range pts {
+			if !seen {
+				val, seen = p.Y, true
+			} else if p.Y != val {
+				return 0, false
+			}
+		}
+	}
+	return val, seen
 }
 
 // loadTargets returns the bounded set of jobs whose events are loaded.
@@ -818,4 +855,41 @@ func combineTails(stdout, stderr []string) []string {
 
 func (m *Model) bumpGen() {
 	m.gen++
+}
+
+// statusFlash remembers that a job just changed status, so its row can glow for
+// a few refreshes. Expiry is counted in refreshes, not wall time: nothing ticks
+// just to animate.
+type statusFlash struct {
+	to   string
+	beat int
+}
+
+const flashBeats = 3
+
+// noteTransitions records jobs whose status differs from the previous list.
+func (m *Model) noteTransitions(next []JobSummary) {
+	if m.flash == nil {
+		m.flash = map[string]statusFlash{}
+	}
+	for id, f := range m.flash {
+		if m.beat-f.beat >= flashBeats {
+			delete(m.flash, id)
+		}
+	}
+	for _, j := range next {
+		if i, ok := m.jobByID[j.JobID]; ok && i < len(m.jobs) && m.jobs[i].Status != j.Status {
+			// applyRefresh bumps beat right after setJobs.
+			m.flash[j.JobID] = statusFlash{to: j.Status, beat: m.beat + 1}
+		}
+	}
+}
+
+// flashPhase returns the effect progress (0,1) for a recently changed job, or 0.
+func (m Model) flashPhase(jobID string) (statusFlash, float64) {
+	f, ok := m.flash[jobID]
+	if !ok || m.beat-f.beat >= flashBeats {
+		return statusFlash{}, 0
+	}
+	return f, float64(m.beat-f.beat+1) / float64(flashBeats+1)
 }

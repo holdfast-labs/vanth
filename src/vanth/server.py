@@ -6909,7 +6909,9 @@ class JobManager:
 
     def _cached_quick_check(self) -> str:
         now = time.monotonic()
-        if self._integrity_cache_ttl() > 0 and (now - self._integrity_cache_at) < self._integrity_cache_ttl():
+        # Empty cache = never scanned. Checking the timestamp alone trusted "" for the
+        # first TTL seconds after boot, since Linux's monotonic clock starts at 0.
+        if self._integrity_cache and self._integrity_cache_ttl() > 0 and (now - self._integrity_cache_at) < self._integrity_cache_ttl():
             return self._integrity_cache
         result = self._select_all("PRAGMA quick_check")[0][0]
         self._integrity_cache = result
@@ -7586,7 +7588,11 @@ class JobManager:
             data={"actor": actor, "reason": reason},
         )
         if not changed:
-            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal or owned by a newer launch"}
+            status = self.status(job_id)["status"]
+            # The runner usually records our stop's cancellation before we do;
+            # already-terminal jobs returned above, so cancelled means it worked.
+            message = "Job stopped" if status == "cancelled" else "Job was already terminal or owned by a newer launch"
+            return {"job_id": job_id, "status": status, "message": message}
         failures = []
         runner_pid = int(row["worker_pid"]) if row["worker_pid"] else None
         if runner_pid and not self._terminate_pid(runner_pid, signal == "kill", deadline):

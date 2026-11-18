@@ -131,9 +131,10 @@ def test_mcp_job_start_wake_me_payload(monkeypatch):
     assert target["type"] == "opencode_thread"
     assert target["events"] == ["completed", "failed", "timeout", "cancelled", "orphaned"]
     assert target["cwd"]  # pins relay resolution to the caller's directory
-    server_mod.job_start(command="echo hi", wake_me=True, cwd="D:\\proj")
-    # The job runs in D:\proj, but the relay registered the caller's directory.
-    assert captured["payload"]["cwd"] == "D:\\proj"
+    job_dir = os.path.abspath("proj")  # absolute on every OS; "D:\proj" is relative on POSIX
+    server_mod.job_start(command="echo hi", wake_me=True, cwd=job_dir)
+    # The job runs in job_dir, but the relay registered the caller's directory.
+    assert captured["payload"]["cwd"] == job_dir
     assert captured["payload"]["wake_targets"][0]["cwd"] == os.getcwd()
     # Explicit wake_targets win over the shorthand.
     explicit = [{"type": "local_command", "events": ["checkpoint"], "command": ["echo", "hi"]}]

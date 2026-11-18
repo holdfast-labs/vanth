@@ -189,3 +189,39 @@ def test_mcp_relative_cwd_resolves_against_caller(monkeypatch):
     assert captured[-1]["cwd"] == "proj"
     server_mod.job_rerun("job_x", cwd="proj", remote_id="r1", idempotency_key="k")
     assert captured[-1]["cwd"] == "proj"
+
+
+def test_doctor_scans_integrity_on_freshly_booted_host(tmp_path, monkeypatch):
+    """Linux's monotonic clock starts at boot; the empty initial cache must not
+    be served as a fresh quick_check result during the first TTL seconds."""
+    monkeypatch.setattr(server_mod.time, "monotonic", lambda: 5.0)
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        assert manager.doctor()["quick_check"] == "ok"
+    finally:
+        manager.close()
+
+
+def test_stop_reports_stopped_when_runner_recorded_the_cancel(tmp_path, monkeypatch):
+    """The runner often writes the cancelled transition first; the stop must
+    still say it stopped the job instead of 'already terminal'."""
+    import asyncio
+    import sys
+
+    manager = JobManager(tmp_path / "state")
+    try:
+        job = manager.start(f'"{sys.executable}" -c "import time; time.sleep(60)"')
+        asyncio.run(manager.wait(job["job_id"], ["started"], timeout_seconds=30))
+        real = manager._terminal_event
+
+        def runner_wins(job_id, status, **kwargs):
+            real(job_id, status, **kwargs)  # the runner's write lands first
+            return False
+
+        monkeypatch.setattr(manager, "_terminal_event", runner_wins)
+        result = manager.stop_sync(job["job_id"], kill_after_seconds=2)
+        assert result["status"] == "cancelled"
+        assert result["message"] == "Job stopped"
+    finally:
+        manager.begin_shutdown()
+        manager.close()

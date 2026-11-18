@@ -1,5 +1,6 @@
 """Tests for run-overview metadata capture costs and behavior."""
 
+import time
 import pytest
 
 from vanth import runtime_info
@@ -31,7 +32,8 @@ def test_git_state_refreshes_stale_entries(tmp_path, monkeypatch):
     from vanth.runtime_info import _git_cache
 
     cwd = str(tmp_path)
-    _git_cache[cwd] = (0.0, {"branch": "stale-branch"})
+    # Far in the past: 0.0 is NOT stale on a freshly booted Linux host (monotonic starts at 0).
+    _git_cache[cwd] = (time.monotonic() - 10**6, {"branch": "stale-branch"})
     monkeypatch.setattr(
         runtime_info.subprocess, "run", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("spawned git"))
     )

@@ -560,6 +560,43 @@ Notes:
 - any other field (e.g. `file`, `stage`, `phase`) is preserved and visible in
   the exact event table.
 
+### Monitor panels: choose what the monitor shows for your job
+
+Print one `panels` event (usually right after start) to declare the job's own
+visuals. The monitor draws them on the job's card in the glance view and in
+the detail dashboard's Metrics pane; jobs that declare nothing get line charts
+of their first metrics. The newest `panels` event wins, and it is stored like
+any event, so the view survives monitor restarts.
+
+```sh
+# shell / any language: one line
+echo 'AGENT_EVENT {"type":"panels","panels":[{"kind":"gauge","metric":"gpu","unit":"%"},{"kind":"line","metric":"loss"},{"kind":"stat","metric":"tokens_s","label":"tok/s"},{"kind":"text","key":"phase"}]}'
+vanth emit panels --json-data '{"panels":[{"kind":"line","metric":"loss"}]}'
+```
+
+```python
+from vanth.agent_events import agent_event
+agent_event("panels", panels=[{"kind": "gauge", "metric": "gpu", "unit": "%"},
+                              {"kind": "line", "metric": "loss"}])
+agent_event("metric", gpu=71, loss=0.42)   # the values the panels read
+```
+
+| `kind` | Shows | Fields |
+|---|---|---|
+| `gauge` | bar of the latest value in `min`..`max` (default 0..100) | `metric`, optional `min`, `max`, `unit`, `label` |
+| `line` | small chart of the metric's history + latest value and trend | `metric`, optional `unit`, `label` |
+| `stat` | the latest value as a big number | `metric`, optional `unit`, `label` |
+| `text` | a short status line: fixed `text`, or the latest value of event data field `key` (e.g. `stage`, `phase`) | `text` or `key`, optional `label` |
+
+Panels read the job's `metric` / `progress` series (including points sent with
+`job_metric_ingest`). The schema is forgiving: `kind` is case-insensitive and
+accepts `progress`/`bar`, `chart`/`sparkline`, `number`/`big`, `status`; extra
+fields are dropped; at most 8 panels; `label` is cut to 32 chars, `unit` to 12,
+`text` to 120; `metric`/`key` names must be at most 64 chars. Invalid entries
+are ignored, never fatal: the stored event lists them under `invalid`, gets
+level `warning`, and shows in the event pane; the card notes how many were
+ignored. See `examples/panels_job.py`.
+
 ### Example: a tracked downloader
 
 ```python
@@ -1290,8 +1327,14 @@ rejected.
 
 ### The Go terminal monitor
 
-The native Go dashboard reads the same home **read-only** and renders live
-plots, progress bars, the exact event table, and log tails:
+The native Go dashboard reads the same home **read-only**. It opens on a
+glance view: one card per running or queued job with a status-coloured
+progress bar, percent, elapsed time, ETA, rate (from the `progress` unit) and
+liveness (time since the last event; `late` and `STALLED` once a job is quiet
+for 3x / 6x its usual event interval), plus the job's declared panels. Finished
+runs sit in a compact strip below, failures from the last day first and in
+red. When nothing is running it says so and shows the fleet timeline. Press `v`
+for the detail dashboard with live plots, the exact event table, and log tails:
 
 ```cmd
 vanth-monitor
@@ -1309,7 +1352,7 @@ mkdir dist 2>nul & go build -o dist\vanth-monitor.exe .\cmd\vanth && dist\vanth-
 The source checkout's `vanth-monitor` wrapper does not build or discover that
 output automatically; run the executable produced by `go build` directly.
 
-Keys: `up/down` or `j/k` select jobs · `enter` pins a job's series · `e` event
+Keys: `up/down` or `j/k` select jobs · `v` glance / detail view · `enter` pins a job's series · `e` event
 table · `l` log tail · `s` slowest-runs table · `+`/`-` zoom a chart · `[`/`]`
 pan · `t` back to live tail · `?` help · `q` or `Ctrl+C` quit.
 

@@ -538,11 +538,44 @@ class RemoteJobManager:
                 if gate == "wait":
                     continue
                 if gate == "cancel":
-                    self.store.db.execute(
-                        "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? WHERE job_id=? AND status='queued'",
-                        (now_iso(), now_iso(), job_id),
-                    )
-                    self.store.update_operation_status(op_id, "failed")
+                    # Cancellation is a terminal outcome the operation state
+                    # machine never reaches through normal transitions, so set
+                    # both rows in ONE transaction (never a raw UPDATE followed
+                    # by update_operation_status's own BEGIN IMMEDIATE, which
+                    # leaves a nested transaction open on this shared
+                    # connection). The outbox row tells the controller.
+                    self.store.db.execute("BEGIN IMMEDIATE")
+                    try:
+                        self.store.db.execute(
+                            "UPDATE jobs SET status='cancelled', ended_at=?, updated_at=? "
+                            "WHERE job_id=? AND status='queued'",
+                            (now_iso(), now_iso(), job_id),
+                        )
+                        self.store.db.execute(
+                            "UPDATE remote_operations SET status='failed', error=?, updated_at=? "
+                            "WHERE op_id=?",
+                            (
+                                "trigger parent did not reach the requested status",
+                                now_iso(),
+                                op_id,
+                            ),
+                        )
+                        cancelled_row = self.store.db.execute(
+                            "SELECT job_id, name, command, status, created_at, updated_at, exit_code "
+                            "FROM jobs WHERE job_id=?",
+                            (job_id,),
+                        ).fetchone()
+                        self.feed.append_in_tx(
+                            "job.upsert",
+                            job_id=job_id,
+                            payload=dict(cancelled_row) if cancelled_row else {
+                                "job_id": job_id, "status": "cancelled",
+                            },
+                        )
+                        self.store.db.commit()
+                    except BaseException:
+                        self.store.db.rollback()
+                        raise
                     continue
                 launch = self.manager.prepare_launch(job_id)
                 if launch is None:

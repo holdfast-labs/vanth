@@ -493,15 +493,22 @@ class RemoteStore:
         settled = ("completed", "failed", "lost")
         placeholders = ",".join("?" for _ in settled)
         with self.db_lock:
-            requests = self.db.execute(
-                f"DELETE FROM remote_requests WHERE status IN ({placeholders}) AND updated_at <= ?",
-                (*settled, cutoff),
-            ).rowcount
-            tombstones = self.db.execute(
-                "DELETE FROM remote_replay_tombstones WHERE created_at <= ?", (cutoff,)
-            ).rowcount
             if commit:
-                self.db.commit()
+                self.db.execute("BEGIN IMMEDIATE")
+            try:
+                requests = self.db.execute(
+                    f"DELETE FROM remote_requests WHERE status IN ({placeholders}) AND updated_at <= ?",
+                    (*settled, cutoff),
+                ).rowcount
+                tombstones = self.db.execute(
+                    "DELETE FROM remote_replay_tombstones WHERE created_at <= ?", (cutoff,)
+                ).rowcount
+                if commit:
+                    self.db.commit()
+            except BaseException:
+                if commit:
+                    self.db.rollback()
+                raise
         return {"requests": requests, "tombstones": tombstones}
 
     @staticmethod
@@ -984,9 +991,13 @@ TRANSITION_TABLES: dict[str, dict[str, dict[str, str]]] = {
         "lost": {},
     },
     "operation": {
-        "accepted": {"queued": "queued"},
-        "queued": {"launched": "launched"},
-        "launched": {"running": "running"},
+        # An accepted op whose job row never committed (no origin mapping) is
+        # failed by the dispatcher; without this it raised on every tick.
+        "accepted": {"queued": "queued", "failed": "failed"},
+        # A queued/launched operation can fail before the runner ever reports
+        # running (e.g. prepare_launch refuses the job); failing it is terminal.
+        "queued": {"launched": "launched", "failed": "failed"},
+        "launched": {"running": "running", "failed": "failed"},
         "running": {"completed": "completed", "failed": "failed"},
         "completed": {},
         "failed": {},

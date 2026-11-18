@@ -79,6 +79,8 @@ ERROR_REGISTRY: dict[str, tuple[int, str]] = {
     "PROTOCOL_REPLAY_MISMATCH": (409, "idempotency key was reused with a different request"),
     "OPERATION_RETRY_PENDING": (503, "outcome not yet terminal; retry with the same idempotency key"),
     "STATE_EPOCH_MISMATCH": (409, "request was bound to a stale remote state epoch"),
+    "INSTANCE_ID_MISMATCH": (409, "request was bound to a different remote instance"),
+    "SNAPSHOT_EXPIRED": (409, "snapshot expired; restart sync"),
     "UNSUPPORTED_FEATURE": (501, "requested feature is not supported"),
     "AUTH_FAILED": (401, "authentication failed"),
     "INVALID_REQUEST": (422, "request payload is invalid"),
@@ -175,12 +177,15 @@ def _serialize(obj: Any) -> str:
     if isinstance(obj, (list, tuple)):
         return "[" + ",".join(_serialize(item) for item in obj) + "]"
     if isinstance(obj, dict):
+        if not all(isinstance(key, str) for key in obj):
+            raise VanthRemoteProtocolError(
+                "PROTOCOL_MALFORMED", "canonical JSON object keys must be strings"
+            )
+        # RFC 8785 sorts keys by UTF-16 code units, not code points. Encoding
+        # to big-endian UTF-16 makes the byte sort match that order (including
+        # astral characters, whose surrogate units sort before U+E000..U+FFFF).
         result = []
-        for key in sorted(obj.keys(), key=lambda k: tuple(map(ord, k))):
-            if not isinstance(key, str):
-                raise VanthRemoteProtocolError(
-                    "PROTOCOL_MALFORMED", "canonical JSON object keys must be strings"
-                )
+        for key in sorted(obj.keys(), key=lambda k: k.encode("utf-16-be", "surrogatepass")):
             result.append(_escape_string(key) + ":" + _serialize(obj[key]))
         return "{" + ",".join(result) + "}"
     raise VanthRemoteProtocolError("PROTOCOL_MALFORMED", f"canonical JSON cannot serialize {type(obj).__name__}")

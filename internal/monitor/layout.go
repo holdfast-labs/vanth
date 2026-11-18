@@ -30,10 +30,13 @@ type layout struct {
 }
 
 const (
-	// headerH is the summary header box height: top border + 4 content rows +
-	// bottom border. The extra rows carry the "needs attention" triage line and
-	// the totals line (W&B LEET run-overview style overview).
-	headerH = 6
+	// Header: a row of stat tiles (border + 3 big-number rows + border) on
+	// roomy terminals, a 3-row compact strip otherwise.
+	tilesH, stripH       = 5, 3
+	tilesMinW, tilesMinH = 100, 32
+
+	// tickerH is the default lower area: border + 3 ticker/timeline rows.
+	tickerH = 5
 
 	// jobBlockHeight is the number of content rows one job occupies in the
 	// jobs sidebar. renderJobs and the mouse hit-test in handleMouseClick both
@@ -42,9 +45,8 @@ const (
 
 	// Minimum column widths for the wide three-column layout. When the body
 	// cannot satisfy all three the layout falls back to fewer columns.
-	jobsMinW    = 26
-	metricsMinW = 30
-	chartsMinW  = 44
+	jobsMinW   = 34
+	chartsMinW = 44
 
 	panelGap = 1 // blank cells between top-level panels so borders never touch
 	statusH  = 2 // status bar: separator rule row + text row
@@ -58,18 +60,29 @@ func (m Model) computeLayout() layout {
 	if !m.ready || w < m.cfg.MinWidth || h < m.cfg.MinHeight {
 		return lay
 	}
-	lowerH := clamp((h-statusH)*35/100, 6, 18)
+	hh := stripH
+	if w >= tilesMinW && h >= tilesMinH {
+		hh = tilesH
+	}
+	// The lower area is a compact ticker + timeline unless a full pane (event
+	// table, logs, slowest runs) was asked for with e / l / s.
+	lowerH := tickerH
+	if m.lowerExpanded() {
+		lowerH = clamp((h-statusH)*35/100, 6, 18)
+	} else if h-statusH-hh < 16 {
+		lowerH = 4
+	}
 	lower := rect{x: 0, y: h - statusH - lowerH, w: w, h: lowerH}
 	lay.lower = lower
 
-	lay.header = rect{x: 0, y: 0, w: w, h: headerH}
-	bodyTop := headerH + panelGap
+	lay.header = rect{x: 0, y: 0, w: w, h: hh}
+	bodyTop := hh + panelGap
 	bodyBottom := lower.y - panelGap
 	bodyH := bodyBottom - bodyTop
 	if bodyH < 2 {
 		// Very short terminal: reclaim the gaps so the body keeps at least a
 		// two-row box (top and bottom border).
-		bodyTop = headerH
+		bodyTop = hh
 		bodyBottom = lower.y
 		bodyH = bodyBottom - bodyTop
 	}
@@ -80,63 +93,46 @@ func (m Model) computeLayout() layout {
 		return m.collapseToNarrow(lay, bodyTop, bodyBottom, w)
 	}
 
-	// Wide: sidebar | key metrics | plots. The body width (minus the two panel
-	// gaps) splits into three roughly equal thirds; minimum widths are enforced
-	// by borrowing cells from the columns with the most slack so the columns
-	// plus gaps always tile body.w exactly. When even the minimums cannot fit,
-	// the layout collapses to the narrow stack above.
-	available := w - 2*panelGap
-	if available < jobsMinW+metricsMinW+chartsMinW {
+	// Wide: a left column (jobs over key metrics) and the plots, which get the
+	// rest of the width: the charts are the point of the dashboard.
+	leftW := clamp(w*27/100, jobsMinW, 50)
+	chartsX := leftW + panelGap
+	if w-chartsX < chartsMinW {
 		return m.collapseToNarrow(lay, bodyTop, bodyBottom, w)
 	}
-	base := available / 3
-	jobsW := base
-	metricsW := base
-	chartsW := available - 2*base
-	// Rebalance columns that fell below their minimum, borrowing from columns
-	// that still have slack. Since available >= sum(min), this always succeeds
-	// and never pushes a column below its floor (see the invariant
-	// j+m >= jMin+mMin implied by the totals).
-	if chartsW < chartsMinW {
-		need := chartsMinW - chartsW
-		if take := min(need, jobsW-jobsMinW); take > 0 {
-			jobsW -= take
-			chartsW += take
-			need -= take
+	jobsH, metricsH := bodyH, 0
+	if bodyH >= 16 {
+		// The Metrics pane shrinks to its content; the jobs list gets the rest.
+		metricsH = clamp(m.metricsHeight(leftW-2), 4, bodyH*45/100)
+		jobsH = bodyH - metricsH
+		// A short job list gives its spare rows to the Metrics pane.
+		need := 2
+		for i := range m.jobs {
+			need += m.jobRows(i)
 		}
-		if take := min(need, metricsW-metricsMinW); take > 0 {
-			metricsW -= take
-			chartsW += take
+		if need < jobsH {
+			jobsH = max(need, 6)
+			metricsH = bodyH - jobsH
 		}
 	}
-	if metricsW < metricsMinW {
-		if take := min(metricsMinW-metricsW, jobsW-jobsMinW); take > 0 {
-			jobsW -= take
-			metricsW += take
-		}
+	lay.jobs = rect{x: 0, y: bodyTop, w: leftW, h: jobsH}
+	if metricsH > 0 {
+		lay.metrics = rect{x: 0, y: bodyTop + jobsH, w: leftW, h: metricsH}
 	}
-	if jobsW < jobsMinW {
-		if take := min(jobsMinW-jobsW, metricsW-metricsMinW); take > 0 {
-			metricsW -= take
-			jobsW += take
-		}
-	}
-
-	lay.jobs = rect{x: 0, y: bodyTop, w: jobsW, h: bodyH}
-	metricsX := jobsW + panelGap
-	lay.metrics = rect{x: metricsX, y: bodyTop, w: metricsW, h: bodyH}
-	chartsX := metricsX + metricsW + panelGap
 	chartArea := rect{x: chartsX, y: bodyTop, w: w - chartsX, h: bodyH}
 	cols := 1
-	// The chart area is now roughly a third of the screen, so a 2-column grid
-	// is only worthwhile on genuinely wide terminals where each cell still
-	// renders a comfortable braille body.
-	if chartArea.w >= 84 {
+	if chartArea.w >= 96 {
 		cols = 2
 	}
 	lay.chartsArea = chartArea
 	lay.charts = m.chartRects(chartArea, cols)
 	return lay
+}
+
+// lowerExpanded reports whether a full-size lower pane (events table, logs or
+// slowest runs) replaces the compact ticker.
+func (m Model) lowerExpanded() bool {
+	return m.showEvents || m.showLogs || m.showSlowest
 }
 
 // collapseToNarrow turns a layout into the jobs+plots stack used on narrow
@@ -145,7 +141,17 @@ func (m Model) computeLayout() layout {
 func (m Model) collapseToNarrow(lay layout, bodyTop, bodyBottom, w int) layout {
 	lay.narrow = true
 	bodyH := bodyBottom - bodyTop
-	jobsH := clamp(bodyH*45/100, 3, 14)
+	// Jobs take what their rows need (up to 58% of the body) so a short list
+	// does not leave blank rows while the plots are squeezed.
+	need := 2
+	for i := range m.jobs {
+		need += m.jobRows(i)
+	}
+	share := 58
+	if m.fleetMode() {
+		share = 70 // the fleet timeline is a luxury; the list is not
+	}
+	jobsH := clamp(min(need, bodyH*share/100), 3, 22)
 	if bodyH-jobsH-panelGap < 1 {
 		jobsH = bodyH // no room for charts; the jobs pane takes the body
 	}

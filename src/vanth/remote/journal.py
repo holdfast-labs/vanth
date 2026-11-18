@@ -77,31 +77,41 @@ class RequestJournal:
         epoch = request.get("expected_state_epoch")
         instance_id = request.get("expected_instance_id")
         with self._lock:
-            self.db.execute(
-                """
-                INSERT INTO client_requests(request_id, remote_id, idempotency_key, method,
-                  payload_json, digest, status, expected_state_epoch, expected_instance_id, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
-                ON CONFLICT(request_id) DO NOTHING
-                """,
-                (
-                    request["request_id"], request["remote_id"], request["idempotency_key"],
-                    request["method"],
-                    json.dumps(request.get("payload"), separators=(",", ":")),
-                    request["digest"], epoch, instance_id, stamp, stamp,
-                ),
-            )
-            self.db.commit()
+            try:
+                self.db.execute(
+                    """
+                    INSERT INTO client_requests(request_id, remote_id, idempotency_key, method,
+                      payload_json, digest, status, expected_state_epoch, expected_instance_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?, ?)
+                    ON CONFLICT(request_id) DO NOTHING
+                    """,
+                    (
+                        request["request_id"], request["remote_id"], request["idempotency_key"],
+                        request["method"],
+                        json.dumps(request.get("payload"), separators=(",", ":")),
+                        request["digest"], epoch, instance_id, stamp, stamp,
+                    ),
+                )
+                self.db.commit()
+            except BaseException:
+                # A failed commit (disk full, busy) must not leave an implicit
+                # transaction open for the next journal write to inherit.
+                self.db.rollback()
+                raise
 
     def mark_resolved(self, request_id: str) -> None:
         """Mark an entry resolved after a terminal outcome."""
         stamp = now_iso()
         with self._lock:
-            self.db.execute(
-                "UPDATE client_requests SET status='resolved', updated_at=? WHERE request_id=?",
-                (stamp, request_id),
-            )
-            self.db.commit()
+            try:
+                self.db.execute(
+                    "UPDATE client_requests SET status='resolved', updated_at=? WHERE request_id=?",
+                    (stamp, request_id),
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
 
     def prune_resolved(self, older_than_seconds: int) -> int:
         """Delete resolved entries past a TTL.
@@ -116,10 +126,14 @@ class RequestJournal:
 
         cutoff = (datetime.now(timezone.utc) - timedelta(seconds=older_than_seconds)).isoformat().replace("+00:00", "Z")
         with self._lock:
-            cursor = self.db.execute(
-                "DELETE FROM client_requests WHERE status='resolved' AND updated_at <= ?", (cutoff,)
-            )
-            self.db.commit()
+            try:
+                cursor = self.db.execute(
+                    "DELETE FROM client_requests WHERE status='resolved' AND updated_at <= ?", (cutoff,)
+                )
+                self.db.commit()
+            except BaseException:
+                self.db.rollback()
+                raise
         return cursor.rowcount
 
     # -- reads (CLI) -------------------------------------------------------------

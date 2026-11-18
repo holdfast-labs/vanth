@@ -618,11 +618,22 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             # thread_id/threadId is accepted as a legacy alias for session_id.
             session_id = target.get("session_id") or target.get("sessionId") or target.get("thread_id") or target.get("threadId")
             if not isinstance(session_id, str) or not session_id:
+                directory = target.get("cwd")
+                where = f" for directory {directory}" if isinstance(directory, str) and directory else ""
+                # Relay lookup is skipped for attach targets (and when the job is unknown),
+                # so only claim "no relay resolved" when lookup could have run.
+                reason = (
+                    "an attach target is delivered by `opencode run --attach`, which needs it"
+                    if target.get("attach")
+                    else f"none was resolved from a live OpenCode plugin relay{where}; "
+                    "is the vanth OpenCode plugin loaded in that session?"
+                )
                 raise ValueError(
-                    "opencode_thread target requires session_id — the OpenCode session id "
-                    "(`ses_...`, from `opencode session list` or the destination shown by "
-                    "`vanth doctor`), NOT the relay client id (`opencode-<pid>-<rand>`); "
-                    "omit it to resolve the live plugin relay for the job's directory"
+                    f"opencode_thread target requires session_id: {reason} "
+                    "Pass the OpenCode session id (`ses_...`, "
+                    "from `opencode session list` or the destination shown by "
+                    "`vanth doctor`), NOT the relay client id "
+                    "(`opencode-<pid>-<rand>`)."
                 )
             # ``attach`` is OPTIONAL: a plain TUI session exposes no server URL
             # (review P0-3), so without it the wake is delivered by the
@@ -6898,7 +6909,9 @@ class JobManager:
 
     def _cached_quick_check(self) -> str:
         now = time.monotonic()
-        if self._integrity_cache_ttl() > 0 and (now - self._integrity_cache_at) < self._integrity_cache_ttl():
+        # Empty cache = never scanned. Checking the timestamp alone trusted "" for the
+        # first TTL seconds after boot, since Linux's monotonic clock starts at 0.
+        if self._integrity_cache and self._integrity_cache_ttl() > 0 and (now - self._integrity_cache_at) < self._integrity_cache_ttl():
             return self._integrity_cache
         result = self._select_all("PRAGMA quick_check")[0][0]
         self._integrity_cache = result
@@ -7575,7 +7588,11 @@ class JobManager:
             data={"actor": actor, "reason": reason},
         )
         if not changed:
-            return {"job_id": job_id, "status": self.status(job_id)["status"], "message": "Job was already terminal or owned by a newer launch"}
+            status = self.status(job_id)["status"]
+            # The runner usually records our stop's cancellation before we do;
+            # already-terminal jobs returned above, so cancelled means it worked.
+            message = "Job stopped" if status == "cancelled" else "Job was already terminal or owned by a newer launch"
+            return {"job_id": job_id, "status": status, "message": message}
         failures = []
         runner_pid = int(row["worker_pid"]) if row["worker_pid"] else None
         if runner_pid and not self._terminate_pid(runner_pid, signal == "kill", deadline):
@@ -8225,7 +8242,11 @@ def job_start(
         origin_thread_id
         or os.environ.get("CODEX_THREAD_ID")
     )
+    # A relative cwd means the caller's directory; the daemon would resolve it
+    # against its own. Remote paths belong to the remote host: left as given.
     cwd = cwd or os.getcwd()
+    if not remote_id:
+        cwd = os.path.abspath(cwd)
     # Default: ask the daemon to attach the calling-session wake to an
     # agent-started local job that did not ask for one, so completion resumes the
     # session instead of relying on polling. Best-effort: the daemon skips it when
@@ -8246,12 +8267,16 @@ def job_start(
     if wake_me and wake_targets is None:
         # Mirror the CLI shorthand: the events MUST be present (a wake target
         # with neither events nor notify_on is rejected as empty), and the
-        # caller's directory pins relay resolution so an omitted session_id does
-        # not resolve an unrelated project's relay.
+        # CALLER's directory pins relay resolution so an omitted session_id does
+        # not resolve an unrelated project's relay. The job may run in another
+        # directory (a worktree or temp dir), but the plugin relay registers the
+        # directory the MCP server process runs in, so the target must use that
+        # same directory, not the job's cwd.
+        caller_directory = os.getcwd()
         wake_targets = [{
             "type": "opencode_thread",
             "events": ["completed", "failed", "timeout", "cancelled", "orphaned"],
-            "cwd": cwd or os.getcwd(),
+            "cwd": caller_directory,
         }]
     if wake_targets is not None:
         copied_targets = resolve_wake_target_identity(wake_targets, origin_thread_id)
@@ -8341,7 +8366,7 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
         "name": name,
         "tags": tags,
         "notes": notes,
-        "cwd": cwd,
+        "cwd": os.path.abspath(cwd) if cwd and not remote_id else cwd,
         "interactive": interactive,
         "secret_env": secret_env,
         "remote_id": remote_id,

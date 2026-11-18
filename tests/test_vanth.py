@@ -15,6 +15,13 @@ from vanth.server import JobManager, normalize_event_payload, now_iso, parse_age
 import shellcmd
 
 
+@pytest.fixture(autouse=True)
+def _policy_every_pass(monkeypatch):
+    # Policies (restart, on_failure) run on the slow maintenance pass (~2s by
+    # default); these tests observe them within ~0.6s, so run it every pass.
+    monkeypatch.setenv("VANTH_SLOW_PASS_EVERY", "1")
+
+
 def cmd(code: str) -> str:
     return shellcmd.join([sys.executable, "-c", code])
 

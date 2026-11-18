@@ -163,19 +163,20 @@ func TestLowerPaneToggles(t *testing.T) {
 	m := baseModel(t)
 	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: resultWithJobs(tj("job_a", "running"))})
 
-	// The event table is the default lower pane on startup.
-	if !m.showEvents {
-		t.Error("event table should be the default lower pane")
+	// The compact ticker + timeline is the default lower area; the full event
+	// table is opt-in.
+	if m.showEvents || m.lowerExpanded() {
+		t.Error("compact ticker should be the default lower area")
 	}
 
-	// 'e' is now a real toggle: the first press hides the events.
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: 'e'}))
-	if m.showEvents || m.showLogs {
-		t.Errorf("e: events=%v logs=%v", m.showEvents, m.showLogs)
-	}
-	// Press again to restore the event table.
+	// 'e' expands the full event table.
 	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: 'e'}))
 	if !m.showEvents || m.showLogs {
+		t.Errorf("e: events=%v logs=%v", m.showEvents, m.showLogs)
+	}
+	// Press again to return to the ticker.
+	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: 'e'}))
+	if m.showEvents || m.showLogs {
 		t.Errorf("e: events=%v logs=%v", m.showEvents, m.showLogs)
 	}
 	// 'l' switches to the log tail and hides the events.
@@ -325,18 +326,25 @@ func TestMouseClickSelectsJob(t *testing.T) {
 	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: resultWithJobs(
 		tj("job_a", "running"), tj("job_b", "running"), tj("job_c", "running"))})
 	lay := m.computeLayout()
-	// Row 0 of the box is the "Jobs" title; each job is a jobBlockHeight-tall
-	// block. The middle line of the second block (content row 1+jobBlockHeight)
-	// must select index 1.
-	m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: lay.jobs.x + 2, Y: lay.jobs.y + 1 + jobBlockHeight}))
-	if m.selected != 1 {
-		t.Errorf("click block 2 should select index 1, got %d", m.selected)
+	// Row 0 of the box is the "Jobs" title. Without progress series the selected
+	// job takes 2 content rows (header + details) and the others 1 each, so
+	// with job 0 selected: rows 0-1 = job 0, row 2 = job 1, row 3 = job 2.
+	click := func(row int) {
+		m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: lay.jobs.x + 2, Y: lay.jobs.y + 1 + row}))
 	}
-	// The last line of the first block (content row jobBlockHeight) still maps
-	// to index 0: block membership is an integer division, not a single row.
-	m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: lay.jobs.x + 2, Y: lay.jobs.y + 1 + jobBlockHeight - 1}))
+	click(2)
+	if m.selected != 1 {
+		t.Errorf("click on row 2 should select index 1, got %d", m.selected)
+	}
+	// Now job 1 is selected: row 0 = job 0, rows 1-2 = job 1 (details row
+	// still maps to it), row 3 = job 2.
+	click(2)
+	if m.selected != 1 {
+		t.Errorf("click on the selected job's details row should keep index 1, got %d", m.selected)
+	}
+	click(0)
 	if m.selected != 0 {
-		t.Errorf("click inside block 1 should select index 0, got %d", m.selected)
+		t.Errorf("click on row 0 should select index 0, got %d", m.selected)
 	}
 	// A click inside the "Jobs" title row must not change the selection.
 	m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: lay.jobs.x + 2, Y: lay.jobs.y}))

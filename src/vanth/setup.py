@@ -183,7 +183,11 @@ def register_opencode(path: Path, home: Path) -> tuple[bool, str]:
             "type": "local",
             "command": ["vanth"],
             "enabled": True,
-            "timeout": 15000,
+            # 60 s matches the reference MCP client budget. Blocking tools
+            # (job_wait, job_start_and_wait, job_stop, job_tail --follow) return
+            # before the wait slice (VANTH_MCP_WAIT_SLICE, 25 s) plus a ~5 s
+            # socket margin, and a daemon cold start can take longer than 15 s.
+            "timeout": 60000,
             # Review P0-3: without VANTH_HOME, a custom-state installation could
             # reach a different daemon (the default home). Always pin the
             # configured home so MCP talks to THIS daemon.

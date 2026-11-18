@@ -53,7 +53,7 @@ def test_register_all_clients_and_idempotence(tmp_path, monkeypatch):
         "type": "local",
         "command": ["vanth"],
         "enabled": True,
-        "timeout": 15000,
+        "timeout": 60000,
         "environment": {"VANTH_HOME": str(home)},
     }
     assert oc["mcp"]["other"] is not None  # untouched
@@ -75,6 +75,29 @@ def test_register_all_clients_and_idempotence(tmp_path, monkeypatch):
     # second run is a no-op
     assert setup.run_setup(None, home=home, assume_yes=True) == 0
     assert json.loads(opencode_path.read_text(encoding="utf-8"))["mcp"]["vanth"] is not None
+
+
+def test_setup_upgrades_stale_opencode_timeout(tmp_path, monkeypatch):
+    """A config written by an older setup has `timeout: 15000`, which is shorter
+    than a blocking MCP call (25 s wait slice + margin). Re-running setup owns
+    the entry, so it must raise the timeout to 60000."""
+    opencode_path = tmp_path / "opencode.json"
+    opencode_path.write_text(
+        json.dumps({"mcp": {"vanth": {
+            "type": "local",
+            "command": ["vanth"],
+            "enabled": True,
+            "timeout": 15000,
+            "environment": {"VANTH_HOME": str(canonical_home())},
+        }}}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(setup, "client_config_paths", lambda home=None: {"opencode": [opencode_path]})
+
+    assert setup.run_setup(["opencode"], home=canonical_home(), assume_yes=True) == 0
+
+    entry = json.loads(opencode_path.read_text(encoding="utf-8"))["mcp"]["vanth"]
+    assert entry["timeout"] == 60000
 
 
 def test_explicit_setup_creates_missing_client_configs_without_backups(tmp_path, monkeypatch):

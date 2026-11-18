@@ -105,6 +105,19 @@ def _discovery(home: Path) -> dict[str, Any] | None:
         return None
 
 
+def _read_token(home: Path) -> str:
+    """Read the daemon auth token; '' when unreadable (missing, a directory, ...).
+
+    ``token`` is user filesystem state: an unreadable one must degrade to
+    "daemon DOWN" instead of crashing `vanth status`/`vanth restart` with a
+    traceback.
+    """
+    try:
+        return (home / "token").read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return ""
+
+
 def _daemon_version() -> str:
     """Best-effort version of the installed package (not the daemon process)."""
     try:
@@ -216,8 +229,7 @@ def cmd_status(home: Path, argv: list[str] | None = None, *, json_out: bool = Fa
         return cmd_job_status(args[0], home, json_out=json_out)
     disc = _discovery(home)
     url = disc["url"] if disc else None
-    token_path = home / "token"
-    token = token_path.read_text(encoding="utf-8").strip() if token_path.exists() else ""
+    token = _read_token(home)
 
     up = False
     health = None
@@ -461,8 +473,7 @@ def cmd_restart(home: Path, *, json_out: bool = False) -> int:
     """
     disc = _discovery(home)
     url = disc["url"] if disc else None
-    token_path = home / "token"
-    token = token_path.read_text(encoding="utf-8").strip() if token_path.exists() else ""
+    token = _read_token(home)
     was_up = bool(url and token and _health(url, token) is not None)
     old_pid = disc.get("pid") if disc else None
 
@@ -599,7 +610,11 @@ def cmd_autostart(argv: list[str], home: Path, *, json_out: bool = False) -> int
         return 0 if state.get("enabled") else 1
     if action == "enable":
         if not assume_yes and not dry_run:
-            answer = input("Install Vanth autostart? [y/N] ").strip().lower()
+            try:
+                answer = input("Install Vanth autostart? [y/N] ").strip().lower()
+            except EOFError:
+                print("vanth autostart: no interactive terminal; pass --yes to apply", file=sys.stderr)
+                return 1
             if answer not in {"y", "yes"}:
                 print("vanth autostart: declined")
                 return 0
@@ -618,7 +633,11 @@ def cmd_autostart(argv: list[str], home: Path, *, json_out: bool = False) -> int
         return 0
     if action == "disable":
         if not assume_yes and not dry_run:
-            answer = input("Remove Vanth autostart? [y/N] ").strip().lower()
+            try:
+                answer = input("Remove Vanth autostart? [y/N] ").strip().lower()
+            except EOFError:
+                print("vanth autostart: no interactive terminal; pass --yes to apply", file=sys.stderr)
+                return 1
             if answer not in {"y", "yes"}:
                 print("vanth autostart: declined")
                 return 0
@@ -1007,17 +1026,24 @@ def cmd_start(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         )
         return 2
     payload["command"] = command
+    if payload.get("cwd"):
+        # Resolve a relative --cwd against the CALLER's directory now. The
+        # daemon resolves cwd against its OWN working directory, which is
+        # wherever it was first started, so `--cwd .`/`--cwd sub` otherwise ran
+        # the job in an unrelated directory.
+        payload["cwd"] = str(Path(payload["cwd"]).expanduser().resolve())
     payload.setdefault("cwd", os.getcwd())
     if env:
         payload["env"] = env
     if wake_me_events is not None:
-        # Resolve the live plugin relay for the CALLER's directory (the job's
-        # --cwd, else this process's cwd) — an omitted cwd would otherwise match
-        # the newest relay of ANY project and wake an unrelated session.
+        # The OpenCode plugin registers the AGENT's own directory, so resolve
+        # the live plugin relay for the CALLER's directory (this process's
+        # cwd), never the job's --cwd. A job cwd would match another project's
+        # relay and wake an unrelated session (or none at all).
         wake.append({
             "type": "opencode_thread",
             "events": wake_me_events,
-            "cwd": payload.get("cwd") or os.getcwd(),
+            "cwd": os.getcwd(),
         })
     if wake:
         payload["wake_targets"] = wake
@@ -1700,6 +1726,9 @@ def cmd_rerun(argv: list[str], home: Path, *, json_out: bool = False) -> int:
         i += 1
     if env:
         payload["env"] = env
+    if payload.get("cwd"):
+        # Relative overrides resolve against the caller, not the daemon's cwd.
+        payload["cwd"] = str(Path(payload["cwd"]).expanduser().resolve())
     if tags:
         payload["tags"] = tags
     if secret_env:
@@ -2318,7 +2347,8 @@ _COMMAND_HELP: dict[str, str] = {
              "  shorthand: vanth start --wake-me -- <command> (or --wake-me=completed,failed,checkpoint)\n"
              "  --wake-me defaults to completed,failed,timeout,cancelled,orphaned.\n"
              "  needs NO session_id; the daemon resolves the live OpenCode plugin\n"
-             "  relay for --cwd. Add \"session_id\":\"ses_...\" only to target a specific\n"
+             "  relay for the CALLER's directory (where you run this command), not\n"
+             "  --cwd. Add \"session_id\":\"ses_...\" only to target a specific\n"
              "  session; never use the relay client id (opencode-<pid>-<rand>).\n"
              "\n"
              "  examples:\n"

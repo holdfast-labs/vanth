@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from vanth import cli
 
@@ -34,7 +35,11 @@ def test_wake_me_forms(monkeypatch, tmp_path):
     assert target["events"] == ["checkpoint"]
 
     assert cli.cmd_start(["--cwd", "D:\\proj", "--wake-me", "--", "echo", "ok"], tmp_path) == 0
-    assert RecordingClient.payload["wake_targets"][0]["cwd"] == "D:\\proj"
+    # A relative caller-side path is made absolute; the job keeps its --cwd.
+    assert RecordingClient.payload["cwd"] == str(Path("D:\\proj").resolve())
+    # The wake target resolves the plugin relay for the CALLER's directory,
+    # never the job's --cwd (the agent's own relay lives there).
+    assert RecordingClient.payload["wake_targets"][0]["cwd"] == os.getcwd()
 
 
 def test_wake_me_empty_is_usage_error(capsys, tmp_path):

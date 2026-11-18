@@ -133,3 +133,25 @@ def test_watchdog_survives_nonfinite_interval(monkeypatch):
         thread.join(timeout=3)
     assert exited, "the watchdog must still reap after the parent dies"
 
+
+def test_watchdog_survives_huge_finite_interval(monkeypatch):
+    """VANTH_WATCH_INTERVAL=1e20 is finite but overflows time.sleep
+    (OverflowError), which killed the watchdog thread just like NaN did."""
+    import vanth.process_watch as pw
+
+    state = {"alive": True}
+    monkeypatch.setattr(pw, "parent_pid", lambda: os.getpid())
+    monkeypatch.setattr(pw, "process_alive", lambda pid: state["alive"])
+    exited: list[bool] = []
+    thread, _ = pw.start_watchdog(
+        interval=1e20, grace=0.0, idle=0.0, on_exit=lambda: exited.append(True)
+    )
+    assert thread is not None
+    try:
+        time.sleep(0.2)
+        assert thread.is_alive(), "an overflowing interval must not kill the watchdog"
+    finally:
+        state["alive"] = False
+        thread.join(timeout=3)
+    assert exited, "the watchdog must still reap after the parent dies"
+

@@ -285,8 +285,9 @@ def start_watchdog(
     idle = idle if idle is not None else _env_float("VANTH_WATCH_IDLE", _DEFAULT_IDLE)
     # A non-finite (NaN/inf) or non-positive interval makes ``time.sleep`` raise
     # inside the watchdog thread, which silently kills the only parent-liveness
-    # guard and leaks the MCP server forever. Same for a negative grace.
-    if not (interval > 0) or interval == float("inf"):
+    # guard and leaks the MCP server forever. Same for a negative grace. A huge
+    # finite interval overflows time.sleep (OverflowError) the same way.
+    if not (0 < interval <= threading.TIMEOUT_MAX):
         interval = _DEFAULT_INTERVAL
     if not (grace >= 0) or grace == float("inf"):
         grace = _DEFAULT_GRACE

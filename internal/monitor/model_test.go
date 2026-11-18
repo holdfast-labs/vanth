@@ -12,7 +12,6 @@ func baseModel(t *testing.T) Model {
 	t.Helper()
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "home"))
 	m := New(cfg, nil)
-	m.detail = true // these tests drive the detail dashboard; glance_test.go covers the default view
 	return m
 }
 
@@ -164,10 +163,9 @@ func TestLowerPaneToggles(t *testing.T) {
 	m := baseModel(t)
 	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: resultWithJobs(tj("job_a", "running"))})
 
-	// The compact ticker + timeline is the default lower area; the full event
-	// table is opt-in.
+	// The charts are the default; the event table is opt-in.
 	if m.showEvents || m.lowerExpanded() {
-		t.Error("compact ticker should be the default lower area")
+		t.Error("no pane should be open by default")
 	}
 
 	// 'e' expands the full event table.
@@ -175,7 +173,7 @@ func TestLowerPaneToggles(t *testing.T) {
 	if !m.showEvents || m.showLogs {
 		t.Errorf("e: events=%v logs=%v", m.showEvents, m.showLogs)
 	}
-	// Press again to return to the ticker.
+	// Press again to return to the charts.
 	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: 'e'}))
 	if m.showEvents || m.showLogs {
 		t.Errorf("e: events=%v logs=%v", m.showEvents, m.showLogs)
@@ -218,71 +216,6 @@ func TestHelpToggle(t *testing.T) {
 	}
 }
 
-func TestZoomAndLiveTailReset(t *testing.T) {
-	m := baseModel(t)
-	res := resultWithJobs(tj("job_a", "running"))
-	res.Points = map[SeriesKey][]Point{
-		{JobID: "job_a", Metric: "loss"}: {
-			{X: 1, Y: 1, Seq: 1}, {X: 2, Y: 2, Seq: 2}, {X: 3, Y: 3, Seq: 3},
-		},
-	}
-	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: res})
-	if len(m.metrics) != 1 || m.metrics[0] != "loss" {
-		t.Fatalf("metrics = %v", m.metrics)
-	}
-
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: '+'}))
-	if m.liveTail {
-		t.Error("zoom should leave live tail mode")
-	}
-	if len(m.views) != 1 {
-		t.Fatalf("zoom should store a view window, got %v", m.views)
-	}
-	minX, maxX, ok := m.metricWindow(0)
-	if !ok || !(maxX > minX) {
-		t.Errorf("zoomed window invalid: %v %v %v", minX, maxX, ok)
-	}
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: 't'}))
-	if !m.liveTail || len(m.views) != 0 {
-		t.Error("t should restore live tail")
-	}
-}
-
-func TestPanMovesWindow(t *testing.T) {
-	m := baseModel(t)
-	res := resultWithJobs(tj("job_a", "running"))
-	res.Points = map[SeriesKey][]Point{
-		{JobID: "job_a", Metric: "loss"}: {{X: 1, Y: 1, Seq: 1}, {X: 100, Y: 2, Seq: 2}},
-	}
-	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: res})
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: ']'}))
-	if len(m.views) != 1 {
-		t.Fatalf("pan should create a window, got %v", m.views)
-	}
-	before := m.views[0]
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: '['}))
-	after := m.views[0]
-	if after[0] >= before[0] {
-		t.Error("[ should pan left")
-	}
-}
-
-func TestTabCyclesFocus(t *testing.T) {
-	m := baseModel(t)
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
-	if m.focus != focusCharts {
-		t.Errorf("tab focus = %v, want charts", m.focus)
-	}
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
-	if m.focus != focusLower {
-		t.Errorf("tab focus = %v, want lower", m.focus)
-	}
-	m, _ = updateModel(t, m, tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
-	if m.focus != focusJobs {
-		t.Errorf("tab focus = %v, want jobs", m.focus)
-	}
-}
-
 func TestTickSchedulesNextRefresh(t *testing.T) {
 	m := baseModel(t)
 	_, cmd := updateModel(t, m, tickMsg{})
@@ -319,75 +252,6 @@ func TestRefreshIntervalRule(t *testing.T) {
 	}
 	if got := RefreshInterval(cfg, nil); got != cfg.RefreshIdle {
 		t.Errorf("empty interval = %v", got)
-	}
-}
-
-func TestMouseClickSelectsJob(t *testing.T) {
-	m := windowed(t, baseModel(t), 120, 40)
-	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: resultWithJobs(
-		tj("job_a", "running"), tj("job_b", "running"), tj("job_c", "running"))})
-	lay := m.computeLayout()
-	// Row 0 of the box is the "Jobs" title. Without progress series the selected
-	// job takes 2 content rows (header + details) and the others 1 each, so
-	// with job 0 selected: rows 0-1 = job 0, row 2 = job 1, row 3 = job 2.
-	click := func(row int) {
-		m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: lay.jobs.x + 2, Y: lay.jobs.y + 1 + row}))
-	}
-	click(2)
-	if m.selected != 1 {
-		t.Errorf("click on row 2 should select index 1, got %d", m.selected)
-	}
-	// Now job 1 is selected: row 0 = job 0, rows 1-2 = job 1 (details row
-	// still maps to it), row 3 = job 2.
-	click(2)
-	if m.selected != 1 {
-		t.Errorf("click on the selected job's details row should keep index 1, got %d", m.selected)
-	}
-	click(0)
-	if m.selected != 0 {
-		t.Errorf("click on row 0 should select index 0, got %d", m.selected)
-	}
-	// A click inside the "Jobs" title row must not change the selection.
-	m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: lay.jobs.x + 2, Y: lay.jobs.y}))
-	if m.selected != 0 {
-		t.Errorf("click on title row should not select, got %d", m.selected)
-	}
-}
-
-func TestMouseClickSetsCrosshair(t *testing.T) {
-	m := windowed(t, baseModel(t), 120, 40)
-	res := resultWithJobs(tj("job_a", "running"))
-	res.Points = map[SeriesKey][]Point{
-		{JobID: "job_a", Metric: "loss"}: {{X: 1, Y: 1, Seq: 1}, {X: 100, Y: 2, Seq: 2}},
-	}
-	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: res})
-	lay := m.computeLayout()
-	if len(lay.charts) == 0 {
-		t.Fatal("no chart rects")
-	}
-	cr := lay.charts[0]
-	m, _ = updateModel(t, m, tea.MouseClickMsg(tea.Mouse{X: cr.x + 10, Y: cr.y + 2}))
-	if _, ok := m.crosshair[cr.metric]; !ok {
-		t.Error("click on chart should set crosshair")
-	}
-}
-
-func TestMouseWheelZoomsChart(t *testing.T) {
-	m := windowed(t, baseModel(t), 120, 40)
-	res := resultWithJobs(tj("job_a", "running"))
-	res.Points = map[SeriesKey][]Point{
-		{JobID: "job_a", Metric: "loss"}: {{X: 1, Y: 1, Seq: 1}, {X: 100, Y: 2, Seq: 2}},
-	}
-	m, _ = updateModel(t, m, refreshMsg{Gen: m.gen, Result: res})
-	lay := m.computeLayout()
-	if len(lay.charts) == 0 {
-		t.Fatal("no chart rects")
-	}
-	cr := lay.charts[0]
-	m, _ = updateModel(t, m, tea.MouseWheelMsg(tea.Mouse{
-		X: cr.x + 10, Y: cr.y + 2, Button: tea.MouseWheelUp}))
-	if len(m.views) == 0 {
-		t.Error("wheel should create a zoom window")
 	}
 }
 

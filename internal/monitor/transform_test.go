@@ -261,63 +261,6 @@ func TestEventCapBoundsMemory(t *testing.T) {
 	}
 }
 
-func mkPoint(x float64, stage string) Point {
-	return Point{X: x, Stage: stage}
-}
-
-func TestSplitSegmentsMonotonicNoBreak(t *testing.T) {
-	pts := []Point{mkPoint(1, "train"), mkPoint(2, "train"), mkPoint(3, "train")}
-	segs := SplitSegments(pts, 8)
-	if len(segs) != 1 {
-		t.Fatalf("got %d segments, want 1", len(segs))
-	}
-}
-
-func TestSplitSegmentsStageChangeBreaks(t *testing.T) {
-	pts := []Point{mkPoint(1, "train"), mkPoint(2, "train"), mkPoint(3, "eval"), mkPoint(4, "eval")}
-	segs := SplitSegments(pts, 8)
-	if len(segs) != 2 {
-		t.Fatalf("got %d segments, want 2", len(segs))
-	}
-	if len(segs[0]) != 2 || len(segs[1]) != 2 {
-		t.Errorf("segment sizes = %d/%d, want 2/2", len(segs[0]), len(segs[1]))
-	}
-}
-
-func TestSplitSegmentsXRegressionBreaks(t *testing.T) {
-	pts := []Point{mkPoint(1, "a"), mkPoint(2, "a"), mkPoint(1, "a")}
-	segs := SplitSegments(pts, 8)
-	if len(segs) != 2 {
-		t.Fatalf("got %d segments, want 2 (x regression)", len(segs))
-	}
-}
-
-func TestSplitSegmentsGapBreaks(t *testing.T) {
-	pts := []Point{mkPoint(1, "a"), mkPoint(2, "a"), mkPoint(100, "a")}
-	segs := SplitSegments(pts, 8)
-	if len(segs) != 2 {
-		t.Fatalf("got %d segments, want 2 (deliberate gap)", len(segs))
-	}
-}
-
-func TestSplitSegmentsDuplicateXConnected(t *testing.T) {
-	pts := []Point{mkPoint(1, "a"), mkPoint(1, "a"), mkPoint(2, "a")}
-	segs := SplitSegments(pts, 8)
-	if len(segs) != 1 {
-		t.Fatalf("got %d segments, want 1 (duplicate x keeps order)", len(segs))
-	}
-}
-
-func TestSplitSegmentsSinglePoint(t *testing.T) {
-	segs := SplitSegments([]Point{mkPoint(5, "a")}, 8)
-	if len(segs) != 1 || len(segs[0]) != 1 {
-		t.Fatalf("single point segmentation wrong: %+v", segs)
-	}
-	if segs := SplitSegments(nil, 8); segs != nil {
-		t.Fatalf("empty input should give nil, got %+v", segs)
-	}
-}
-
 func TestTransformKeepsAllOriginalEvents(t *testing.T) {
 	evs := []Event{
 		tev(1, "metric", map[string]any{"loss": 1.0}),

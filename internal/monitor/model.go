@@ -3,7 +3,6 @@ package monitor
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -12,22 +11,10 @@ import (
 	"github.com/charmbracelet/colorprofile"
 )
 
-// Focus regions the keyboard can move between.
-type focus int
-
+// zoom limits for the time window of a chart.
 const (
-	focusJobs focus = iota
-	focusCharts
-	focusLower
-)
-
-const (
-	zoomInFactor   = 0.6
-	zoomOutFactor  = 1.7
-	pageZoomIn     = 0.5
-	pageZoomOut    = 2.0
-	panFraction    = 0.2
-	crosshairAXISW = 6 // left columns reserved for the chart y-axis labels
+	minZoomSpan = 30 * time.Second
+	maxZoomSpan = 32 * 24 * time.Hour
 )
 
 // refreshMsg carries one immutable refresh result.
@@ -72,13 +59,11 @@ type Model struct {
 	warnings   int
 	malformed  int
 	metrics    []string
-	chartFocus int
+	chartFocus int                      // index into the chart list; its page is shown
+	zoom       map[string]time.Duration // per chart key: the time window the user zoomed to
+	colors     map[string]int           // series colour slot per charted job
 
-	liveTail  bool
-	views     map[int][2]float64
-	crosshair map[int]float64
-
-	focus       focus
+	hideSidebar bool // [ / ]: fold the sidebar into the compact run list
 	showEvents  bool
 	showLogs    bool
 	showSlowest bool
@@ -91,8 +76,7 @@ type Model struct {
 	loading     bool
 	staleSince  *time.Time
 	lastRefresh time.Time
-	beat        int // refresh counter; drives the heartbeat border (no timer)
-	flash       map[string]statusFlash
+	beat        int                // refresh counter; drives the heartbeat border (no timer)
 	constants   map[string]float64 // flat metrics, shown as values only
 	mode        string
 	empty       bool
@@ -100,7 +84,6 @@ type Model struct {
 	errorMsg    string
 
 	panels map[string]panelDecl // latest declared panels per job
-	detail bool                 // true: the detail dashboard; false: the glance view
 
 	help bool
 	quit bool
@@ -111,20 +94,16 @@ var quitCmd tea.Cmd = func() tea.Msg { return tea.Quit() }
 // New constructs a monitor model.
 func New(cfg Config, q *Querier) Model {
 	return Model{
-		cfg:       cfg,
-		q:         q,
-		pinned:    map[string]bool{},
-		jobByID:   map[string]int{},
-		points:    map[SeriesKey][]Point{},
-		events:    map[string][]Event{},
-		lastSeq:   map[string]int64{},
-		views:     map[int][2]float64{},
-		crosshair: map[int]float64{},
-		liveTail:  true,
-		// The event table is the default lower pane so the dashboard shows
-		// durable event activity immediately; 'e' and 'l' toggle between the
-		// event table, the log tail, and the neutral hint.
-		mode: ModeSQLite,
+		cfg:     cfg,
+		q:       q,
+		pinned:  map[string]bool{},
+		jobByID: map[string]int{},
+		points:  map[SeriesKey][]Point{},
+		events:  map[string][]Event{},
+		lastSeq: map[string]int64{},
+		zoom:    map[string]time.Duration{},
+		colors:  map[string]int{},
+		mode:    ModeSQLite,
 	}
 }
 
@@ -188,48 +167,86 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, quitCmd
 	}
 	if m.help {
-		if k == "?" {
+		if k == "?" || k == "esc" {
 			m.help = false
 		}
 		return m, nil
 	}
+	n := len(m.chartSpecs())
 	switch k {
 	case "?":
 		m.help = true
 	case "tab":
-		m.cycleFocus(1)
+		if n > 0 {
+			m.chartFocus = (clamp(m.chartFocus, 0, n-1) + 1) % n
+		}
 	case "shift+tab":
-		m.cycleFocus(-1)
+		if n > 0 {
+			m.chartFocus = (clamp(m.chartFocus, 0, n-1) + n - 1) % n
+		}
+	case "left", "right":
+		m.pageCharts(k == "right", n)
+	case "[", "]":
+		m.hideSidebar = !m.hideSidebar
 	case "enter":
 		m.togglePinSelected()
-	case "v":
-		m.detail = !m.detail
 	case "t":
-		m.resetLiveTail()
+		m.zoom = map[string]time.Duration{}
 	case "l":
 		return m.toggleLogs()
 	case "e":
 		m.toggleEvents()
 	case "s":
 		m.toggleSlowest()
-	case "up", "k":
-		m.moveUp()
-	case "down", "j":
-		m.moveDown()
-	case "left", "[":
-		m = m.panChart(-panFraction)
-	case "right", "]":
-		m = m.panChart(panFraction)
-	case "+", "=", "pgup":
-		m = m.zoomChart(zoomInFactor)
-	case "-", "_", "pgdn":
-		m = m.zoomChart(zoomOutFactor)
+	case "esc":
+		m.showEvents, m.showLogs, m.showSlowest, m.logLoading = false, false, false, false
+	case "up", "k", "down", "j":
+		delta := 1
+		if k == "up" || k == "k" {
+			delta = -1
+		}
+		gen := m.gen
+		m.moveGlance(delta)
+		if m.showLogs && m.gen != gen {
+			m.logLoading = true
+			return m, m.logTailCmd()
+		}
+	case "pgup":
+		m.lowerScroll++
+	case "pgdown", "pgdn":
+		m.lowerScroll = max(m.lowerScroll-1, 0)
+	case "+", "=":
+		if specs := m.chartSpecs(); n > 0 {
+			m.zoomChart(specs[clamp(m.chartFocus, 0, n-1)], 0.5)
+		}
+	case "-", "_":
+		if specs := m.chartSpecs(); n > 0 {
+			m.zoomChart(specs[clamp(m.chartFocus, 0, n-1)], 2)
+		}
 	}
 	return m, nil
 }
 
-func (m *Model) cycleFocus(delta int) {
-	m.focus = focus((int(m.focus) + delta + 3) % 3)
+// pageCharts moves the chart focus to the first chart of the next or previous
+// page of the grid.
+func (m *Model) pageCharts(next bool, n int) {
+	if n == 0 {
+		return
+	}
+	cols, rows := gridShape(m.computeLeet().main, n)
+	per := cols * rows
+	page := clamp(m.chartFocus, 0, n-1)/per - 1
+	if next {
+		page += 2
+	}
+	m.chartFocus = clamp(page, 0, (n-1)/per) * per
+}
+
+// zoomChart scales a chart's time window (factor < 1 zooms in).
+func (m *Model) zoomChart(s chartSpec, factor float64) {
+	lo, hi, _ := m.chartWindow(s)
+	span := time.Duration(float64(hi.Sub(lo)) * factor)
+	m.zoom[s.key] = min(max(span, minZoomSpan), maxZoomSpan)
 }
 
 func (m *Model) togglePinSelected() {
@@ -243,12 +260,6 @@ func (m *Model) togglePinSelected() {
 		m.pinned[id] = true
 	}
 	m.bumpGen()
-}
-
-func (m *Model) resetLiveTail() {
-	m.liveTail = true
-	m.views = map[int][2]float64{}
-	m.crosshair = map[int]float64{}
 }
 
 func (m Model) toggleLogs() (tea.Model, tea.Cmd) {
@@ -274,7 +285,7 @@ func (m *Model) toggleEvents() {
 	m.lowerScroll = 0
 }
 
-// toggleSlowest switches the lower pane to the slowest-runs table. It is
+// toggleSlowest switches the main area to the slowest-runs table. It is
 // mutually exclusive with the event table and log tail.
 func (m *Model) toggleSlowest() {
 	m.showSlowest = !m.showSlowest
@@ -322,287 +333,41 @@ func (m Model) slowestJobs(n int) []JobSummary {
 	return out
 }
 
-func (m *Model) moveUp() {
-	switch m.focus {
-	case focusJobs:
-		if !m.detail {
-			m.moveGlance(-1)
-			return
-		}
-		if m.selected > 0 {
-			m.selected--
-			m.bumpGen()
-		}
-	case focusCharts:
-		if m.chartFocus > 0 {
-			m.chartFocus--
-		}
-	case focusLower:
-		m.lowerScroll++
-	}
-}
-
-func (m *Model) moveDown() {
-	switch m.focus {
-	case focusJobs:
-		if !m.detail {
-			m.moveGlance(1)
-			return
-		}
-		if m.selected < len(m.jobs)-1 {
-			m.selected++
-			m.bumpGen()
-		}
-	case focusCharts:
-		if m.chartFocus < len(m.metrics)-1 {
-			m.chartFocus++
-		}
-	case focusLower:
-		if m.lowerScroll > 0 {
-			m.lowerScroll--
-		}
-	}
-}
-
-// zoomChart zooms the x window of the focused metric around the crosshair or
-// center.
-func (m Model) zoomChart(factor float64) Model {
-	if len(m.metrics) == 0 {
-		return m
-	}
-	idx := m.chartFocus
-	minX, maxX, ok := m.metricWindow(idx)
-	if !ok {
-		return m
-	}
-	anchor := minX + (maxX-minX)/2
-	if x, has := m.crosshair[idx]; has {
-		anchor = x
-	}
-	return m.zoomChartAt(idx, anchor, factor)
-}
-
-func (m Model) zoomChartAt(idx int, anchor, factor float64) Model {
-	minX, maxX, ok := m.metricWindow(idx)
-	if !ok {
-		return m
-	}
-	r := (maxX - minX) * factor
-	if r <= 0 || math.IsNaN(r) || math.IsInf(r, 0) {
-		return m
-	}
-	half := r / 2
-	m.views[idx] = [2]float64{anchor - half, anchor + half}
-	m.liveTail = false
-	return m
-}
-
-func (m Model) panChart(frac float64) Model {
-	if len(m.metrics) == 0 {
-		return m
-	}
-	idx := m.chartFocus
-	minX, maxX, ok := m.metricWindow(idx)
-	if !ok {
-		return m
-	}
-	shift := (maxX - minX) * frac
-	m.views[idx] = [2]float64{minX + shift, maxX + shift}
-	m.liveTail = false
-	return m
-}
-
 func (m Model) handleMouseClick(mouse tea.Mouse) (tea.Model, tea.Cmd) {
-	if !m.ready {
+	if !m.ready || len(m.jobs) == 0 {
 		return m, nil
 	}
-	if !m.detail {
-		return m.handleGlanceClick(mouse.X, mouse.Y), nil
-	}
-	lay := m.computeLayout()
-	if inRect(mouse.X, mouse.Y, lay.jobs) && lay.jobs.h > 0 {
-		// Row 0 of the box is the "Jobs" header; job blocks start at row 1 and
-		// each block is jobBlockHeight content rows tall, so the block index is
-		// the content row divided by the block height.
-		row := mouse.Y - lay.jobs.y - 1
-		if row >= 0 {
-			if idx := m.jobAtRow(row, lay.jobs.h-2); idx >= 0 {
-				m.selected = idx
-				m.bumpGen()
-			}
-		}
-		return m, nil
-	}
-	for _, cr := range lay.charts {
-		if inRect(mouse.X, mouse.Y, cr.rect) {
-			m.chartFocus = cr.metric
-			if x, ok := m.chartXAt(cr, mouse.X); ok {
-				m.crosshair[cr.metric] = x
-			}
-			return m, nil
-		}
-	}
-	if inRect(mouse.X, mouse.Y, lay.metrics) {
-		m.focus = focusCharts
-		return m, nil
-	}
-	if inRect(mouse.X, mouse.Y, lay.lower) {
-		m.focus = focusLower
+	gen := m.gen
+	m = m.leetClick(mouse.X, mouse.Y)
+	if m.showLogs && m.gen != gen {
+		m.logLoading = true
+		return m, m.logTailCmd()
 	}
 	return m, nil
 }
 
+// handleMouseWheel zooms the chart under the pointer, or scrolls an open pane.
 func (m Model) handleMouseWheel(mouse tea.Mouse) (tea.Model, tea.Cmd) {
 	if !m.ready {
 		return m, nil
 	}
-	lay := m.computeLayout()
-	for _, cr := range lay.charts {
-		if inRect(mouse.X, mouse.Y, cr.rect) {
-			m.chartFocus = cr.metric
-			anchor := 0.0
-			if x, ok := m.chartXAt(cr, mouse.X); ok {
-				anchor = x
-			}
-			factor := 1.25
-			if mouse.Button == tea.MouseWheelUp {
-				factor = 0.8
-			}
-			return m.zoomChartAt(cr.metric, anchor, factor), nil
+	up := mouse.Button == tea.MouseWheelUp
+	if m.lowerExpanded() {
+		if up {
+			m.lowerScroll++
+		} else {
+			m.lowerScroll = max(m.lowerScroll-1, 0)
 		}
+		return m, nil
+	}
+	if s, ok := m.chartAt(mouse.X, mouse.Y); ok {
+		factor := 2.0
+		if up {
+			factor = 0.5
+		}
+		m.zoomChart(s, factor)
 	}
 	return m, nil
-}
-
-func inRect(x, y int, r rect) bool {
-	return x >= r.x && x < r.x+r.w && y >= r.y && y < r.y+r.h
-}
-
-// chartXAt maps a terminal column to a metric x value using the current window.
-// cr is the full bordered box: the plot canvas begins one cell inside the left
-// border, after the y-axis labels.
-func (m Model) chartXAt(cr chartRect, mx int) (float64, bool) {
-	minX, maxX, ok := m.metricWindow(cr.metric)
-	if !ok {
-		return 0, false
-	}
-	cw := cr.w - 2 - crosshairAXISW
-	if cw <= 0 {
-		return 0, false
-	}
-	x := minX + float64(mx-(cr.x+1+crosshairAXISW))*(maxX-minX)/float64(cw)
-	if x < minX {
-		x = minX
-	}
-	if x > maxX {
-		x = maxX
-	}
-	return x, true
-}
-
-// metricWindow returns the effective x window for a metric: the stored zoom
-// window or, in live-tail mode, the padded auto window over visible points.
-func (m Model) metricWindow(idx int) (minX, maxX float64, ok bool) {
-	if idx < 0 || idx >= len(m.metrics) {
-		return 0, 0, false
-	}
-	if w, exists := m.views[idx]; exists {
-		return w[0], w[1], true
-	}
-	minX, maxX, has := m.autoWindow(idx)
-	if !has {
-		return 0, 0, false
-	}
-	px, py := padRange(minX, maxX, 0.05, 1)
-	return px, py, true
-}
-
-func (m Model) autoWindow(idx int) (float64, float64, bool) {
-	if idx < 0 || idx >= len(m.metrics) {
-		return 0, 0, false
-	}
-	metric := m.metrics[idx]
-	var minX, maxX float64
-	has := false
-	for _, j := range m.visibleOverlayJobs(metric) {
-		for _, p := range m.points[SeriesKey{JobID: j.JobID, Metric: metric}] {
-			if !has {
-				minX, maxX = p.X, p.X
-				has = true
-				continue
-			}
-			if p.X < minX {
-				minX = p.X
-			}
-			if p.X > maxX {
-				maxX = p.X
-			}
-		}
-	}
-	return minX, maxX, has
-}
-
-func padRange(minX, maxX, frac, minPad float64) (float64, float64) {
-	r := maxX - minX
-	pad := r * frac
-	if r < 1e-12 {
-		pad = math.Max(math.Abs(minX)*frac, minPad)
-	}
-	lo := minX - pad
-	if minX >= 0 && lo < 0 {
-		lo = 0 // data that starts at zero (steps, progress) never gets a negative axis
-	}
-	return lo, maxX + pad
-}
-
-// visibleOverlayJobs returns the jobs drawn for a metric: pinned first, then
-// the selected job, then the rest in list order, capped at MaxOverlays.
-func (m Model) visibleOverlayJobs(metric string) []JobSummary {
-	var pinned, rest []JobSummary
-	for _, j := range m.jobs {
-		if len(m.points[SeriesKey{JobID: j.JobID, Metric: metric}]) == 0 {
-			continue
-		}
-		if m.pinned[j.JobID] {
-			pinned = append(pinned, j)
-		} else {
-			rest = append(rest, j)
-		}
-	}
-	sel := m.selectedJobID()
-	for i, j := range rest {
-		if j.JobID == sel {
-			rest = append(rest[:i:i], rest[i+1:]...)
-			rest = append([]JobSummary{j}, rest...)
-			break
-		}
-	}
-	out := append(pinned, rest...)
-	if len(out) > m.cfg.MaxOverlays {
-		out = out[:m.cfg.MaxOverlays]
-	}
-	return out
-}
-
-// allChartJobIDs returns the IDs of every job contributing to any chart; slot
-// assignment is computed over this stable set so colors do not change with
-// list order or with the eight-overlay cap.
-func (m Model) allChartJobIDs() []string {
-	seen := map[string]bool{}
-	var ids []string
-	for _, j := range m.jobs {
-		for metric := range m.metricSet() {
-			if len(m.points[SeriesKey{JobID: j.JobID, Metric: metric}]) > 0 {
-				seen[j.JobID] = true
-				break
-			}
-		}
-	}
-	for id := range seen {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return ids
 }
 
 func (m Model) metricSet() map[string]bool {
@@ -618,8 +383,8 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 	if res.JobsOK {
 		first := len(m.jobs) == 0
 		m.setJobs(res.Jobs)
-		if first && !m.detail && len(m.jobs) > 0 {
-			m.selected = m.glanceOrder()[0] // start on the first card, not the first list row
+		if first && len(m.jobs) > 0 {
+			m.selected = m.glanceOrder()[0] // the first run of the sidebar, not of the raw list
 		}
 	}
 	m.notePanels(res.Events)
@@ -641,6 +406,7 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 		}
 		m.rebuildMetrics()
 	}
+	m.assignColors()
 	m.warnings += res.Warnings
 	if res.Malformed > m.malformed {
 		m.malformed = res.Malformed
@@ -648,7 +414,6 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 	m.mode = res.Mode
 	m.loading = false
 	m.lastRefresh = time.Now()
-	m.beat++
 	if res.Stale {
 		now := time.Now()
 		m.staleSince = &now
@@ -665,7 +430,6 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) setJobs(jobs []JobSummary) {
-	m.noteTransitions(jobs)
 	m.jobs = jobs
 	m.jobByID = map[string]int{}
 	for i, j := range jobs {
@@ -879,43 +643,9 @@ func combineTails(stdout, stderr []string) []string {
 	return out
 }
 
+// bumpGen marks a change of the selection or pins: in-flight refreshes for
+// the old target set are discarded, and the new set gets its colours.
 func (m *Model) bumpGen() {
 	m.gen++
-}
-
-// statusFlash remembers that a job just changed status, so its row can glow for
-// a few refreshes. Expiry is counted in refreshes, not wall time: nothing ticks
-// just to animate.
-type statusFlash struct {
-	to   string
-	beat int
-}
-
-const flashBeats = 3
-
-// noteTransitions records jobs whose status differs from the previous list.
-func (m *Model) noteTransitions(next []JobSummary) {
-	if m.flash == nil {
-		m.flash = map[string]statusFlash{}
-	}
-	for id, f := range m.flash {
-		if m.beat-f.beat >= flashBeats {
-			delete(m.flash, id)
-		}
-	}
-	for _, j := range next {
-		if i, ok := m.jobByID[j.JobID]; ok && i < len(m.jobs) && m.jobs[i].Status != j.Status {
-			// applyRefresh bumps beat right after setJobs.
-			m.flash[j.JobID] = statusFlash{to: j.Status, beat: m.beat + 1}
-		}
-	}
-}
-
-// flashPhase returns the effect progress (0,1) for a recently changed job, or 0.
-func (m Model) flashPhase(jobID string) (statusFlash, float64) {
-	f, ok := m.flash[jobID]
-	if !ok || m.beat-f.beat >= flashBeats {
-		return statusFlash{}, 0
-	}
-	return f, float64(m.beat-f.beat+1) / float64(flashBeats+1)
+	m.assignColors()
 }

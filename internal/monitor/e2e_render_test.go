@@ -25,7 +25,6 @@ func TestRenderRealProgressData(t *testing.T) {
 	defer q.Close()
 
 	m := New(cfg, q)
-	m.detail = true // this test asserts the charts of the detail dashboard
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 44})
 	m = updated.(Model)
 
@@ -49,18 +48,17 @@ func TestRenderRealProgressData(t *testing.T) {
 
 	view := strings.Join(strings.Split(m.render(), "\n"), "\n")
 
-	// The dashboard header must aggregate job statuses.
-	if !strings.Contains(view, "completed") || !strings.Contains(view, "failed") {
+	// The header must aggregate job statuses.
+	if !strings.Contains(view, "done") || !strings.Contains(view, "failed") {
 		t.Errorf("summary header missing status counts:\n%s", view)
 	}
 	// The jobs pane must list the job by name.
 	if !strings.Contains(view, "training run") {
 		t.Errorf("job name not rendered:\n%s", view)
 	}
-	// Metric names must appear somewhere in the dashboard (chart titles or the
-	// key-metrics panel): loss and accuracy are the numeric metric fields, and
-	// progress.percent is the normalized progress series.
-	for _, metric := range []string{"loss", "acc", "progress.percent"} {
+	// Metric names must appear as chart titles: loss and accuracy are the
+	// numeric metric fields, and progress % is the normalized progress series.
+	for _, metric := range []string{"loss", "acc", "progress %"} {
 		if !strings.Contains(view, metric) {
 			t.Errorf("metric %q not rendered:\n%s", metric, view)
 		}
@@ -70,7 +68,7 @@ func TestRenderRealProgressData(t *testing.T) {
 	if !strings.ContainsAny(view, brailleRange) {
 		t.Errorf("no braille chart glyphs rendered:\n%s", view)
 	}
-	// The key-metrics panel must show the selected job's final progress.
+	// The sidebar must show the selected job's final progress.
 	if !strings.Contains(view, "100%") {
 		t.Logf("note: progress readout not matched (formatting may vary):\n%s", view)
 	}

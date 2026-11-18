@@ -265,46 +265,6 @@ func (s *SeriesStore) appendPoint(jobID, metric string, ev Event, y float64, sta
 	}
 }
 
-// SplitSegments splits points into connectable runs. A new segment starts at
-// the first point and whenever the stage changes, x regresses, or a deliberate
-// gap (delta far beyond the typical step) appears. Duplicate x values keep
-// event order and remain connected.
-func SplitSegments(points []Point, gapFactor float64) [][]Point {
-	if len(points) <= 1 {
-		if len(points) == 0 {
-			return nil
-		}
-		return [][]Point{points}
-	}
-	typical := typicalStep(points)
-	var cuts []int
-	for i := 1; i < len(points); i++ {
-		prev, cur := points[i-1], points[i]
-		if cur.Stage != prev.Stage {
-			cuts = append(cuts, i)
-			continue
-		}
-		if cur.X < prev.X {
-			cuts = append(cuts, i)
-			continue
-		}
-		if typical > 0 && cur.X-prev.X > gapFactor*typical {
-			cuts = append(cuts, i)
-		}
-	}
-	if len(cuts) == 0 {
-		return [][]Point{points}
-	}
-	segments := make([][]Point, 0, len(cuts)+1)
-	start := 0
-	for _, c := range cuts {
-		segments = append(segments, points[start:c])
-		start = c
-	}
-	segments = append(segments, points[start:])
-	return segments
-}
-
 // typicalStep returns the lower median positive x delta of a series, or 0 when
 // no positive deltas exist. The lower median resists skew from a single large
 // gap so that one outlier delta does not inflate the "typical" step.

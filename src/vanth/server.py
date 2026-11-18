@@ -620,10 +620,17 @@ def validate_wake_targets(targets: list[dict[str, Any]] | None) -> None:
             if not isinstance(session_id, str) or not session_id:
                 directory = target.get("cwd")
                 where = f" for directory {directory}" if isinstance(directory, str) and directory else ""
+                # Relay lookup is skipped for attach targets (and when the job is unknown),
+                # so only claim "no relay resolved" when lookup could have run.
+                reason = (
+                    "an attach target is delivered by `opencode run --attach`, which needs it"
+                    if target.get("attach")
+                    else f"none was resolved from a live OpenCode plugin relay{where}; "
+                    "is the vanth OpenCode plugin loaded in that session?"
+                )
                 raise ValueError(
-                    "opencode_thread target requires session_id: no live OpenCode "
-                    f"plugin relay is registered{where}; is the vanth OpenCode plugin "
-                    "loaded in that session? Pass the OpenCode session id (`ses_...`, "
+                    f"opencode_thread target requires session_id: {reason} "
+                    "Pass the OpenCode session id (`ses_...`, "
                     "from `opencode session list` or the destination shown by "
                     "`vanth doctor`), NOT the relay client id "
                     "(`opencode-<pid>-<rand>`)."
@@ -8229,7 +8236,11 @@ def job_start(
         origin_thread_id
         or os.environ.get("CODEX_THREAD_ID")
     )
+    # A relative cwd means the caller's directory; the daemon would resolve it
+    # against its own. Remote paths belong to the remote host: left as given.
     cwd = cwd or os.getcwd()
+    if not remote_id:
+        cwd = os.path.abspath(cwd)
     # Default: ask the daemon to attach the calling-session wake to an
     # agent-started local job that did not ask for one, so completion resumes the
     # session instead of relying on polling. Best-effort: the daemon skips it when
@@ -8349,7 +8360,7 @@ def job_rerun(job_id: str, command: str | None = None, env: dict[str, str] | Non
         "name": name,
         "tags": tags,
         "notes": notes,
-        "cwd": cwd,
+        "cwd": os.path.abspath(cwd) if cwd and not remote_id else cwd,
         "interactive": interactive,
         "secret_env": secret_env,
         "remote_id": remote_id,

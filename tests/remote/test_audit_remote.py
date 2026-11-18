@@ -140,6 +140,21 @@ def test_prepare_launch_failure_marks_queued_operation_failed(tmp_path):
     assert store.db.in_transaction is False
 
 
+
+def test_accepted_operation_without_job_is_failed_once(tmp_path):
+    remote, store, _fake = make_remote(tmp_path)
+    assert remote.handle_request(request_frame(key="key-audit-orphan-01"))["kind"] == "response"
+    # Simulate an accepted op whose job/origin mapping never committed.
+    store.db.execute("DELETE FROM remote_job_origins")
+    store.db.execute("UPDATE remote_operations SET status='accepted'")
+    store.db.commit()
+
+    remote._dispatch_queued_ops()  # raised ValueError (accepted -> failed) on every tick
+
+    op = store.db.execute("SELECT status FROM remote_operations").fetchone()
+    assert op["status"] == "failed"
+    assert store.db.in_transaction is False
+
 # ---------------------------------------------------------------------------
 # Empty artifacts must transfer (zero chunks)
 # ---------------------------------------------------------------------------

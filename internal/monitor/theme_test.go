@@ -380,6 +380,9 @@ func TestJobListCollapsesRowsAndKeepsSelectionVisible(t *testing.T) {
 	if idx := m.jobAtRow(0, contentH); idx != m.jobWindowStart(contentH) {
 		t.Errorf("row 0 maps to %d", idx)
 	}
+	if idx := m.jobAtRow(contentH, contentH); idx != -1 {
+		t.Errorf("bottom border row selects hidden job %d", idx)
+	}
 }
 
 func TestConstantSeriesAreValuesNotCharts(t *testing.T) {

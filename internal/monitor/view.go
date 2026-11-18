@@ -210,6 +210,9 @@ func (m Model) jobWindowStart(contentH int) int {
 
 // jobAtRow maps a content row of the jobs pane to a job index (or -1).
 func (m Model) jobAtRow(row, contentH int) int {
+	if row < 0 || row >= contentH {
+		return -1 // border rows; a job past the last visible row is not on screen
+	}
 	y := 0
 	for i := m.jobWindowStart(contentH); i < len(m.jobs); i++ {
 		y += m.jobRows(i)

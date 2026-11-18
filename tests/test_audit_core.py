@@ -142,8 +142,50 @@ def test_unresolved_opencode_wake_names_the_directory(tmp_path):
                 ],
             )
         message = str(excinfo.value)
-        assert "no live OpenCode plugin relay is registered" in message
+        assert "none was resolved from a live OpenCode plugin relay" in message
         assert f"for directory {missing}" in message
         assert "omit it" not in message
     finally:
         manager.close()
+
+
+def test_attach_opencode_wake_without_session_names_attach(tmp_path):
+    """Relay lookup never runs for an attach target, so the error must not blame the relay."""
+    manager = JobManager(tmp_path / "state", recover=False)
+    try:
+        with pytest.raises(ValueError, match="requires session_id") as excinfo:
+            manager.start(
+                "echo nowhere",
+                cwd=str(tmp_path),
+                wake_targets=[{"type": "opencode_thread", "events": ["completed"],
+                               "attach": "http://127.0.0.1:4096"}],
+            )
+        message = str(excinfo.value)
+        assert "--attach" in message
+        assert "relay" not in message.split("Pass")[0]
+    finally:
+        manager.close()
+
+
+def test_mcp_relative_cwd_resolves_against_caller(monkeypatch):
+    """The daemon resolves cwd against its own directory, so the MCP tools must
+    send an absolute local cwd; a remote cwd belongs to the remote host."""
+    captured: list = []
+
+    class FakeClient:
+        def post(self, path, payload):
+            captured.append(payload)
+            return {"job_id": "job_x", "status": "running"}
+
+        def confirm_local_start(self, result):
+            return result
+
+    monkeypatch.setattr(server_mod, "get_client", lambda: FakeClient())
+    server_mod.job_start(command="echo hi", cwd="sub")
+    assert captured[-1]["cwd"] == os.path.abspath("sub")
+    server_mod.job_rerun("job_x", cwd="sub")
+    assert captured[-1]["cwd"] == os.path.abspath("sub")
+    server_mod.job_start(command="echo hi", cwd="proj", remote_id="r1", idempotency_key="k")
+    assert captured[-1]["cwd"] == "proj"
+    server_mod.job_rerun("job_x", cwd="proj", remote_id="r1", idempotency_key="k")
+    assert captured[-1]["cwd"] == "proj"

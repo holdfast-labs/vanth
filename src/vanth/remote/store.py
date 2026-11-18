@@ -991,7 +991,9 @@ TRANSITION_TABLES: dict[str, dict[str, dict[str, str]]] = {
         "lost": {},
     },
     "operation": {
-        "accepted": {"queued": "queued"},
+        # An accepted op whose job row never committed (no origin mapping) is
+        # failed by the dispatcher; without this it raised on every tick.
+        "accepted": {"queued": "queued", "failed": "failed"},
         # A queued/launched operation can fail before the runner ever reports
         # running (e.g. prepare_launch refuses the job); failing it is terminal.
         "queued": {"launched": "launched", "failed": "failed"},

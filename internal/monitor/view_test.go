@@ -32,6 +32,7 @@ func populatedModel(t *testing.T, width, height int) Model {
 	t.Helper()
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "home"))
 	m := New(cfg, nil)
+	m.detail = true
 	m = apply(t, m, tea.WindowSizeMsg{Width: width, Height: height})
 	res := RefreshResult{JobsOK: true, Mode: ModeSQLite, Points: map[SeriesKey][]Point{}, Events: map[string][]Event{}}
 	for i := 0; i < 10; i++ {
@@ -157,6 +158,7 @@ func TestDashboardKeyMetricsPanelShowsProgressAndValues(t *testing.T) {
 func TestViewLegendTwoSeriesAndFoldBeyondEight(t *testing.T) {
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "home"))
 	m := New(cfg, nil)
+	m.detail = true
 	m = apply(t, m, tea.WindowSizeMsg{Width: 140, Height: 44})
 	res := RefreshResult{JobsOK: true, Mode: ModeSQLite, Points: map[SeriesKey][]Point{}}
 	for i := 0; i < 10; i++ {
@@ -265,8 +267,8 @@ func TestShortRepoHandlesURLForms(t *testing.T) {
 		"https://github.com/holdfast-labs/vanth":     "vanth",
 		"git@github.com:holdfast-labs/vanth.git":     "vanth",
 		"git@github.com:vanth.git":                   "vanth",
-		"vanth": "vanth",
-		"":      "",
+		"vanth":                                      "vanth",
+		"":                                           "",
 	}
 	for in, want := range cases {
 		if got := shortRepo(in); got != want {

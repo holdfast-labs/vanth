@@ -57,6 +57,15 @@ func (m Model) render() string {
 		return fmt.Sprintf("terminal too small: %dx%d (minimum %dx%d)",
 			m.width, m.height, m.cfg.MinWidth, m.cfg.MinHeight)
 	}
+	if !m.detail && len(m.jobs) > 0 && !(m.help && m.helpOnly()) {
+		frame := m.renderGlance() + "\n" + m.renderStatusBar(layout{lower: rect{w: m.width}})
+		if m.help {
+			if out, ok := m.helpDialog(frame); ok {
+				return out
+			}
+		}
+		return frame
+	}
 	lay := m.computeLayout()
 
 	var jobsPane, metricsPane, chartsPane, lowerPane, status string
@@ -246,8 +255,12 @@ func (m Model) renderJobs(r rect) string {
 		}
 	}
 	styledTitle := lipgloss.NewStyle().Bold(true).Foreground(titleColor(m.dark)).Render(title)
+	hint := "↑↓ select · enter pin"
+	if r.w < 44 {
+		hint = "enter pin"
+	}
 	return m.panelBoxOpts(r, styledTitle, strings.Join(lines, "\n"), panelOpts{
-		hint:    "↑↓ select · enter pin",
+		hint:    hint,
 		focused: m.focus == focusJobs,
 		pulse:   m.pulsePhase(m.summary().running),
 	})
@@ -469,19 +482,21 @@ func (m Model) renderSummaryHeader(r rect) string {
 	return m.panelBox(r, title, content)
 }
 
-// attentionCount aggregates jobs that need human attention: failed or orphaned
-// jobs plus running jobs whose latest recorded progress is below 100%. Running
-// jobs without any progress series are left out (no signal one way or the
-// other).
+// attentionCount aggregates jobs that need human attention: failed, timed-out
+// or orphaned jobs plus running jobs that have stalled (gone quiet for several
+// times their usual event interval).
 func (m Model) attentionCount() int {
 	s := m.summary()
 	n := s.failed + s.orphaned
+	now := time.Now()
 	for _, j := range m.jobs {
-		if j.Status != "running" {
-			continue
-		}
-		if pct := m.jobProgressPercent(j.JobID); pct >= 0 && pct < 100 {
+		if j.Status == "timeout" {
 			n++
+		}
+		if j.Status == "running" {
+			if st, _, _ := m.jobLiveness(j, now); st == liveStalled {
+				n++
+			}
 		}
 	}
 	return n
@@ -1084,6 +1099,7 @@ func (m Model) renderHelp(r rect) string {
 		"up/down or j/k   move in list/table",
 		"tab / shift+tab  move focus",
 		"enter            pin/unpin job",
+		"v                glance cards / detail dashboard",
 		"left/right [ ]   pan x",
 		"+/-/pgup/pgdn    zoom x",
 		"t                return to live tail",
@@ -1091,7 +1107,7 @@ func (m Model) renderHelp(r rect) string {
 		"e                toggle event table",
 		"s                toggle slowest-runs table",
 		"mouse wheel      zoom chart under pointer",
-		"mouse click      select job / set crosshair",
+		"mouse click      select card or job / crosshair",
 		"?                toggle this help",
 		"q or ctrl+c      quit",
 	}
@@ -1221,17 +1237,14 @@ func truncate(s string, width int) string {
 	if lipgloss.Width(s) <= width {
 		return s
 	}
+	// Too wide: keep what fits in width-1 cells and mark the cut with "…".
 	r := []rune(s)
 	w := 0
 	for i, ru := range r {
-		ruWidth := runeWidth(ru)
-		if w+ruWidth > width {
-			if w == width {
-				return string(r[:i])
-			}
+		if w+runeWidth(ru) > width-1 {
 			return string(r[:i]) + "…"
 		}
-		w += ruWidth
+		w += runeWidth(ru)
 	}
 	return s
 }

@@ -12,6 +12,7 @@ func baseModel(t *testing.T) Model {
 	t.Helper()
 	cfg := DefaultConfig(filepath.Join(t.TempDir(), "home"))
 	m := New(cfg, nil)
+	m.detail = true // these tests drive the detail dashboard; glance_test.go covers the default view
 	return m
 }
 

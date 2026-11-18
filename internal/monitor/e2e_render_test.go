@@ -25,6 +25,7 @@ func TestRenderRealProgressData(t *testing.T) {
 	defer q.Close()
 
 	m := New(cfg, q)
+	m.detail = true // this test asserts the charts of the detail dashboard
 	updated, _ := m.Update(tea.WindowSizeMsg{Width: 160, Height: 44})
 	m = updated.(Model)
 

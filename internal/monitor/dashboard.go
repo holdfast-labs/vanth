@@ -64,6 +64,9 @@ func (m Model) tile(glyph, label string, n int, hex string, innerW int, corner s
 		lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(border).Padding(0, 1),
 		bloom.Text(strings.Join(rows, "\n")),
 	)
+	if short, ok := tileShort[label]; ok && lipgloss.Width(label)+4 > innerW {
+		label = short // narrow tile: a shorter word rather than a cut one
+	}
 	lab := lipgloss.NewStyle().Bold(n > 0).Foreground(border).Render(" " + glyph + " " + label + " ")
 	box = box.Edge(bloom.Top, bloom.Start, bloom.Text(lab).Truncate())
 	if corner != "" {
@@ -71,6 +74,8 @@ func (m Model) tile(glyph, label string, n int, hex string, innerW int, corner s
 	}
 	return box
 }
+
+var tileShort = map[string]string{"completed": "done", "cancelled": "cancel", "attention": "attn", "orphaned": "orphan"}
 
 // renderHeader draws the stat tiles (roomy terminals) or the compact strip.
 func (m Model) renderHeader(r rect) string {
@@ -107,7 +112,7 @@ func (m Model) renderTiles(r rect) string {
 		fmt.Sprintf("%d jobs · %s ev", len(m.jobs), compactFmt(float64(s.events))),
 		fmt.Sprintf("%d jobs", len(m.jobs)), fmt.Sprintf("%dj", len(m.jobs)),
 	} {
-		if lipgloss.Width(c) <= inner {
+		if lipgloss.Width(c)+2 <= inner {
 			corner = c
 			break
 		}
@@ -225,7 +230,10 @@ func (m Model) renderTicker(r rect) string {
 	}
 	typeW = min(typeW, max(innerW/3, 6))
 	for _, ev := range events[from:] {
-		ts := truncate(FormatTimestamp(ev.CreatedAt), 8)
+		ts := FormatTimestamp(ev.CreatedAt)
+		if len(ts) > 8 {
+			ts = ts[:8] // HH:MM:SS; the table (e) has milliseconds
+		}
 		msg := ev.Message
 		if msg == "" {
 			msg = CompactJSON(roundFloats(ev.Data).(map[string]any))

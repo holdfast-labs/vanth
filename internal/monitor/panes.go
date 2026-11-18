@@ -88,6 +88,12 @@ func (m Model) metricsLines(innerW, contentH int) []string {
 	if pct := m.jobProgressPercent(job.JobID); pct >= 0 {
 		add(m.styledBar(job.Status, pct, max(innerW-5, 1), false) + fmt.Sprintf(" %3.0f%%", pct))
 	}
+	// Panels the job declared for itself come before the generic metric rows.
+	if d, ok := m.panels[job.JobID]; ok {
+		for _, l := range m.renderPanelGrid(job, d.specs, innerW, 2) {
+			add(l)
+		}
+	}
 
 	// Key/value cells: bold value, dim label.
 	facts := boldStyle.Render(fmt.Sprint(job.EventCount)) + dimStyle.Render(" events")
@@ -240,7 +246,11 @@ func (m Model) renderStatusBar(lay layout) string {
 	key := func(k, d string) string {
 		return boldStyle.Render(k) + " " + d
 	}
-	hints := []string{key("q", "quit"), key("?", "help"), key("tab", "focus"), key("e/l/s", "panes")}
+	view := "detail"
+	if m.detail {
+		view = "glance"
+	}
+	hints := []string{key("q", "quit"), key("?", "help"), key("v", view), key("e/l/s", "panes"), key("tab", "focus")}
 	brand := gradientText("vanth", true) + " "
 	right := ""
 	for n := len(hints); n > 0; n-- {
@@ -289,7 +299,7 @@ func loadingSkeleton(w, h int) string {
 // Bloom; if the terminal is too small for a dialog the caller falls back to
 // the lower-pane help.
 func (m Model) helpDialog(frame string) (string, bool) {
-	const lines = 15
+	const lines = 16
 	w, h := min(m.width-4, 56), lines+2
 	if w < 40 || m.height < h+2 {
 		return "", false

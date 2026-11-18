@@ -20,6 +20,7 @@ var statuses = []string{"running", "queued", "completed", "failed", "cancelled",
 func mixedModel(t *testing.T, width, height int) Model {
 	t.Helper()
 	m := New(DefaultConfig(filepath.Join(t.TempDir(), "home")), nil)
+	m.detail = true
 	m = apply(t, m, tea.WindowSizeMsg{Width: width, Height: height})
 	res := RefreshResult{JobsOK: true, Mode: ModeSQLite, Points: map[SeriesKey][]Point{}, Events: map[string][]Event{}}
 	for i, st := range statuses {
@@ -86,7 +87,7 @@ func TestHeaderTilesWideAndStripNarrow(t *testing.T) {
 		t.Errorf("tiles should show big digits:\n%s", wide)
 	}
 	narrow := stripANSI(mixedModel(t, 80, 30).View().Content)
-	if !strings.Contains(narrow, statusIcon("failed")+" 1") || !strings.Contains(narrow, "⚑ 3") || !strings.Contains(narrow, "Vanth monitor") {
+	if !strings.Contains(narrow, statusIcon("failed")+" 1") || !strings.Contains(narrow, "⚑ 2") || !strings.Contains(narrow, "Vanth monitor") {
 		t.Errorf("narrow strip missing compact badges:\n%s", narrow)
 	}
 	if strings.Contains(narrow, "━┓") {
@@ -398,7 +399,7 @@ func TestConstantSeriesAreValuesNotCharts(t *testing.T) {
 	if m.constants["progress.total"] != 100 {
 		t.Errorf("constants = %v", m.constants)
 	}
-	if v := stripANSI(m.View().Content); !strings.Contains(v, "progress.tota") || !strings.Contains(v, "constant") {
+	if v := stripANSI(m.View().Content); !strings.Contains(v, "progress.tot") || !strings.Contains(v, "constant") {
 		t.Errorf("constant value missing from Metrics pane:\n%s", v)
 	}
 	// A single point is not "constant": it still charts.

@@ -99,6 +99,9 @@ type Model struct {
 	emptyMsg    string
 	errorMsg    string
 
+	panels map[string]panelDecl // latest declared panels per job
+	detail bool                 // true: the detail dashboard; false: the glance view
+
 	help bool
 	quit bool
 }
@@ -199,6 +202,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.cycleFocus(-1)
 	case "enter":
 		m.togglePinSelected()
+	case "v":
+		m.detail = !m.detail
 	case "t":
 		m.resetLiveTail()
 	case "l":
@@ -320,6 +325,10 @@ func (m Model) slowestJobs(n int) []JobSummary {
 func (m *Model) moveUp() {
 	switch m.focus {
 	case focusJobs:
+		if !m.detail {
+			m.moveGlance(-1)
+			return
+		}
 		if m.selected > 0 {
 			m.selected--
 			m.bumpGen()
@@ -336,6 +345,10 @@ func (m *Model) moveUp() {
 func (m *Model) moveDown() {
 	switch m.focus {
 	case focusJobs:
+		if !m.detail {
+			m.moveGlance(1)
+			return
+		}
 		if m.selected < len(m.jobs)-1 {
 			m.selected++
 			m.bumpGen()
@@ -402,6 +415,9 @@ func (m Model) panChart(frac float64) Model {
 func (m Model) handleMouseClick(mouse tea.Mouse) (tea.Model, tea.Cmd) {
 	if !m.ready {
 		return m, nil
+	}
+	if !m.detail {
+		return m.handleGlanceClick(mouse.X, mouse.Y), nil
 	}
 	lay := m.computeLayout()
 	if inRect(mouse.X, mouse.Y, lay.jobs) && lay.jobs.h > 0 {
@@ -600,8 +616,13 @@ func (m Model) metricSet() map[string]bool {
 // applyRefresh merges an immutable refresh result into the model.
 func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 	if res.JobsOK {
+		first := len(m.jobs) == 0
 		m.setJobs(res.Jobs)
+		if first && !m.detail && len(m.jobs) > 0 {
+			m.selected = m.glanceOrder()[0] // start on the first card, not the first list row
+		}
 	}
+	m.notePanels(res.Events)
 	for jobID, evs := range res.Events {
 		m.events[jobID] = append(m.events[jobID], evs...)
 		if n := len(m.events[jobID]); n > m.cfg.EventLimit {
@@ -710,25 +731,30 @@ func (m *Model) constantSeries(metric string) (float64, bool) {
 	return val, seen
 }
 
-// loadTargets returns the bounded set of jobs whose events are loaded.
+// loadTargets returns the bounded set of jobs whose events are loaded: the
+// selected job, pinned jobs, then active jobs (their cards need progress and
+// liveness), capped at MaxOverlays.
 func (m Model) loadTargets() []string {
 	targets := map[string]bool{}
-	if id := m.selectedJobID(); id != "" {
-		targets[id] = true
-	}
-	for _, j := range m.jobs {
-		if m.pinned[j.JobID] {
-			targets[j.JobID] = true
+	var out []string
+	add := func(id string) {
+		if id != "" && !targets[id] && len(out) < m.cfg.MaxOverlays {
+			targets[id] = true
+			out = append(out, id)
 		}
 	}
-	var out []string
-	for id := range targets {
-		out = append(out, id)
+	add(m.selectedJobID())
+	for _, j := range m.jobs {
+		if m.pinned[j.JobID] {
+			add(j.JobID)
+		}
+	}
+	for _, j := range m.jobs {
+		if isActive(j.Status) && !j.Shadow {
+			add(j.JobID)
+		}
 	}
 	sort.Strings(out)
-	if len(out) > m.cfg.MaxOverlays {
-		out = out[:m.cfg.MaxOverlays]
-	}
 	return out
 }
 

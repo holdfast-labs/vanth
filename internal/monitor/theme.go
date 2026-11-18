@@ -41,6 +41,7 @@ func gradientText(s string, bold bool) string {
 type panelOpts struct {
 	hint    string  // right-aligned text on the top border
 	focused bool    // accent border
+	alert   bool    // failure-red border (wins over focus)
 	pulse   float64 // heartbeat phase in (0,1]; 0 disables the border effect
 
 	// Optional dim captions on the bottom border (e.g. time-axis ends).
@@ -63,6 +64,9 @@ func (m Model) panelBoxOpts(r rect, title, content string, o panelOpts) string {
 	hex := panelBorderHex
 	if o.focused {
 		hex = focusBorderHex
+	}
+	if o.alert {
+		hex = statusHex("failed", m.dark)
 	}
 	border := lipgloss.Color(hex)
 	box := bloom.Box(
@@ -134,6 +138,8 @@ func statusIcon(status string) string {
 		return "⊘"
 	case "orphaned":
 		return "▲"
+	case "timeout":
+		return "◷"
 	default:
 		return "?"
 	}
@@ -159,6 +165,8 @@ func statusHex(status string, dark bool) string {
 		return pick("#b57f00", "#e0a526")
 	case "orphaned":
 		return pick("#eb6834", "#f07a47")
+	case "timeout":
+		return pick("#c2410c", "#f2884b")
 	default:
 		return "#8b8b8b"
 	}

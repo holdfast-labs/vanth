@@ -659,7 +659,7 @@ func (m Model) renderLeetHeader() string {
 	full := strings.Join(append(facts, m.mode, fmt.Sprintf("%d jobs", len(m.jobs)), clock), " · ")
 	for _, cand := range [][2]string{{counts(false), full}, {counts(false), clock}, {counts(false), ""}, {counts(true), clock}, {counts(true), ""}} {
 		right := fg(ch.axis).Render(cand[1]) + " "
-		if lipgloss.Width(cand[0])+lipgloss.Width(right)+1 <= w {
+		if lipgloss.Width(cand[0])+lipgloss.Width(right)+3 <= w { // keep a clear gap
 			return spread(cand[0], right, w)
 		}
 	}

@@ -68,9 +68,10 @@ Install with `uv` (Python 3.11+):
 uv tool install vanth
 ```
 
-This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
-the ops CLI as standalone tools (the wheel bundles the native Go monitor, so
-no Go toolchain is needed). Wheels are published for Windows x86_64, Linux
+This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, the
+`vanth-mcp` MCP launcher, and the ops CLI as standalone tools (`vanth-monitor`
+and `vanth-mcp` are native executables shipped in the wheel, so no Go
+toolchain is needed). Wheels are published for Windows x86_64, Linux
 x86_64/arm64, and macOS x86_64/arm64.
 
 **No Python toolchain?** Download the self-contained binary for your platform
@@ -200,8 +201,22 @@ vanth-monitor
 |---|---|---|
 | `vanth` | `uv run vanth` | MCP stdio server and human CLI |
 | `vanthd` | `uv run vanthd` | Background HTTP daemon |
-| `vanth-monitor` | `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
+| `vanth-mcp` | `uv run vanth-mcp` | MCP stdio server via a native launcher (fewer processes; what `vanth setup` registers) |
+| `vanth-monitor` | `uv run vanth-monitor` | Live terminal dashboard (native Go executable installed by the wheel) |
 | `vanth-codex-notify` | `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin and dispatches it to Codex |
+
+`vanth-mcp` and `vanth` (with no subcommand) run the same MCP server. On
+Windows the `vanth` console script costs three processes per agent (uv
+trampoline, venv launcher, interpreter); `vanth-mcp` is a native launcher that
+finds its env at run time (its own directory, or the env named by the uv tool
+receipt for `uv tool install`'s bin-dir copy), then starts the env's base
+interpreter directly with `__PYVENV_LAUNCHER__` set, so the server loads the
+env's packages exactly as the venv launcher would: two processes, and the
+server is killed with the launcher (job object) without taking the daemon down.
+On Linux/macOS it `exec`s the env's `python`: one process. If it cannot
+resolve the env it falls back to the env's own `python`, then `python` on
+`PATH`, and says so on stderr. No interpreter path is ever written to a client
+config.
 
 The MCP stdio server exits when its launching client closes stdin or dies, and
 reaps itself after `VANTH_WATCH_IDLE` seconds of idle (default 1800; `0`
@@ -404,6 +419,11 @@ vanth setup --remove
 By default setup detects clients and prompts before applying changes. `--yes`
 skips prompts, client names limit the targets, `--json` prints machine-readable
 output, and `--remove` unregisters Vanth.
+
+Setup registers the bare command `vanth-mcp` when the native launcher is
+installed with this Vanth and is what `PATH` finds, else `vanth`. Re-running
+setup after an upgrade rewrites existing `vanth` entries to `vanth-mcp`. The
+manual examples below use `vanth`; `vanth-mcp` works in the same place.
 
 Configs it manages:
 
@@ -1364,17 +1384,15 @@ a mission-control view:
 vanth-monitor
 ```
 
-Published platform wheels include the native Go binary, so `vanth-monitor`
-runs without a Go toolchain. In a source checkout on Windows, build it once
-from the repo root using `cmd.exe` (requires Go on `PATH`), then run the
-generated executable:
+Published platform wheels install `vanth-monitor` as a native executable, so
+it runs without a Go toolchain (one process; it used to be a Python console
+script that re-launched the Go binary). In a source checkout, `uv sync` builds
+it into `.venv` with the same build hook (Go on `PATH`), so `uv run
+vanth-monitor` works. To build it by hand on Windows with `cmd.exe`:
 
 ```cmd
 mkdir dist 2>nul & go build -o dist\vanth-monitor.exe .\cmd\vanth && dist\vanth-monitor.exe monitor
 ```
-
-The source checkout's `vanth-monitor` wrapper does not build or discover that
-output automatically; run the executable produced by `go build` directly.
 
 Keys: `up/down`, `left/right` or `j/k` select a job (cards, then the rail) ·
 `tab`/`shift+tab` focus a chart · `[`/`]` page the charts · `+`/`-` or the
@@ -1736,8 +1754,9 @@ go test ./...
 `uv build` produces the sdist and wheel; the wheel bundles the Go monitor.
 
 The wheel build runs a hatchling build hook (`build-hooks/bundle_monitor.py`)
-that compiles the Go monitor for the host platform and bundles it under
-`vanth/monitor-bin/` so `vanth-monitor` needs no Go toolchain at runtime. `go`
+that compiles the multi-call Go binary (`cmd/vanth`) for the host platform and
+ships it as two wheel scripts, `vanth-monitor` and `vanth-mcp` (the program
+name selects the role), so neither needs a Go toolchain at runtime. `go`
 must be on PATH when building the wheel; it is not needed to install or run it.
 Wheels are platform-tagged (`py3-none-<platform>`) because they contain the
 native binary.

@@ -333,3 +333,25 @@ def test_parent_pid_steps_over_this_interpreters_own_launcher():
     )
     assert out.returncode == 0, out.stderr
     assert int(out.stdout) == os.getpid()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shim waits for its child only on Windows")
+def test_parent_pid_steps_over_the_native_vanth_mcp_shim(monkeypatch):
+    """vanth-mcp.exe (next to the env's python) starts the base interpreter and
+    waits for it; the watchdog must watch the client that started the shim."""
+    from vanth import process_watch
+
+    scripts = r"C:\env\Scripts"
+    images = {
+        os.getpid(): r"C:\base\python.exe",
+        100: scripts + r"\vanth-mcp.exe",
+        50: r"C:\clients\agent.exe",
+    }
+    monkeypatch.setattr(process_watch, "_windows_image", images.get)
+    monkeypatch.setattr(process_watch, "_windows_parent_pids", lambda: {100: 50, 50: 4})
+    monkeypatch.setattr(sys, "executable", scripts + r"\python.exe")
+    monkeypatch.setattr(sys, "argv", [r"C:\env\Lib\site-packages\vanth\server.py"])
+    assert process_watch._skip_own_launchers(100) == 50
+    # Some other program's vanth-mcp.exe is not one of our layers.
+    images[100] = r"C:\elsewhere\vanth-mcp.exe"
+    assert process_watch._skip_own_launchers(100) == 100

@@ -9471,7 +9471,7 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
 # name a command, so the dispatch gate must look past them. The routing sets
 # live in vanth.cli (imported at the top of this module for compatibility);
 # _is_vanth_mcp_command below is the only remaining user here.
-_VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw"}
+_VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw", "vanth-mcp", "vanth-mcp.exe"}
 
 
 def _is_vanth_script_name(base: str) -> bool:

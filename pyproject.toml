@@ -62,11 +62,11 @@ dev = [
 vanth = "vanth.cli:dispatch"
 vanthd = "vanth.daemon:main"
 vanth-codex-notify = "vanth.codex_bridge:main"
-vanth-monitor = "vanth.monitor:main"
 vanth-remote-helper = "vanth.remote.helper:main"
 
 [build-system]
-requires = ["hatchling"]
+# >=1.27: build hooks may set shared_scripts (the native vanth-monitor/vanth-mcp).
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.hooks.custom]

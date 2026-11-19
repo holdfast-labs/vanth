@@ -43,12 +43,14 @@ jobs:
           wheels=(dist/*.whl)
           test -e "${wheels[0]}"
           uv run --no-cache --isolated --no-project --with "${wheels[0]}" python -c "import vanth; print(vanth.__file__)"
-      - name: Smoke bundled monitor console script
+      - name: Smoke native vanth-monitor and vanth-mcp scripts
         shell: bash
         run: |
           wheels=(dist/*.whl)
           test -e "${wheels[0]}"
           uv run --no-cache --isolated --no-project --with "${wheels[0]}" vanth-monitor --version
+          # The shim resolves the env's interpreter and runs `python -m vanth.server --version`.
+          uv run --no-cache --isolated --no-project --with "${wheels[0]}" vanth-mcp --version
 
   go:
     strategy:

@@ -234,7 +234,8 @@ def _skip_own_launchers(ppid: int) -> int:
     """Return the first ancestor that is not one of this server's launchers.
 
     ``vanth.exe`` (console-script trampoline) -> venv ``Scripts\\python.exe``
-    (launcher) -> real interpreter: both launchers wait for their child and
+    (launcher) -> real interpreter, or ``vanth-mcp.exe`` (native shim) -> real
+    interpreter: these launchers wait for their child and
     outlive a dead client, so watching the direct parent never saw the client
     die and orphaned servers lingered until the idle timeout. A layer is only
     skipped when its image is exactly this process's venv launcher
@@ -250,7 +251,10 @@ def _skip_own_launchers(ppid: int) -> int:
     # Console-script __main__ strips ".exe" from argv[0]; the trampoline has it.
     if argv0 and os.path.splitext(argv0)[1] == "":
         argv0 += ".exe"
-    for path in (sys.executable, argv0):
+    # The native vanth-mcp shim (installed next to the env's python) starts the
+    # interpreter directly and waits for it, so it is a launcher layer too.
+    shim = os.path.join(os.path.dirname(sys.executable), "vanth-mcp.exe") if sys.executable else ""
+    for path in (sys.executable, argv0, shim):
         if path and path.lower().endswith(".exe"):
             path = os.path.normcase(os.path.abspath(path))
             if path != own:

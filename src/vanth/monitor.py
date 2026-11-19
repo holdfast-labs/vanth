@@ -1,9 +1,10 @@
-"""Console entry point for the native Go terminal monitor.
+"""Python entry point (``python -m vanth.monitor``) for the native Go monitor.
 
 The monitor is a read-only Go binary that renders Vanth's durable SQLite/JSONL
-state as a Bubble Tea TUI. Platform wheels bundle the host-platform binary
-inside the wheel (``vanth/monitor-bin/vanth-monitor``); this module locates and
-re-executes it, so ``vanth-monitor`` works without a Go toolchain.
+state as a Bubble Tea TUI. Platform wheels install it as the native
+``vanth-monitor`` executable in the env's scripts directory; standalone builds
+bundle it as ``vanth/monitor-bin/vanth-monitor``. This module locates and
+re-executes it.
 
 If the bundled binary is missing (for example, in a source checkout or sdist
 install), the wrapper explains how to build and run the monitor from the Go
@@ -15,6 +16,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
 import vanth
@@ -29,9 +31,10 @@ def _binary_name() -> str:
 
 def bundled_binary() -> Path | None:
     """Return the host-platform monitor binary bundled in the wheel, if any."""
-    candidates = [
-        Path(vanth.__file__).parent / _BIN_DIR_NAME / _binary_name(),
-    ]
+    candidates = [Path(vanth.__file__).parent / _BIN_DIR_NAME / _binary_name()]
+    if not getattr(sys, "frozen", False):
+        # A frozen build is itself named vanth-monitor; never re-exec it.
+        candidates.insert(0, Path(sysconfig.get_path("scripts")) / _binary_name())
     for candidate in candidates:
         if candidate.is_file():
             return candidate
@@ -60,7 +63,7 @@ def find_monitor_binary() -> Path:
             "To use the vanth-monitor command without a Go toolchain, install "
             "the platform wheel:\n"
             "  uv tool install --force vanth\n"
-            f"(looked in: {Path(vanth.__file__).parent / _BIN_DIR_NAME})"
+            f"(looked in: {sysconfig.get_path('scripts')} and {Path(vanth.__file__).parent / _BIN_DIR_NAME})"
         )
     return bundled
 

@@ -7,6 +7,7 @@ from __future__ import annotations
 # sys.modules hit once anything async is already running).
 import base64
 import difflib
+import functools
 import hashlib
 import json
 import logging
@@ -23,7 +24,6 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -578,20 +578,25 @@ def resolve_wake_target_identity(
     return copied
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """urllib handler that refuses 3xx redirects (webhook credential safety).
+@functools.cache
+def _no_redirect_opener() -> Any:
+    """urllib opener that refuses 3xx redirects (webhook credential safety).
 
     urllib's default HTTPRedirectHandler follows redirects and re-sends the
     request headers, which would forward Authorization tokens to a different
     origin. Raising here surfaces the redirect as an HTTPError so webhook
     delivery fails instead of leaking credentials (review P1-4).
+
+    Built on first use: urllib.request (~30ms) and build_opener's SSL context
+    (~20ms) would otherwise be paid by every runner, daemon and MCP server.
     """
+    import urllib.request
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
-
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+    return urllib.request.build_opener(_NoRedirectHandler)
 
 
 def canonicalize_wake_target(target: dict[str, Any]) -> dict[str, Any]:
@@ -2387,10 +2392,12 @@ class JobManager:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        request = urllib.request.Request(
+        from urllib.request import Request
+
+        request = Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
-        with _NO_REDIRECT_OPENER.open(request, timeout=5) as response:
+        with _no_redirect_opener().open(request, timeout=5) as response:
             if response.status not in (200, 201, 202, 204):
                 raise RuntimeError(f"alert webhook returned HTTP {response.status}")
 
@@ -3126,7 +3133,9 @@ class JobManager:
         body_payload["target"] = dict(target)
         body_payload["target"].pop("headers", None)
         body = json.dumps(body_payload, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
+        from urllib.request import Request
+
+        request = Request(
             url,
             data=body,
             headers=headers,
@@ -3136,7 +3145,7 @@ class JobManager:
         try:
             # Disable automatic redirects: cross-origin redirects could exfiltrate
             # the configured headers (Authorization bearer tokens, service tokens).
-            with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            with _no_redirect_opener().open(request, timeout=timeout) as response:
                 status = response.getcode()
         except urllib.error.HTTPError as exc:
             if exc.code in (301, 302, 303, 307, 308):
@@ -6354,14 +6363,18 @@ class JobManager:
                     "set VANTH_ALLOW_HTTP_ARTIFACT_READ=1 to enable legacy retrieval"
                 )
             try:
-                with urllib.request.urlopen(uri, timeout=5) as response:
+                from urllib.request import urlopen
+
+                with urlopen(uri, timeout=5) as response:
                     content = response.read(max_bytes + 1)
             except Exception as exc:
                 raise ValueError(f"artifact content unavailable: {exc}") from None
         elif parsed.scheme in {"", "file"} or (len(parsed.scheme) == 1 and parsed.scheme.isalpha()):
             path = Path(uri)
             if parsed.scheme == "file":
-                path = Path(urllib.request.url2pathname(parsed.path))
+                from urllib.request import url2pathname
+
+                path = Path(url2pathname(parsed.path))
             if not path.is_absolute():
                 path = Path(self.home) / path
             if not path.exists() or not path.is_file():

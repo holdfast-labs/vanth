@@ -11,10 +11,10 @@ persistence and throttling.
 
 from __future__ import annotations
 
+import functools
 import os
 import socket
 import urllib.error
-import urllib.request
 from typing import Any
 
 PROBE_TYPES = {"port", "http", "log_line", "file"}
@@ -25,7 +25,13 @@ _HTTP_TIMEOUT_SECONDS = 1.0
 
 # Readiness probes connect DIRECTLY: a system/registry proxy would otherwise
 # route a localhost check (or any internal endpoint) through an unexpected hop.
-_HTTP_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+@functools.cache
+def _http_opener() -> Any:
+    # Lazy: urllib.request (~30ms) and build_opener's SSL context (~20ms)
+    # would otherwise be paid by every process that imports vanth.server.
+    from urllib.request import ProxyHandler, build_opener
+
+    return build_opener(ProxyHandler({}))
 
 
 def _positive_int(value: Any, field: str) -> int:
@@ -107,10 +113,12 @@ def evaluate_probe(probe: dict[str, Any], *, log_text: str | None = None) -> boo
             check_outbound_url(probe["url"])
         except OutboundDenied:
             return False
-        request = urllib.request.Request(probe["url"], method="GET")
+        from urllib.request import Request
+
+        request = Request(probe["url"], method="GET")
         expected = int(probe.get("expect_status", _DEFAULT_EXPECT_STATUS))
         try:
-            with _HTTP_OPENER.open(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
+            with _http_opener().open(request, timeout=_HTTP_TIMEOUT_SECONDS) as response:
                 return int(response.status) == expected
         except urllib.error.HTTPError as exc:
             return int(exc.code) == expected

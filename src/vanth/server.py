@@ -426,12 +426,84 @@ def normalize_event_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 pass
         if isinstance(data.get("percent"), (int, float)):
             data["percent"] = max(0, min(100, data["percent"]))
+    level = payload.get("level", "info")
+    message = payload.get("message")
+    if payload["type"] == "panels":
+        if "panels" not in data and "panels" in payload:
+            data["panels"] = payload["panels"]  # forgiving: top-level "panels" key
+        panels, invalid = validate_panels(data.get("panels"))
+        data = {"panels": panels}
+        if invalid:
+            data["invalid"] = invalid
+            level = "warning" if level in (None, "info") else level
+            message = message or f"{len(invalid)} panel spec(s) ignored: {invalid[0]}"
     return {
         "type": payload["type"],
-        "level": payload.get("level", "info"),
-        "message": payload.get("message"),
+        "level": level,
+        "message": message,
         "data": data,
     }
+
+
+# Declarative monitor panels (`panels` events). Untrusted job output, so every
+# count and string is bounded; anything malformed is dropped with a short note.
+PANEL_KINDS = {"gauge", "line", "stat", "text"}
+PANEL_KIND_ALIASES = {"progress": "gauge", "bar": "gauge", "chart": "line", "sparkline": "line",
+                      "number": "stat", "big": "stat", "status": "text"}
+MAX_PANELS = 8
+_PANEL_STR_LIMITS = {"metric": 64, "key": 64, "label": 32, "unit": 12, "text": 120}
+
+
+def _finite(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def validate_panels(raw: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """Return (clean panel specs, invalid notes) for a ``panels`` event payload.
+
+    A panel is ``{"kind": "gauge"|"line"|"stat"|"text", "metric": name,
+    "label"?, "unit"?, "min"?, "max"?}``; ``text`` panels take ``text`` (fixed)
+    or ``key`` (latest value of that event data field) instead of ``metric``.
+    """
+    if not isinstance(raw, list):
+        return [], ["panels must be a list"]
+    panels: list[dict[str, Any]] = []
+    invalid: list[str] = []
+    for i, spec in enumerate(raw[:MAX_PANELS], 1):
+        if not isinstance(spec, dict):
+            invalid.append(f"panel {i}: not an object")
+            continue
+        kind = spec.get("kind", spec.get("type"))
+        kind = PANEL_KIND_ALIASES.get(kind.lower(), kind.lower()) if isinstance(kind, str) else None
+        if kind not in PANEL_KINDS:
+            invalid.append(f"panel {i}: unknown kind {str(spec.get('kind'))[:20]!r}")
+            continue
+        clean: dict[str, Any] = {"kind": kind}
+        for field, limit in _PANEL_STR_LIMITS.items():
+            value = spec.get(field)
+            if isinstance(value, str) and value.strip():
+                # Names must match exactly, so an over-long one is dropped, not cut.
+                if field in ("metric", "key") and len(value.strip()) > limit:
+                    continue
+                clean[field] = value.strip()[:limit]
+        if kind == "text" and "text" not in clean and "key" not in clean:
+            invalid.append(f"panel {i}: text panel needs 'text' or 'key'")
+            continue
+        if kind != "text" and "metric" not in clean:
+            invalid.append(f"panel {i}: {kind} panel needs a 'metric' (at most 64 chars)")
+            continue
+        lo, hi = spec.get("min"), spec.get("max")
+        if _finite(lo) and _finite(hi) and lo >= hi:
+            invalid.append(f"panel {i}: min must be below max (range ignored)")
+        else:
+            if _finite(lo):
+                clean["min"] = lo
+            if _finite(hi):
+                clean["max"] = hi
+        panels.append(clean)
+    if len(raw) > MAX_PANELS:
+        invalid.append(f"{len(raw) - MAX_PANELS} panel(s) beyond the {MAX_PANELS}-panel limit ignored")
+    return panels, invalid
 
 
 ATTENTION_EVENTS = {"needs_input", "permission_required", "blocked", "decision_requested"}
@@ -8167,6 +8239,12 @@ def job_start(
     (``job_wait`` still tracks it meanwhile). Use ``job_wait``/``job_status`` to
     check progress.
 
+    To choose what ``vanth-monitor`` shows for the job, have it print one
+    ``panels`` event at start: ``AGENT_EVENT {"type":"panels","panels":[
+    {"kind":"gauge","metric":"gpu","unit":"%"},{"kind":"line","metric":"loss"},
+    {"kind":"stat","metric":"tokens_s"},{"kind":"text","key":"stage"}]}``;
+    the panels read its ``metric``/``progress`` events (README "Monitor panels").
+
     For a direct local job, this call also waits up to three seconds for the
     workload's ``started`` event. ``startup_confirmed`` reports whether that
     confirmation arrived; false means check later, not that startup failed.
@@ -8897,7 +8975,13 @@ def job_dashboard(job_ids: list[str] | None = None, limit: int = 5000) -> dict[s
 
 @_deferred_tool()
 def job_metric_ingest(job_id: str, metrics: list[dict[str, Any]], idempotency_key: str | None = None) -> dict[str, Any]:
-    """Record scalar metric points for a job (loss, accuracy, ...) programmatically."""
+    """Record scalar metric points for a job (loss, accuracy, ...) programmatically.
+
+    Points also drive the job's monitor panels. A job declares those by
+    printing one line, e.g. ``AGENT_EVENT {"type":"panels","panels":[{"kind":
+    "gauge","metric":"gpu","unit":"%"},{"kind":"line","metric":"loss"}]}``
+    (kinds: gauge, line, stat, text; see README "Monitor panels").
+    """
     return get_client().post(f"/jobs/{job_id}/metrics", {"metrics": metrics, "idempotency_key": idempotency_key})
 
 

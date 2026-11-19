@@ -1192,6 +1192,10 @@ Write scalar metric points into a job's metric series programmatically
 { "job_id": "job_abc123", "ingested": 2, "idempotency_key": "..." }
 ```
 
+Ingested points feed the monitor's declared panels like any `metric` event: a
+job that printed `AGENT_EVENT {"type":"panels","panels":[{"kind":"line","metric":"loss"}]}`
+shows these values on its card (see "Monitor panels" in the README).
+
 ### `job_artifact_read`
 
 Read a stored job artifact's metadata and, when it is a local file, contents.

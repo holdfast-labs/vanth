@@ -63,7 +63,6 @@ type Model struct {
 	zoom       map[string]time.Duration // per chart key: the time window the user zoomed to
 	colors     map[string]int           // series colour slot per charted job
 
-	hideSidebar bool // [ / ]: fold the sidebar into the compact run list
 	showEvents  bool
 	showLogs    bool
 	showSlowest bool
@@ -76,7 +75,7 @@ type Model struct {
 	loading     bool
 	staleSince  *time.Time
 	lastRefresh time.Time
-	beat        int                // refresh counter; drives the heartbeat border (no timer)
+	beat        int                // refresh counter; steps the stalled-card pulse and no-progress bars (no timer)
 	constants   map[string]float64 // flat metrics, shown as values only
 	mode        string
 	empty       bool
@@ -184,10 +183,8 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		if n > 0 {
 			m.chartFocus = (clamp(m.chartFocus, 0, n-1) + n - 1) % n
 		}
-	case "left", "right":
-		m.pageCharts(k == "right", n)
 	case "[", "]":
-		m.hideSidebar = !m.hideSidebar
+		m.pageCharts(k == "]", n)
 	case "enter":
 		m.togglePinSelected()
 	case "t":
@@ -200,9 +197,9 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.toggleSlowest()
 	case "esc":
 		m.showEvents, m.showLogs, m.showSlowest, m.logLoading = false, false, false, false
-	case "up", "k", "down", "j":
+	case "up", "k", "down", "j", "left", "right":
 		delta := 1
-		if k == "up" || k == "k" {
+		if k == "up" || k == "k" || k == "left" {
 			delta = -1
 		}
 		gen := m.gen
@@ -233,7 +230,7 @@ func (m *Model) pageCharts(next bool, n int) {
 	if n == 0 {
 		return
 	}
-	cols, rows := gridShape(m.computeLeet().main, n)
+	cols, rows := m.gridShape(m.computeMission().main, n)
 	per := cols * rows
 	page := clamp(m.chartFocus, 0, n-1)/per - 1
 	if next {
@@ -338,7 +335,7 @@ func (m Model) handleMouseClick(mouse tea.Mouse) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	gen := m.gen
-	m = m.leetClick(mouse.X, mouse.Y)
+	m = m.missionClick(mouse.X, mouse.Y)
 	if m.showLogs && m.gen != gen {
 		m.logLoading = true
 		return m, m.logTailCmd()
@@ -384,7 +381,7 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 		first := len(m.jobs) == 0
 		m.setJobs(res.Jobs)
 		if first && len(m.jobs) > 0 {
-			m.selected = m.runOrder()[0] // the first run of the sidebar, not of the raw list
+			m.selected = m.runOrder()[0] // the first run in view order, not of the raw list
 		}
 	}
 	m.notePanels(res.Events)
@@ -414,6 +411,7 @@ func (m Model) applyRefresh(res RefreshResult) (tea.Model, tea.Cmd) {
 	m.mode = res.Mode
 	m.loading = false
 	m.lastRefresh = time.Now()
+	m.beat++
 	if res.Stale {
 		now := time.Now()
 		m.staleSince = &now

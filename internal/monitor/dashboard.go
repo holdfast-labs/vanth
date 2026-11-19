@@ -1,44 +1,9 @@
 package monitor
 
 import (
-	"fmt"
 	"strings"
 	"time"
 )
-
-// bigDigits is a 3-row heavy box-drawing digit font for the stat tiles.
-var bigDigits = [10][3]string{
-	{"┏━┓", "┃ ┃", "┗━┛"},
-	{"━┓ ", " ┃ ", "━┻━"},
-	{"━━┓", "┏━┛", "┗━━"},
-	{"━━┓", " ━┫", "━━┛"},
-	{"┃ ┃", "┗━┫", "  ┃"},
-	{"┏━━", "┗━┓", "━━┛"},
-	{"┏━━", "┣━┓", "┗━┛"},
-	{"━━┓", "  ┃", "  ┃"},
-	{"┏━┓", "┣━┫", "┗━┛"},
-	{"┏━┓", "┗━┫", "━━┛"},
-}
-
-// bigNumber renders n as three rows of heavy digits, or returns nil when the
-// width does not fit (callers then fall back to a plain bold number).
-func bigNumber(n, width int) []string {
-	s := fmt.Sprint(max(n, 0))
-	if len(s)*4-1 > width {
-		return nil
-	}
-	rows := make([]string, 3)
-	for i, c := range s {
-		d := bigDigits[c-'0']
-		for r := range rows {
-			if i > 0 {
-				rows[r] += " "
-			}
-			rows[r] += d[r]
-		}
-	}
-	return rows
-}
 
 const sparkRunes = "▁▂▃▄▅▆▇█"
 

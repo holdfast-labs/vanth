@@ -12,8 +12,9 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// panelBorderHex is the muted border of every box (LEET's layout grey).
-const panelBorderHex = "#444444"
+// panelBorderHex is the muted border of the boxed panes (events, logs,
+// help, fleet views); only they and the job cards are boxed.
+const panelBorderHex = "#334155"
 
 func titleColor(dark bool) color.Color {
 	if dark {
@@ -39,7 +40,7 @@ func (m Model) render() string {
 		return fmt.Sprintf("terminal too small: %dx%d (minimum %dx%d)",
 			m.width, m.height, m.cfg.MinWidth, m.cfg.MinHeight)
 	}
-	frame := m.renderLeet()
+	frame := m.renderMission()
 	if m.help {
 		if out, ok := m.helpDialog(frame); ok {
 			return out
@@ -260,17 +261,16 @@ func (m Model) renderHelp(r rect) string {
 		return "help needs a larger window"
 	}
 	lines := []string{
-		"↑/↓ or k/j        select run",
+		"↑↓ ←→ or j/k      select job (cards, then the rail)",
 		"tab / shift+tab   focus next / previous chart",
-		"←/→               previous / next page of charts",
+		"[ / ]             previous / next page of charts",
 		"+/- · wheel       zoom the chart's time window",
 		"t                 reset zoom (live window)",
-		"[ or ]            sidebar / compact run list",
-		"enter             pin run (keep it on the charts)",
+		"enter             pin job (keep its card and lines)",
 		"e / l / s         events / logs / slowest runs",
 		"pgup/pgdn         scroll the open pane",
 		"esc               close the pane",
-		"click             select run · focus chart",
+		"click             select a job · focus a chart",
 		"?                 toggle this help",
 		"q or ctrl+c       quit",
 	}
@@ -355,22 +355,6 @@ func runeWidth(r rune) int {
 	return 1
 }
 
-// padToHeight pads or trims a string to exactly h lines.
-func padToHeight(s string, h int) string {
-	if h <= 0 {
-		return ""
-	}
-	cur := lipgloss.Height(s)
-	if cur < h {
-		return s + strings.Repeat("\n", h-cur)
-	}
-	if cur > h {
-		lines := strings.Split(s, "\n")
-		return strings.Join(lines[:h], "\n")
-	}
-	return s
-}
-
 // roundFloats returns v with every float rounded to 6 significant digits, so a
 // payload preview reads 0.864 instead of 0.8639999999999999. Values that are
 // not floats pass through; maps and slices are copied, never mutated.
@@ -396,25 +380,6 @@ func roundFloats(v any) any {
 		return out
 	}
 	return v
-}
-
-// jobAgeText is a compact duration for finished jobs, or the age for running
-// ones: "45s", "12m", "5h", "9d".
-func (m Model) jobAgeText(j JobSummary) string {
-	if sec, ok := j.DurationSeconds(); ok {
-		return compactDuration(time.Duration(sec * float64(time.Second)))
-	}
-	ref := j.UpdatedAt
-	if j.Status == "running" || j.Status == "queued" {
-		ref = j.CreatedAt
-		if j.StartedAt != "" {
-			ref = j.StartedAt
-		}
-	}
-	if d := ageOf(ref); d > 0 {
-		return compactDuration(d)
-	}
-	return ""
 }
 
 func compactDuration(d time.Duration) string {

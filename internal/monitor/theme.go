@@ -91,11 +91,11 @@ func statusIcon(status string) string {
 	case "running":
 		return "●"
 	case "queued", "pending":
-		return "◌"
+		return "○"
 	case "completed":
-		return "✔"
+		return "✓"
 	case "failed":
-		return "✘"
+		return "✕"
 	case "cancelled":
 		return "⊘"
 	case "orphaned":

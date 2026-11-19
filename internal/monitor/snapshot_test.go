@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/colorprofile"
 )
 
 var blackColor = color.Black
@@ -32,12 +33,19 @@ func TestWriteSnapshots(t *testing.T) {
 		}
 	}
 	for _, size := range snapshotSizes {
-		m := leetModel(t, size.w, size.h)
+		m := fixtureModel(t, size.w, size.h)
 		write(m, "fixture-"+size.name)
 		if size.w == 160 {
 			m.help = true
 			write(m, "fixture-help")
 		}
+		if size.w == 160 || size.w == 80 {
+			m.help, m.profile = false, colorprofile.ASCII
+			if err := os.WriteFile(filepath.Join(dir, "fixture-nocolor-"+size.name+".ans"), []byte(asciiFrame(t, m)), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		write(idleModel(t, size.w, size.h), "fixture-idle-"+size.name)
 	}
 
 	home := os.Getenv("VANTH_MONITOR_E2E_HOME")

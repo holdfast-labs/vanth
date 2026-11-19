@@ -35,7 +35,7 @@ func loadingSkeleton(w, h int) string {
 // Bloom; if the terminal is too small for a dialog the caller falls back to
 // the lower-pane help.
 func (m Model) helpDialog(frame string) (string, bool) {
-	const lines = 13
+	const lines = 12
 	w, h := min(m.width-4, 56), lines+2
 	if w < 40 || m.height < h+2 {
 		return "", false

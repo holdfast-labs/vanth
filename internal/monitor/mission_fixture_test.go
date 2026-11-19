@@ -29,10 +29,10 @@ func wobble(k, salt int) float64 {
 	return x - math.Floor(x) - .5
 }
 
-// leetFixture mirrors the design mockup: four running jobs (one stalled, one
+// missionFixture mirrors the mission-control mockup: four running jobs (one stalled, one
 // without progress), one queued, and finished runs with two failures. The
 // training job declares panels.
-func leetFixture() RefreshResult {
+func missionFixture() RefreshResult {
 	res := RefreshResult{JobsOK: true, Mode: ModeSQLite, Points: map[SeriesKey][]Point{}, Events: map[string][]Event{}}
 	add := func(j JobSummary) { res.Jobs = append(res.Jobs, j) }
 	code1 := int64(1)
@@ -110,11 +110,11 @@ func leetFixture() RefreshResult {
 	return res
 }
 
-// leetModel is a dark-background model at w x h holding leetFixture.
-func leetModel(t *testing.T, w, h int) Model {
+// fixtureModel is a dark-background model at w x h holding missionFixture.
+func fixtureModel(t *testing.T, w, h int) Model {
 	t.Helper()
 	m := New(DefaultConfig(filepath.Join(t.TempDir(), "home")), nil)
 	m = apply(t, m, tea.WindowSizeMsg{Width: w, Height: h})
 	m = apply(t, m, tea.BackgroundColorMsg{Color: blackColor})
-	return apply(t, m, refreshMsg{Gen: m.gen, Result: leetFixture()})
+	return apply(t, m, refreshMsg{Gen: m.gen, Result: missionFixture()})
 }

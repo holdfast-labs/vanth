@@ -105,23 +105,6 @@ func (m *Model) notePanels(events map[string][]Event) {
 	}
 }
 
-// jobPanels returns the job's declared panels, or a default set: line charts
-// of up to three of its metrics.
-func (m Model) jobPanels(jobID string) (specs []PanelSpec, declared bool) {
-	if d, ok := m.panels[jobID]; ok && len(d.specs) > 0 {
-		return d.specs, true
-	}
-	for _, k := range m.metrics {
-		if strings.HasPrefix(k, "progress.") || len(m.points[SeriesKey{JobID: jobID, Metric: k}]) == 0 {
-			continue
-		}
-		if specs = append(specs, PanelSpec{Kind: "line", Metric: k}); len(specs) == 3 {
-			break
-		}
-	}
-	return specs, false
-}
-
 // latestValue returns the newest point of a job's metric series.
 func (m Model) latestValue(jobID, metric string) (float64, bool) {
 	pts := m.points[SeriesKey{JobID: jobID, Metric: metric}]

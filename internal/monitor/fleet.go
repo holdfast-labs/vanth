@@ -120,10 +120,6 @@ func (m Model) renderTimeline(r rect) string {
 		hint: hint, bottomL: stampLabel(lo, span), bottomR: stampLabel(hi, span)})
 }
 
-// fleetMode is true when there are no per-job metric charts to show; the plots
-// area then shows fleet-level visuals instead.
-func (m Model) fleetMode() bool { return len(m.metrics) == 0 }
-
 // renderFleet fills the plots area with fleet-level visuals: the timeline, a
 // bar chart of recent run durations colored by status, and an outcome strip for
 // jobs sharing the selected job's name.

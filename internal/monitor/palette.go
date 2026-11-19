@@ -6,38 +6,54 @@ import (
 	"charm.land/lipgloss/v2"
 )
 
-// The monitor's palette follows W&B LEET: ten series colours (one per job,
-// the same everywhere it appears) and muted grey chrome.
-var seriesHex = [...]string{
-	"#58D3DB", "#FCA36F", "#7DB1FA", "#E180FF", "#FFCF4D",
-	"#B8E986", "#FF9ECF", "#A1A6FF", "#E8C9A0", "#6FE0B5",
+// The monitor's palette: a slate base, one two-stop gradient per job (the
+// same everywhere the job appears: card, bar, chart line, legend), red for
+// failure, amber for a stall and green for success.
+var seriesGrad = [...][2]string{
+	{"#38BDF8", "#818CF8"}, // sky
+	{"#FBBF24", "#FB923C"}, // amber
+	{"#34D399", "#2DD4BF"}, // emerald
+	{"#C084FC", "#F472B6"}, // violet
+	{"#A3E635", "#4ADE80"}, // lime
+	{"#E879F9", "#C084FC"}, // fuchsia
+	{"#22D3EE", "#60A5FA"}, // cyan
+	{"#FB923C", "#FBBF24"}, // orange
+	{"#818CF8", "#A78BFA"}, // indigo
+	{"#2DD4BF", "#A3E635"}, // teal
 }
 
 // seriesMarkers stand in for the series colours when there is no colour:
-// chart points and the sidebar swatch use the job's marker instead.
+// chart points, legend and run rows use the job's marker instead.
 var seriesMarkers = [...]rune{'*', '+', 'o', 'x', '#', '@', '%', '&', '=', '~'}
 
 const (
-	brandHex   = "#FCBC32" // vanth/LIVE badges and the selected row
-	brandFgHex = "#171A1F"
-	focusHex   = "#10BFCC" // focused chart and the help bar
-	runHex     = "#3DD68C"
-	crashHex   = "#FF5F5F" // failed and stalled
-	lateHex    = "#E0A526"
+	brandHex   = "#38BDF8" // ◆ vanth and the focused chart
+	failHex    = "#F43F5E" // failed and stalled
+	failDimHex = "#9F1239"
+	stallHex   = "#FBBF24"
+	okHex      = "#22C55E"
+	pillInkHex = "#0F172A" // dark text on light pills
+	pillRedHex = "#EB4268" // CharmTone Sriracha
+	pillAmbHex = "#FF985A" // CharmTone Tang
+
+	runHex   = okHex // status colours shared with the panes and fleet views
+	crashHex = failHex
+	lateHex  = stallHex
+	focusHex = brandHex
 )
 
-// chrome is the grey scale for borders, titles and text; LEET's values on a
-// dark background, darker ones on a light background.
+// chrome is the text hierarchy: value (brightest), text, dim, faint (rules
+// and baselines) and track (empty bar cells). Slate on dark, inverted on light.
 type chrome struct {
-	border, title, text, key, value, axis, guide color.Color
+	value, text, dim, faint, track color.Color
 }
 
 func (m Model) chrome() chrome {
 	c := func(s string) color.Color { return lipgloss.Color(s) }
 	if m.dark {
-		return chrome{c("#444444"), c("#bcbcbc"), c("#8a8a8a"), c("#767676"), c("#d0d0d0"), c("#585858"), c("#383838")}
+		return chrome{c("#F1F5F9"), c("#CBD5E1"), c("#64748B"), c("#334155"), c("#1E293B")}
 	}
-	return chrome{c("#bcbcbc"), c("#3a3a3a"), c("#5f5f5f"), c("#767676"), c("#262626"), c("#8a8a8a"), c("#d0d0d0")}
+	return chrome{c("#0F172A"), c("#334155"), c("#64748B"), c("#CBD5E1"), c("#E2E8F0")}
 }
 
 // assignColors gives every charted job (running, selected, pinned) a series
@@ -62,12 +78,12 @@ func (m *Model) assignColors() {
 }
 
 func freeColor(used map[int]bool) int {
-	for c := range seriesHex {
+	for c := range seriesGrad {
 		if !used[c] {
 			return c
 		}
 	}
-	return len(used) % len(seriesHex) // more jobs than colours: reuse in turn
+	return len(used) % len(seriesGrad) // more jobs than colours: reuse in turn
 }
 
 // colorIndex is the job's series colour slot. A job that is not charted yet
@@ -83,8 +99,18 @@ func (m Model) colorIndex(jobID string) int {
 	return freeColor(used)
 }
 
+// jobColor is the job's line colour, the first stop of its gradient.
 func (m Model) jobColor(jobID string) color.Color {
-	return lipgloss.Color(seriesHex[m.colorIndex(jobID)])
+	return lipgloss.Color(seriesGrad[m.colorIndex(jobID)][0])
+}
+
+// jobGrad is the job's gradient; a stalled job is drawn in failure red.
+func (m Model) jobGrad(j JobSummary) (color.Color, color.Color) {
+	if m.isStalled(j) || isFailure(j.Status) {
+		return lipgloss.Color(failHex), lipgloss.Color("#FB7185")
+	}
+	g := seriesGrad[m.colorIndex(j.JobID)]
+	return lipgloss.Color(g[0]), lipgloss.Color(g[1])
 }
 
 func (m Model) jobMarker(jobID string) rune {

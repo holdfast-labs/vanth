@@ -48,8 +48,8 @@ func TestRenderRealProgressData(t *testing.T) {
 
 	view := strings.Join(strings.Split(m.render(), "\n"), "\n")
 
-	// The header must aggregate job statuses.
-	if !strings.Contains(view, "done") || !strings.Contains(view, "failed") {
+	// The header must aggregate job statuses (zero counts, such as failed here, are hidden).
+	if !strings.Contains(view, "1 done") || strings.Contains(view, "failed") {
 		t.Errorf("summary header missing status counts:\n%s", view)
 	}
 	// The jobs pane must list the job by name.
@@ -68,8 +68,8 @@ func TestRenderRealProgressData(t *testing.T) {
 	if !strings.ContainsAny(view, brailleRange) {
 		t.Errorf("no braille chart glyphs rendered:\n%s", view)
 	}
-	// The Overview must show the selected job's final progress.
-	if !strings.Contains(view, "100 / 100") {
+	// The idle hero line must show the selected job's final step.
+	if !strings.Contains(view, "100/100") {
 		t.Errorf("final step not shown in the Overview:\n%s", view)
 	}
 }

@@ -17,7 +17,7 @@ when a job needs attention. It is built for one trusted user on one machine.
 - **Wake-on-attention**: durable at-least-once deliveries resume a Codex thread
   or OpenCode session when a job needs a human or agent.
 - **Terminal dashboard**: the native Go `monitor` renders a live
-  W&B-LEET-style dashboard of jobs, metrics, and plots.
+  mission-control dashboard of running jobs, their metrics, and recent runs.
 
 Out of scope: TLS, multi-user tenancy/RBAC, a web UI, and distributed workers.
 Supported: interactive stdin (`job_send`), concurrent-job quotas, automatic
@@ -565,7 +565,7 @@ Notes:
 Print one `panels` event (usually right after start) to declare the job's own
 visuals. The monitor puts them in its chart grid while the job is running (or
 selected): `line` and `gauge` panels become charts, `stat` a big-number tile,
-and `text` a row in the sidebar's Overview. Jobs that declare nothing get a
+and `text` joins the current step on the job's card. Jobs that declare nothing get a
 chart per metric. The newest `panels` event wins, and it is stored like any
 event, so the view survives monitor restarts.
 
@@ -587,7 +587,7 @@ agent_event("metric", gpu=71, loss=0.42)   # the values the panels read
 | `gauge` | a chart with a fixed `min`..`max` axis (default 0..100) and the latest value | `metric`, optional `min`, `max`, `unit`, `label` |
 | `line` | a chart of the metric's history and its latest value | `metric`, optional `min`, `max`, `unit`, `label` |
 | `stat` | the latest value as a big number, with a sparkline | `metric`, optional `unit`, `label` |
-| `text` | an Overview row: fixed `text`, or the latest value of event data field `key` (e.g. `stage`, `phase`) | `text` or `key`, optional `label` |
+| `text` | text on the job's card: fixed `text`, or the latest value of event data field `key` (e.g. `stage`, `phase`) | `text` or `key`, optional `label` |
 
 Panels read the job's `metric` / `progress` series (including points sent with
 `job_metric_ingest`). The schema is forgiving: `kind` is case-insensitive and
@@ -595,8 +595,8 @@ accepts `progress`/`bar`, `chart`/`sparkline`, `number`/`big`, `status`; extra
 fields are dropped; at most 8 panels; `label` is cut to 32 chars, `unit` to 12,
 `text` to 120; `metric`/`key` names must be at most 64 chars. Invalid entries
 are ignored, never fatal: the stored event lists them under `invalid`, gets
-level `warning`, and shows in the event pane; the Overview notes how many were
-ignored. See `examples/panels_job.py` and `examples/demo/train.py`.
+level `warning`, and shows in the event pane; the job's card notes how many
+were ignored. See `examples/panels_job.py` and `examples/demo/train.py`.
 
 ### Example: a tracked downloader
 
@@ -1328,26 +1328,37 @@ rejected.
 
 ### The Go terminal monitor
 
-The native Go dashboard reads the same home **read-only**. Its layout follows
-W&B LEET:
+The native Go dashboard reads the same home **read-only**. It is laid out as
+a mission-control view:
 
-- **Header**: status counts (running, queued, done, failed, stalled), the data
-  source, job count and clock.
-- **Sidebar**: *Running* jobs, each with a colour swatch and its percent (red
-  `✖ stalled 9m` once a job has been quiet for 6x its usual event interval,
-  `◔ late` at 3x); *Queued*; *Finished*, failures first in red with their exit
-  code or `timeout`; and an *Overview* of the selected run (state, host,
-  elapsed, step, phase, ETA and rate, last output, `text` panels).
-- **Charts**: a grid of braille line charts over time (`-30m … now`), one per
-  metric: progress of every running job first, then the jobs' declared panels,
-  then their other metrics. Each job keeps one colour everywhere (swatch, line,
-  values); the latest values sit on the chart's top border, and a stalled
-  job's value turns red. More charts than fit are paged.
-- When nothing runs, the selected (most recent) run's charts stay up, or the
-  fleet timeline and recent run durations if it has none.
-- Below 90 columns (or after `[`/`]`) the sidebar folds into a compact list of
-  the running runs above the charts. Without colour (`NO_COLOR`), each job's
-  lines and swatch use its own marker character instead.
+- **Header**: `◆ vanth  mission control`, then status pills (`● 4 running`,
+  `○ 1 queued`, `✕ 2 failed`, `⚠ 1 stalled`; a pill is hidden at zero), the
+  done count, the job count and the data source.
+- **Cards**: one per running job (up to four across; `+N more` when they do
+  not fit): its name and liveness (`● 12s` since the last output, `◔` when
+  late), a big gradient percent (or the elapsed time for a job without
+  progress), time left, rate and elapsed time, a gradient progress bar, and the
+  current step with the job's `text` panels. A job that has been quiet for 6x
+  its usual event interval gets a thick red card with `✕ STALLED 9m` and
+  `no output for 9m`. Each job keeps one colour everywhere (card, bar, chart
+  lines, legend). The selected card has a bright border; selecting a finished
+  job (or pinning one) gives it a card too.
+- **Charts**: a borderless grid of braille line charts (`30m ago … now`) under
+  a `METRICS` legend: the jobs' declared panels, then progress, then the other
+  metrics of jobs that declared none. The latest values sit right-aligned in
+  each chart's title in the jobs' colours (red for a stalled job). More charts
+  than fit are paged.
+- **Rail**: one line of finished and queued runs, failures first
+  (`✕ deploy-staging exit 1 · 4m`), then queued, then the rest dimmed; then the
+  key hints and how fresh the data is (`updated 1s ago`, `STALE`, `FALLBACK`).
+- When nothing runs, a calm `nothing running` line describes the selected
+  (most recent) run above its charts and the fleet timeline, or the fleet
+  timeline and recent run durations if it has no metrics.
+- Below 90 columns the cards become one line per job (colour stripe, name,
+  bar, percent, time left, liveness) above a single progress chart. Without
+  colour (`NO_COLOR`), each job's lines and rows use its own marker character,
+  pills turn to reverse video and a stalled card keeps its thick border and
+  `STALLED` text.
 
 ```cmd
 vanth-monitor
@@ -1365,12 +1376,12 @@ mkdir dist 2>nul & go build -o dist\vanth-monitor.exe .\cmd\vanth && dist\vanth-
 The source checkout's `vanth-monitor` wrapper does not build or discover that
 output automatically; run the executable produced by `go build` directly.
 
-Keys: `up/down` or `j/k` select a run · `tab`/`shift+tab` focus a chart ·
-`left`/`right` page the charts · `+`/`-` or the mouse wheel zoom a chart's
-time window (`t` resets) · `[`/`]` sidebar / compact list · `enter` pins a run
-on the charts · `e` events, `l` log tail, `s` slowest runs in place of the
-charts (`pgup`/`pgdn` scroll, `esc` closes) · click a run or chart to select it ·
-`?` help · `q` or `Ctrl+C` quit.
+Keys: `up/down`, `left/right` or `j/k` select a job (cards, then the rail) ·
+`tab`/`shift+tab` focus a chart · `[`/`]` page the charts · `+`/`-` or the
+mouse wheel zoom a chart's time window (`t` resets) · `enter` pins a job (it
+keeps its card and lines) · `e` events, `l` log tail, `s` slowest runs in place
+of the charts (`pgup`/`pgdn` scroll, `esc` closes) · click a card, rail entry
+or chart to select it · `?` help · `q` or `Ctrl+C` quit.
 
 To try it on realistic jobs, `uv run python scripts/demo_jobs.py --home DIR`
 starts six demo jobs (training with panels, a stalling eval, an ingest, a

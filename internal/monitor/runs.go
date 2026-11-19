@@ -219,12 +219,10 @@ func (m Model) activeJobs(now time.Time) []int {
 		if !isActive(j.Status) {
 			continue
 		}
+		// Stalled jobs keep their place (and colour); the red card marks them.
 		rank := 2
 		if j.Status == "running" || j.Status == "launching" {
 			rank = 1
-			if st, _, _ := m.jobLiveness(j, now); st == liveStalled {
-				rank = 0
-			}
 		}
 		t, _ := jobStart(j)
 		items = append(items, item{i, rank, t})

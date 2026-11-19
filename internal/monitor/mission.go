@@ -84,10 +84,10 @@ func (m Model) computeMission() missionLayout {
 		}
 		top += len(g.cards) + 1
 	default:
-		const gap, minW = 2, 36
+		const gap, minW = 2, 30
 		aw := w - 2
-		cols := clamp((aw+gap)/(minW+gap), 1, 4)
-		cw := (aw - gap*(cols-1)) / cols
+		// Four cards across by default, a fifth fits at 160 wide instead of wrapping.
+		cols := min(clamp((aw+gap)/(minW+gap), 1, 5), max(len(jobs), 4))
 		need := (len(jobs) + cols - 1) / cols
 		budget := avail / 2
 		ch, rows := 6, max(1, min(need, budget/6))
@@ -97,6 +97,10 @@ func (m Model) computeMission() missionLayout {
 				break
 			}
 		}
+		if rows > 1 && len(jobs) <= rows*cols {
+			cols = (len(jobs) + rows - 1) / rows // balance rows: 2x2, not 3 + a lone card
+		}
+		cw := (aw - gap*(cols-1)) / cols
 		shown, more := m.window(jobs, rows*cols)
 		for k, i := range shown {
 			g.cards = append(g.cards, cardCell{rect: rect{x: 1 + (k%cols)*(cw+gap), y: top + (k/cols)*ch, w: cw, h: ch}, job: i})
@@ -610,13 +614,17 @@ func (m Model) renderLegend(g missionLayout) string {
 // railItems are the finished and queued runs of the rail, in the order they
 // are drawn: failures first, then queued runs, then the rest (dimmed), cut
 // with "…" when the line is full. x is relative to the rail's start.
+// railFailWindow is how recent a failure must be to lead the rail in bold with its
+// reason; older failures fall back to a plain red name among the rest.
+const railFailWindow = 3 * time.Hour
+
 func (m Model) railItems(w int) []railItem {
 	ch := m.chrome()
 	dim, faint := fg(ch.dim), fg(ch.faint)
 	var fails, queued, rest []int
 	for _, i := range m.recentJobs() {
 		j := m.jobs[i]
-		if isFailure(j.Status) && jobEnded(j) < 24*time.Hour {
+		if isFailure(j.Status) && jobEnded(j) < railFailWindow {
 			fails = append(fails, i)
 		} else {
 			rest = append(rest, i)

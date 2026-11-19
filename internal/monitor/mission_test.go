@@ -116,7 +116,7 @@ func TestFrameIsExactlyTheTerminalAtEverySize(t *testing.T) {
 func TestCardGridReflows(t *testing.T) {
 	cases := []struct {
 		w, h, cols, cardH int
-	}{{160, 44, 4, 10}, {120, 36, 3, 8}, {100, 30, 2, 6}, {80, 24, 1, 1}, {50, 14, 1, 1}}
+	}{{160, 44, 4, 10}, {120, 36, 2, 8}, {100, 30, 2, 6}, {80, 24, 1, 1}, {50, 14, 1, 1}} // 120: 2x2, never 3 + a lone card
 	for _, c := range cases {
 		g := fixtureModel(t, c.w, c.h).computeMission()
 		if len(g.cards) != 4 {
@@ -137,6 +137,15 @@ func TestCardGridReflows(t *testing.T) {
 		if last := g.cards[len(g.cards)-1]; last.y+last.h > g.main.y {
 			t.Errorf("%dx%d: cards overlap the charts", c.w, c.h)
 		}
+	}
+	// A fifth running job joins the first row at 160 wide instead of wrapping.
+	five := missionFixture()
+	five.Jobs = append(five.Jobs, JobSummary{JobID: "job_x5", Name: "fifth", Status: "running", StartedAt: ago(time.Minute)})
+	m5 := New(DefaultConfig(filepath.Join(t.TempDir(), "home")), nil)
+	m5 = apply(t, m5, tea.WindowSizeMsg{Width: 160, Height: 44})
+	m5 = apply(t, m5, refreshMsg{Gen: m5.gen, Result: five})
+	if g := m5.computeMission(); len(g.cards) != 5 || g.cards[4].y != g.cards[0].y {
+		t.Errorf("5 jobs at 160x44: want one row of 5, got %+v", g.cards)
 	}
 	// More running jobs than fit: a "+N more" card, and the selection stays visible.
 	res := missionFixture()
@@ -816,5 +825,32 @@ func TestParsePanelsIgnoresInvalid(t *testing.T) {
 	}
 	if s, bad := parsePanels(map[string]any{"panels": "nope"}); s != nil || bad != 1 {
 		t.Error("non-list panels must be ignored")
+	}
+}
+
+func TestStalledJobKeepsItsPlace(t *testing.T) {
+	m := fixtureModel(t, 160, 44)
+	// Make the stalled job the newest, so stall-first ordering would move it ahead.
+	for i, j := range m.jobs {
+		if m.isStalled(j) {
+			m.jobs[i].StartedAt = ago(time.Second)
+		}
+	}
+	var prev time.Time
+	stalled := false
+	for _, i := range m.activeJobs(time.Now()) {
+		j := m.jobs[i]
+		if !isRunning(j.Status) {
+			continue
+		}
+		stalled = stalled || m.isStalled(j)
+		start, _ := jobStart(j)
+		if start.Before(prev) {
+			t.Fatalf("running jobs out of start order at %s (a stalled job jumped ahead)", j.DisplayName())
+		}
+		prev = start
+	}
+	if !stalled {
+		t.Fatal("fixture has no stalled job to check")
 	}
 }

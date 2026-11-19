@@ -55,7 +55,6 @@ type JobSummary struct {
 	StderrPath string
 	EventsPath string
 	Tags       []string
-	EventCount int64
 	Notes      string
 	RunJSON    string
 	// Remote shadow projection (Phase 3): set when the row comes from a

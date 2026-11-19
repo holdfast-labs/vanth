@@ -10,6 +10,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 )
 
 // panelBorderHex is the muted border of the boxed panes (events, logs,
@@ -88,6 +89,24 @@ func fillLine(line string, width int) string {
 	if width <= 0 {
 		return ""
 	}
+	if strings.ContainsAny(line, "\t\r\n") {
+		return fillLines(line, width)
+	}
+	// A plain single line needs only one width pass when it already fits;
+	// lipgloss's per-call layout passes made fillLine ~40% of a 160x44 frame.
+	w := ansi.StringWidth(line)
+	if w > width {
+		line = ansi.Truncate(line, width, "")
+		w = ansi.StringWidth(line)
+	}
+	if w < width {
+		line += strings.Repeat(" ", width-w)
+	}
+	return line
+}
+
+// fillLines is the general path: lipgloss expands tabs and truncates each line.
+func fillLines(line string, width int) string {
 	l := lipgloss.NewStyle().MaxWidth(width).Render(line)
 	if w := lipgloss.Width(l); w < width {
 		l += strings.Repeat(" ", width-w)

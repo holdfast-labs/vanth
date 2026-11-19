@@ -180,7 +180,12 @@ func TestShimEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	root := t.TempDir()
+	// Long form: Windows temp dirs can be 8.3 short names (RUNNER~1), while the
+	// shim reports its own path resolved to the long name.
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	exe, binName := "", "bin"
 	if runtime.GOOS == "windows" {
 		exe, binName = ".exe", "Scripts"

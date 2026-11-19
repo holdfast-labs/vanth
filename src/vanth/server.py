@@ -9747,3 +9747,7 @@ def _run_mcp_server() -> None:
             # The stdio loop ended (client closed stdin or sent exit): no need
             # for the watchdog anymore; it would only fire a redundant exit.
             pass
+
+
+if __name__ == "__main__":
+    main()

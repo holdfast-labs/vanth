@@ -106,7 +106,7 @@ from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .outbound import OutboundDenied, check_outbound_url
-from .paths import canonical_home
+from .paths import canonical_home, self_python
 from .probes import evaluate_probe, validate_probe
 from .process_watch import windows_pid_alive
 from .runtime_info import capture_run_metadata, serialize_run_metadata
@@ -3913,8 +3913,10 @@ class JobManager:
         try:
             try:
                 runner_log = (self.logs / f"{job_id}.runner.log").open("ab")
+                python, python_env = self_python()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "vanth.runner", str(self.home), job_id, f"{job_id}-{claim_token}.json"],
+                    [python, "-m", "vanth.runner", str(self.home), job_id, f"{job_id}-{claim_token}.json"],
+                    env=python_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=runner_log,

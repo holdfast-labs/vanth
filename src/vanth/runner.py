@@ -64,6 +64,76 @@ def _contain_windows_runner() -> int:
     return handle
 
 
+# cmd.exe internal commands: they only exist inside the shell.
+_CMD_BUILTINS = frozenset(
+    "assoc break call cd chdir cls color copy date del dir dpath echo endlocal erase exit for ftype "
+    "goto if keys md mkdir mklink move path pause popd prompt pushd rd rem ren rename rmdir set "
+    "setlocal shift start time title type ver verify vol".split()
+)
+
+
+def _windows_direct_executable(command: str, cwd: str | None, env: dict[str, str]) -> str | None:
+    """Return the ``.exe`` cmd.exe would run for ``command``, or None to keep the shell.
+
+    ``cmd /c`` stays alive as an extra process for every job. When the command
+    uses no shell feature, CreateProcess on the same command line is identical:
+    the program parses its own command line either way. Anything cmd.exe would
+    interpret (operators/redirects/parens outside quotes, ``%``/``!``
+    expansion, ``@``, builtins, scripts resolved via PATHEXT, ambiguous
+    PATH/PATHEXT casing) keeps the shell. Quote state follows cmd.exe's own
+    rule (every ``"`` toggles; backslash escapes nothing).
+    """
+    text = command.strip()
+    if not text or text[0] == "@" or any(ch in text for ch in "%!\r\n\x00"):
+        return None
+    quoted = False
+    for ch in text:
+        if ch == '"':
+            quoted = not quoted
+        elif not quoted and ch in "&|<>^()":
+            return None
+    if text[0] == '"':
+        end = text.find('"', 1)
+        token, rest = (text[1:end], text[end + 1:]) if end > 0 else ("", "")
+        if rest and not rest[0].isspace():
+            return None
+    else:
+        token = text.split(None, 1)[0]
+    if not token or any(ch in token for ch in '"=,;+[]*?'):
+        return None
+    has_sep = any(ch in token for ch in "\\/:")
+    if not has_sep and token.lower().split(".", 1)[0] in _CMD_BUILTINS:
+        return None
+
+    def lookup(name: str) -> str | None:
+        values = [v for k, v in env.items() if k.upper() == name]
+        if len(values) > 1:
+            raise LookupError(name)
+        return values[0] if values else None
+
+    try:
+        pathext = [e for e in (lookup("PATHEXT") or ".COM;.EXE;.BAT;.CMD").split(";") if e]
+        search_path = lookup("PATH") or ""
+        no_cwd = lookup("NODEFAULTCURRENTDIRECTORYINEXEPATH") is not None
+    except LookupError:
+        return None
+    base = cwd or os.getcwd()
+    if has_sep:
+        dirs = [base]
+    else:
+        dirs = ([] if no_cwd else [base]) + [d.strip('"') for d in search_path.split(";") if d.strip('"')]
+    names = [token] if os.path.splitext(token)[1].upper() in {e.upper() for e in pathext} else []
+    names += [token + ext for ext in pathext]
+    for directory in dirs:
+        for name in names:
+            candidate = os.path.join(directory, name)
+            if os.path.isfile(candidate):
+                # The first match is what cmd.exe runs; only a native .exe is
+                # safe to start without it (.bat/.cmd need the shell).
+                return candidate if candidate.lower().endswith(".exe") else None
+    return None
+
+
 def _fail_start(manager: JobManager, job_id: str, exc: Exception, claim_token: str | None = None) -> int:
     message = f"Job runner failed to start: {exc}"
     try:
@@ -228,16 +298,19 @@ def run(home: str, job_id: str, spec_file: str | None = None) -> int:
             if isinstance(name, str) and isinstance(env.get(name), str) and env.get(name)
         ]
         creationflags = 0
+        executable = None
         if sys.platform == "win32":
             creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+            executable = _windows_direct_executable(spec["command"], spec.get("cwd"), env)
         proc = subprocess.Popen(
             spec["command"],
+            executable=executable,
             cwd=spec.get("cwd"),
             env=env,
             stdin=subprocess.PIPE if spec.get("interactive") else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            shell=True,
+            shell=executable is None,
             creationflags=creationflags,
             start_new_session=sys.platform != "win32",
         )

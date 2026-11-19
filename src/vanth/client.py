@@ -185,6 +185,11 @@ class VanthClient:
                 if self._probe_port() == "quiet":
                     break
                 time.sleep(0.2)
+        # Deliberately sys.executable, not paths.self_python(): on Windows the
+        # venv launcher's job is what lets the daemon start runners with
+        # CREATE_BREAKAWAY_FROM_JOB; a directly started daemon inherits the
+        # caller's job (often breakaway-denied) and every launch fails with
+        # WinError 5.
         subprocess.Popen(
             [sys.executable, "-m", "vanth.daemon"],
             stdin=subprocess.DEVNULL,

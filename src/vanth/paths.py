@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from pathlib import Path
 
 
@@ -19,6 +20,33 @@ def canonical_home(home: str | os.PathLike[str] | None = None) -> Path:
             raise ValueError("VANTH_HOME and AGENT_BG_HOME refer to different state directories")
         return vant_path
     return Path(vant_home or agent_home or Path.home() / ".vanth").expanduser().resolve()
+
+
+def self_python() -> tuple[str, dict[str, str]]:
+    """Return ``(executable, env)`` for spawning this interpreter as one process.
+
+    On Windows a venv's ``Scripts\\python.exe`` (plain venv, uv venv, uv tool
+    install) is a launcher that re-executes the base interpreter and waits, so
+    every ``sys.executable -m vanth.<module>`` costs two processes. Like
+    ``multiprocessing`` does, start the base interpreter directly and set
+    ``__PYVENV_LAUNCHER__`` so it adopts the venv (``sys.executable``,
+    ``sys.prefix``, site-packages) exactly as the launcher would; CPython
+    consumes and clears the variable at startup. Everywhere else (POSIX,
+    non-venv, frozen builds) this is ``sys.executable`` and the current env.
+    """
+    env = os.environ.copy()
+    base = getattr(sys, "_base_executable", None)
+    if (
+        os.name == "nt"
+        and not getattr(sys, "frozen", False)
+        and sys.prefix != sys.base_prefix
+        and base
+        and os.path.normcase(base) != os.path.normcase(sys.executable)
+        and os.path.isfile(base)
+    ):
+        env["__PYVENV_LAUNCHER__"] = sys.executable
+        return base, env
+    return sys.executable, env
 
 
 def secure_home_permissions(home: str | os.PathLike[str] | None = None) -> None:

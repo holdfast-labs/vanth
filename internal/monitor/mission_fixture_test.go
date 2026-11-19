@@ -111,7 +111,7 @@ func missionFixture() RefreshResult {
 }
 
 // fixtureModel is a dark-background model at w x h holding missionFixture.
-func fixtureModel(t *testing.T, w, h int) Model {
+func fixtureModel(t testing.TB, w, h int) Model {
 	t.Helper()
 	m := New(DefaultConfig(filepath.Join(t.TempDir(), "home")), nil)
 	m = apply(t, m, tea.WindowSizeMsg{Width: w, Height: h})

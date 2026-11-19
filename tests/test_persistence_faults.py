@@ -298,3 +298,29 @@ def test_queued_cancel_persistence_failure_rolls_back_metadata_and_allows_retry(
     monkeypatch.setattr(manager, "_enqueue_deliveries_uncommitted", original)
     assert manager.stop_sync("job_fault", actor="tool", reason="test cancellation")["status"] == "cancelled"
     assert manager.db.execute("SELECT COUNT(*) FROM events WHERE job_id='job_fault' AND type='cancelled'").fetchone()[0] == 1
+
+
+def test_maintenance_polls_use_indexes_without_a_schema_bump(tmp_path):
+    import sqlite3
+
+    from vanth.migrations import LATEST_SCHEMA_VERSION
+    from vanth.server import JobManager
+
+    JobManager(tmp_path, recover=False).close()
+    db = sqlite3.connect(tmp_path / "jobs.sqlite")
+    db.execute("DROP INDEX idx_jobs_status")
+    db.execute("DROP INDEX idx_jobs_policy")
+    db.commit()
+    db.close()
+    manager = JobManager(tmp_path, recover=False)  # an existing home gains them on open
+    try:
+        assert manager.db.execute("PRAGMA user_version").fetchone()[0] == LATEST_SCHEMA_VERSION
+        for query in (
+            "SELECT job_id FROM jobs WHERE status='running' AND (runner_heartbeat_at IS NULL OR runner_heartbeat_at < '')",
+            "SELECT job_id FROM jobs WHERE status='queued' ORDER BY priority DESC, created_at ASC",
+            "SELECT job_id FROM jobs WHERE policy_json IS NOT NULL AND policy_disabled=0",
+        ):
+            plan = " ".join(str(row[3]) for row in manager.db.execute("EXPLAIN QUERY PLAN " + query))
+            assert "SCAN jobs" not in plan, (query, plan)
+    finally:
+        manager.close()

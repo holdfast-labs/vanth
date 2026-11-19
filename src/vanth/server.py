@@ -7,6 +7,7 @@ from __future__ import annotations
 # sys.modules hit once anything async is already running).
 import base64
 import difflib
+import functools
 import hashlib
 import json
 import logging
@@ -23,7 +24,6 @@ import threading
 import time
 import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
 import warnings
 from datetime import datetime, timedelta, timezone
@@ -106,7 +106,7 @@ from .codex_bridge import CodexActiveWriterError, send_delivery_to_codex
 from .migrations import LATEST_SCHEMA_VERSION, configure_connection, migrate
 from .opencode_bridge import OpenCodeSessionNotFound, send_delivery_to_opencode
 from .outbound import OutboundDenied, check_outbound_url
-from .paths import canonical_home
+from .paths import canonical_home, self_python
 from .probes import evaluate_probe, validate_probe
 from .process_watch import windows_pid_alive
 from .runtime_info import capture_run_metadata, serialize_run_metadata
@@ -578,20 +578,25 @@ def resolve_wake_target_identity(
     return copied
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """urllib handler that refuses 3xx redirects (webhook credential safety).
+@functools.cache
+def _no_redirect_opener() -> Any:
+    """urllib opener that refuses 3xx redirects (webhook credential safety).
 
     urllib's default HTTPRedirectHandler follows redirects and re-sends the
     request headers, which would forward Authorization tokens to a different
     origin. Raising here surfaces the redirect as an HTTPError so webhook
     delivery fails instead of leaking credentials (review P1-4).
+
+    Built on first use: urllib.request (~30ms) and build_opener's SSL context
+    (~20ms) would otherwise be paid by every runner, daemon and MCP server.
     """
+    import urllib.request
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+    class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
 
-
-_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+    return urllib.request.build_opener(_NoRedirectHandler)
 
 
 def canonicalize_wake_target(target: dict[str, Any]) -> dict[str, Any]:
@@ -2387,10 +2392,12 @@ class JobManager:
             },
             separators=(",", ":"),
         ).encode("utf-8")
-        request = urllib.request.Request(
+        from urllib.request import Request
+
+        request = Request(
             url, data=body, headers={"Content-Type": "application/json"}, method="POST"
         )
-        with _NO_REDIRECT_OPENER.open(request, timeout=5) as response:
+        with _no_redirect_opener().open(request, timeout=5) as response:
             if response.status not in (200, 201, 202, 204):
                 raise RuntimeError(f"alert webhook returned HTTP {response.status}")
 
@@ -2566,7 +2573,7 @@ class JobManager:
             else:  # pragma: no cover - loop always breaks
                 raise RuntimeError("event write failed")
         if event is not None and event.get("persisted") is not False:
-            self._append_event_mirror(event, job_id)
+            self._append_event_mirror([event], job_id)
         with self._condition(job_id):
             self._condition(job_id).notify_all()
         return event
@@ -2583,6 +2590,8 @@ class JobManager:
         mutate: Callable[[sqlite3.Connection], None] | None = None,
         exempt_from_cap: bool = False,
         transaction: bool = True,
+        known_count: int | None = None,
+        known_seq: int | None = None,
     ) -> dict[str, Any]:
         """Persist a state mutation and its event + deliveries in ONE transaction.
 
@@ -2592,12 +2601,16 @@ class JobManager:
         leave a resolved decision with no event, which a retry could not
         repair). ``mutate`` may raise ``_DecisionNoOp`` to abort cleanly.
         ``exempt_from_cap`` is set only by authoritative decision transitions.
+        ``known_count``/``known_seq`` let a batch that already holds the write
+        lock skip the per-event COUNT(*) (a scan that grows with the job) and
+        MAX(seq) lookups.
         """
         if transaction:
             self.db.execute("BEGIN IMMEDIATE")
         try:
             if event_type not in TERMINAL_STATUSES and not exempt_from_cap:
-                count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                count = known_count if known_count is not None else self.db.execute(
+                    "SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
                 if count >= self.max_events_per_job:
                     if transaction:
                         self.db.rollback()
@@ -2634,8 +2647,11 @@ class JobManager:
                         "persisted": False,
                         "noop": True,
                     }
-            row = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,)).fetchone()
-            seq = int(row["seq"])
+            if known_seq is not None:
+                seq = known_seq
+            else:
+                row = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,)).fetchone()
+                seq = int(row["seq"])
             created_at = now_iso()
             event_id = "evt_" + uuid.uuid4().hex[:16]
             self.db.execute(
@@ -2691,10 +2707,21 @@ class JobManager:
                 with self.db_lock:
                     self.db.execute("BEGIN IMMEDIATE")
                     try:
-                        events = [self._emit_transactional(
-                            job_id, payload, encoded, payload["type"], payload["level"], source,
-                            payload["message"], transaction=False,
-                        ) for payload, encoded in prepared[offset:offset + 64]]
+                        # The write lock is held for the whole batch, so the
+                        # job's event count and next seq can be tracked here.
+                        count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                        seq = self.db.execute(
+                            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                        events = []
+                        for payload, encoded in prepared[offset:offset + 64]:
+                            event = self._emit_transactional(
+                                job_id, payload, encoded, payload["type"], payload["level"], source,
+                                payload["message"], transaction=False, known_count=count, known_seq=seq,
+                            )
+                            if event.get("persisted") is not False:
+                                count += 1
+                                seq += 1
+                            events.append(event)
                         self.db.commit()
                         return events
                     except BaseException:
@@ -2704,9 +2731,7 @@ class JobManager:
             contentions = self.event_contentions_by_job.get(job_id, 0)
             events = self._retry_locked(persist, event_job=job_id)
             elapsed = time.monotonic() - started
-            for event in events:
-                if event.get("persisted") is not False:
-                    self._append_event_mirror(event, job_id)
+            self._append_event_mirror([event for event in events if event.get("persisted") is not False], job_id)
             with self._condition(job_id):
                 self._condition(job_id).notify_all()
             with self.db_lock:
@@ -2724,15 +2749,19 @@ class JobManager:
             elif elapsed > 1:
                 self.logger.warning("event capture slow job_id=%s stream=%s seconds=%.3f", job_id, source, elapsed)
 
-    def _append_event_mirror(self, event: dict[str, Any], job_id: str) -> None:
+    def _append_event_mirror(self, events: list[dict[str, Any]], job_id: str) -> None:
+        if not events:
+            return
         try:
             row = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))
             if not row:
                 return
+            # One open per batch: an open/close per event dominated capture of
+            # chatty jobs on Windows.
             with Path(row["events_path"]).open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, separators=(",", ":")) + "\n")
+                f.write("".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events))
         except OSError:
-            self.logger.exception("event mirror write failed job_id=%s event_id=%s", job_id, event.get("event_id"))
+            self.logger.exception("event mirror write failed job_id=%s event_id=%s", job_id, events[0].get("event_id"))
         except (sqlite3.Error, RuntimeError):
             self.logger.exception("event mirror path lookup failed job_id=%s", job_id)
 
@@ -3126,7 +3155,9 @@ class JobManager:
         body_payload["target"] = dict(target)
         body_payload["target"].pop("headers", None)
         body = json.dumps(body_payload, separators=(",", ":")).encode("utf-8")
-        request = urllib.request.Request(
+        from urllib.request import Request
+
+        request = Request(
             url,
             data=body,
             headers=headers,
@@ -3136,7 +3167,7 @@ class JobManager:
         try:
             # Disable automatic redirects: cross-origin redirects could exfiltrate
             # the configured headers (Authorization bearer tokens, service tokens).
-            with _NO_REDIRECT_OPENER.open(request, timeout=timeout) as response:
+            with _no_redirect_opener().open(request, timeout=timeout) as response:
                 status = response.getcode()
         except urllib.error.HTTPError as exc:
             if exc.code in (301, 302, 303, 307, 308):
@@ -3913,8 +3944,10 @@ class JobManager:
         try:
             try:
                 runner_log = (self.logs / f"{job_id}.runner.log").open("ab")
+                python, python_env = self_python()
                 proc = subprocess.Popen(
-                    [sys.executable, "-m", "vanth.runner", str(self.home), job_id, f"{job_id}-{claim_token}.json"],
+                    [python, "-m", "vanth.runner", str(self.home), job_id, f"{job_id}-{claim_token}.json"],
+                    env=python_env,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=runner_log,
@@ -5267,18 +5300,21 @@ class JobManager:
             return None
         return pgid if pgid == pid else None
 
-    def _kill_pid(self, pid: int, force: bool, *, timeout_seconds: float = 10.0) -> None:
+    def _kill_pid(self, pid: int, force: bool, *, timeout_seconds: float = 10.0) -> bool | None:
+        """Signal ``pid``'s tree; returns False only when Windows refused the signal."""
         if sys.platform == "win32":
             args = ["taskkill", "/PID", str(pid), "/T"]
             if force:
                 args.append("/F")
-            subprocess.run(
+            result = subprocess.run(
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=max(0.1, timeout_seconds),
             )
-            return
+            # A graceful taskkill only posts WM_CLOSE; a windowless console
+            # process "can only be terminated forcefully" and taskkill fails.
+            return result.returncode == 0
         signal_number = 9 if force else 15
         # Signal ONLY the group the target pid actually leads. Never
         # os.killpg(pid) blindly: a reused pid that leads a *different* group
@@ -5301,10 +5337,12 @@ class JobManager:
         # Even an immediate force-stop needs bounded process-launch grace for
         # taskkill itself; a zero grace must not time out before it can start.
         try:
-            self._kill_pid(pid, force=force, timeout_seconds=max(1.0, deadline - time.monotonic()))
+            delivered = self._kill_pid(pid, force=force, timeout_seconds=max(1.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             return False
-        while self._pid_alive(pid) and time.monotonic() < deadline:
+        # Nothing was delivered (Windows console job): waiting out the grace
+        # period cannot help, so escalate to force right away.
+        while delivered is not False and self._pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         if self._pid_alive(pid):
             try:
@@ -6347,14 +6385,18 @@ class JobManager:
                     "set VANTH_ALLOW_HTTP_ARTIFACT_READ=1 to enable legacy retrieval"
                 )
             try:
-                with urllib.request.urlopen(uri, timeout=5) as response:
+                from urllib.request import urlopen
+
+                with urlopen(uri, timeout=5) as response:
                     content = response.read(max_bytes + 1)
             except Exception as exc:
                 raise ValueError(f"artifact content unavailable: {exc}") from None
         elif parsed.scheme in {"", "file"} or (len(parsed.scheme) == 1 and parsed.scheme.isalpha()):
             path = Path(uri)
             if parsed.scheme == "file":
-                path = Path(urllib.request.url2pathname(parsed.path))
+                from urllib.request import url2pathname
+
+                path = Path(url2pathname(parsed.path))
             if not path.is_absolute():
                 path = Path(self.home) / path
             if not path.exists() or not path.is_file():
@@ -9705,3 +9747,7 @@ def _run_mcp_server() -> None:
             # The stdio loop ended (client closed stdin or sent exit): no need
             # for the watchdog anymore; it would only fire a redundant exit.
             pass
+
+
+if __name__ == "__main__":
+    main()

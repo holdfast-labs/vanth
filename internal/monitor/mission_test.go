@@ -19,7 +19,7 @@ import (
 
 func stripANSI(s string) string { return ansi.Strip(s) }
 
-func apply(t *testing.T, m Model, msg tea.Msg) Model {
+func apply(t testing.TB, m Model, msg tea.Msg) Model {
 	t.Helper()
 	mm, _ := m.Update(msg)
 	out, ok := mm.(Model)

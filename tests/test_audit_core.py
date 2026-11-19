@@ -225,3 +225,20 @@ def test_stop_reports_stopped_when_runner_recorded_the_cancel(tmp_path, monkeypa
     finally:
         manager.begin_shutdown()
         manager.close()
+
+
+def test_python_m_vanth_server_serves_mcp(tmp_path):
+    """`python -m vanth.server` is a supported launch shape (launcher.py); it
+    used to import and exit without serving."""
+    import json
+    import subprocess
+    import sys
+
+    init = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+        "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}
+    proc = subprocess.run(
+        [sys.executable, "-m", "vanth.server"], input=json.dumps(init) + "\n", capture_output=True, text=True,
+        timeout=60, env={**os.environ, "VANTH_HOME": str(tmp_path / "home")},
+    )
+    reply = json.loads(proc.stdout.splitlines()[0])
+    assert reply["id"] == 1 and "result" in reply

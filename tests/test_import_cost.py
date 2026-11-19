@@ -66,3 +66,14 @@ def test_version_matches_installed_distribution():
         "import vanth; from importlib.metadata import version; "
         "print(vanth.__version__ == version('vanth'))"
     ) == "True"
+
+
+def test_server_import_avoids_urllib_request():
+    """Runners import `vanth.server` once per job: urllib.request/http.client
+    (~30ms) and build_opener's SSL context (~20ms) are built on first use."""
+    out = _run(
+        "import vanth.server, sys; "
+        "print('urllib.request' in sys.modules); print('http.client' in sys.modules); "
+        "print(vanth.server._no_redirect_opener.cache_info().currsize)"
+    )
+    assert out.splitlines() == ["False", "False", "0"]

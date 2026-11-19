@@ -322,3 +322,90 @@ def test_eof_marker_crash_recovers_canonical_record_without_duplicate(tmp_path, 
             manager.send_sync("fake", "late")
     finally:
         manager.close()
+
+
+def test_self_python_starts_an_interpreter_that_sees_this_environment():
+    from vanth.paths import self_python
+
+    python, env = self_python()
+    out = subprocess.run([python, "-c", "import sys, os, vanth; print(sys.prefix); print(os.environ.get('__PYVENV_LAUNCHER__'))"],
+                         env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    prefix, launcher = out.stdout.splitlines()
+    assert prefix == sys.prefix
+    # CPython consumes the variable, so job workloads never inherit it.
+    assert launcher == "None"
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe bypass is Windows-only")
+def test_windows_direct_executable_keeps_shell_for_shell_features(tmp_path):
+    import os
+
+    from vanth.runner import _windows_direct_executable as direct
+
+    exe = tmp_path / "tool.exe"
+    exe.write_bytes(b"")
+    (tmp_path / "script.cmd").write_text("@echo hi")
+    env = {"PATH": str(tmp_path), "PATHEXT": ".COM;.EXE;.BAT;.CMD"}
+    cwd = str(tmp_path / "elsewhere")
+    os.mkdir(cwd)
+    assert direct('tool -c "print(1); a & b | c"', cwd, env).lower() == str(exe).lower()
+    assert direct(f'"{exe}" arg', cwd, env) == str(exe)
+    for command in ["tool a & tool b", "tool > out.txt", "tool %PATH%", "tool !X!", "@tool", "(tool)",
+                    'tool "a" & b', "echo hi", "set X=1", "script", "nosuch", "tool\nother", ""]:
+        assert direct(command, cwd, env) is None, command
+    assert direct("tool", cwd, {**env, "Path": str(tmp_path)}) is None  # ambiguous PATH casing
+    # cmd.exe searches the job's cwd before PATH: a script there wins.
+    (tmp_path / "elsewhere" / "tool.bat").write_text("@echo shadow")
+    assert direct("tool", cwd, env) is None
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe bypass is Windows-only")
+def test_plain_windows_command_runs_without_cmd_wrapper(tmp_path):
+    manager = JobManager(tmp_path)
+    try:
+        code = "import os; print(os.getppid())"
+        # The base interpreter: a venv launcher workload would print its own pid.
+        python = getattr(sys, "_base_executable", sys.executable)
+        job = manager.start(shellcmd.join([python, "-c", code]))
+        assert manager.wait_sync(job["job_id"], ["completed"], timeout_seconds=30)["result"] == "event"
+        status = manager.status(job["job_id"])
+        assert int(manager.tail(job["job_id"])["content"].strip()) == status["worker_pid"]
+        shelled = manager.start(shellcmd.join([python, "-c", code]) + " && exit 0")
+        assert manager.wait_sync(shelled["job_id"], ["completed"], timeout_seconds=30)["result"] == "event"
+        assert int(manager.tail(shelled["job_id"])["content"].strip()) != manager.status(shelled["job_id"])["worker_pid"]
+    finally:
+        manager.close()
+
+
+def test_capture_batches_persist_consecutive_seqs_and_one_mirror_open_per_batch(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path, recover=False)
+    stamp = now_iso()
+    events_path = manager.events_dir / "chatty.jsonl"
+    manager.db.execute(
+        "INSERT INTO jobs(job_id,command,status,created_at,updated_at,stdout_path,stderr_path,events_path) "
+        "VALUES ('chatty','x','running',?,?,?,?,?)",
+        (stamp, stamp, str(manager.logs / "c.out"), str(manager.logs / "c.err"), str(events_path)))
+    manager.db.commit()
+    manager._emit("chatty", "started")
+    opens = []
+    original = Path.open
+
+    def counting_open(path, *args, **kwargs):
+        if path == events_path:
+            opens.append(1)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    lines = b"".join(b'AGENT_EVENT {"type":"metric","data":{"_step":%d,"loss":1}}\n' % i for i in range(300))
+    manager._read_stream("chatty", ChunkStream([lines[:9000], lines[9000:]]), tmp_path / "out", "stdout")
+    seqs = [row[0] for row in manager.db.execute("SELECT seq FROM events WHERE job_id='chatty' ORDER BY seq")]
+    assert seqs == list(range(1, 302))
+    mirrored = [json.loads(line)["seq"] for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert mirrored == seqs
+    assert len(opens) <= 8  # a few 64-event batches, not one open per event
+    manager.close()

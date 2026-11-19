@@ -232,8 +232,10 @@ def _git_state(cwd: str | None) -> dict[str, str] | None:
         _remember_git_state(cwd, None, now)
         return None
     repo = _git(cwd, "remote", "get-url", "origin")
-    branch = _git(cwd, "rev-parse", "--abbrev-ref", "HEAD")
-    commit = _git(cwd, "rev-parse", "HEAD")
+    # One spawn for both (each git start costs ~70ms on Windows): prints the
+    # full commit, then the abbreviated ref (branch, or "HEAD" if detached).
+    revs = (_git(cwd, "rev-parse", "HEAD", "--abbrev-ref", "HEAD") or "").split()
+    commit, branch = (revs[0], revs[1]) if len(revs) == 2 else (None, None)
     state: dict[str, str] = {}
     if branch:
         state["branch"] = branch

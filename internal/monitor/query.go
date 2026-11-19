@@ -167,11 +167,13 @@ func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) 
 		SELECT j.job_id, j.name, j.command, j.status, j.pid, j.worker_pid, j.stop_requested_at,
 		       j.created_at, j.updated_at, j.exit_code, j.started_at, j.ended_at,
 		       j.tags_json, j.notes, j.run_json,
-		       j.stdout_path, j.stderr_path, j.events_path,
-		       (SELECT COUNT(*) FROM events e WHERE e.job_id = j.job_id) AS event_count
+		       j.stdout_path, j.stderr_path, j.events_path
 		FROM jobs j
-		ORDER BY CASE WHEN j.status IN ('running', 'orphaned') THEN 0 ELSE 1 END, j.updated_at DESC, j.created_at DESC
-		LIMIT ?`
+		WHERE j.rowid IN (
+		    SELECT rowid FROM jobs
+		    ORDER BY CASE WHEN status IN ('running', 'orphaned') THEN 0 ELSE 1 END, updated_at DESC, created_at DESC
+		    LIMIT ?)
+		ORDER BY CASE WHEN j.status IN ('running', 'orphaned') THEN 0 ELSE 1 END, j.updated_at DESC, j.created_at DESC`
 	rows, err := db.QueryContext(ctx, query, q.cfg.JobLimit)
 	if err != nil {
 		return err
@@ -195,7 +197,7 @@ func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) 
 		)
 		if err := rows.Scan(&j.JobID, &name, &j.Command, &j.Status, &pid, &workerPid, &stopReq,
 			&j.CreatedAt, &j.UpdatedAt, &exitCode, &startedAt, &endedAt, &tagsJSON, &notes, &runJSON,
-			&j.StdoutPath, &j.StderrPath, &j.EventsPath, &j.EventCount); err != nil {
+			&j.StdoutPath, &j.StderrPath, &j.EventsPath); err != nil {
 			return err
 		}
 		j.Name = name.String

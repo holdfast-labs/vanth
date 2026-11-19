@@ -40,10 +40,15 @@ def test_windows_pid_alive_agrees_with_process_alive():
     assert windows_pid_alive(proc.pid) is False
     assert process_alive(os.getpid()) is True
     assert process_alive(proc.pid) is False
-    start = time.perf_counter()
-    for _ in range(20):
-        windows_pid_alive(os.getpid())
-    assert (time.perf_counter() - start) < 1.0
+    # Fastest of 5 rounds: one load spike on a busy runner must not fail it, yet
+    # the slow tasklist path (~0.1-0.5 s per call) still would.
+    rounds = []
+    for _ in range(5):
+        start = time.perf_counter()
+        for _ in range(20):
+            windows_pid_alive(os.getpid())
+        rounds.append(time.perf_counter() - start)
+    assert min(rounds) < 1.0
 
 
 def test_windows_pid_alive_exit_code_259_is_dead():

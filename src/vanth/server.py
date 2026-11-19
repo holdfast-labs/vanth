@@ -5269,18 +5269,21 @@ class JobManager:
             return None
         return pgid if pgid == pid else None
 
-    def _kill_pid(self, pid: int, force: bool, *, timeout_seconds: float = 10.0) -> None:
+    def _kill_pid(self, pid: int, force: bool, *, timeout_seconds: float = 10.0) -> bool | None:
+        """Signal ``pid``'s tree; returns False only when Windows refused the signal."""
         if sys.platform == "win32":
             args = ["taskkill", "/PID", str(pid), "/T"]
             if force:
                 args.append("/F")
-            subprocess.run(
+            result = subprocess.run(
                 args,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=max(0.1, timeout_seconds),
             )
-            return
+            # A graceful taskkill only posts WM_CLOSE; a windowless console
+            # process "can only be terminated forcefully" and taskkill fails.
+            return result.returncode == 0
         signal_number = 9 if force else 15
         # Signal ONLY the group the target pid actually leads. Never
         # os.killpg(pid) blindly: a reused pid that leads a *different* group
@@ -5303,10 +5306,12 @@ class JobManager:
         # Even an immediate force-stop needs bounded process-launch grace for
         # taskkill itself; a zero grace must not time out before it can start.
         try:
-            self._kill_pid(pid, force=force, timeout_seconds=max(1.0, deadline - time.monotonic()))
+            delivered = self._kill_pid(pid, force=force, timeout_seconds=max(1.0, deadline - time.monotonic()))
         except subprocess.TimeoutExpired:
             return False
-        while self._pid_alive(pid) and time.monotonic() < deadline:
+        # Nothing was delivered (Windows console job): waiting out the grace
+        # period cannot help, so escalate to force right away.
+        while delivered is not False and self._pid_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         if self._pid_alive(pid):
             try:

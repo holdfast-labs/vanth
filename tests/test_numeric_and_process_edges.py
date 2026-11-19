@@ -98,3 +98,23 @@ def test_live_leader_retains_existing_process_tree_cleanup(monkeypatch):
     monkeypatch.setattr(manager, "_kill_pid", lambda pid, force: calls.append((pid, force)))
     manager._kill_process(proc, force=True)
     assert calls == [(123456, True)]
+
+
+def test_undelivered_graceful_stop_escalates_without_waiting_out_grace(monkeypatch):
+    import time
+
+    manager = object.__new__(JobManager)
+    calls, alive = [], [True]
+
+    def kill(pid, force, timeout_seconds=10.0):
+        calls.append(force)
+        if force:
+            alive[0] = False
+        return force  # graceful taskkill refused: windowless console process
+
+    monkeypatch.setattr(manager, "_kill_pid", kill)
+    monkeypatch.setattr(manager, "_pid_alive", lambda pid: alive[0])
+    started = time.monotonic()
+    assert manager._terminate_pid(123456, force=False, deadline=started + 10)
+    assert calls == [False, True]
+    assert time.monotonic() - started < 2

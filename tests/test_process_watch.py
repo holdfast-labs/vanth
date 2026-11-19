@@ -333,3 +333,108 @@ def test_parent_pid_steps_over_this_interpreters_own_launcher():
     )
     assert out.returncode == 0, out.stderr
     assert int(out.stdout) == os.getpid()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shim waits for its child only on Windows")
+def test_parent_pid_steps_over_the_native_vanth_mcp_shim(monkeypatch):
+    """vanth-mcp.exe (next to the env's python) starts the base interpreter and
+    waits for it; the watchdog must watch the client that started the shim."""
+    from vanth import process_watch
+
+    scripts = r"C:\env\Scripts"
+    images = {
+        os.getpid(): r"C:\base\python.exe",
+        100: scripts + r"\vanth-mcp.exe",
+        50: r"C:\clients\agent.exe",
+    }
+    monkeypatch.setattr(process_watch, "_windows_image", images.get)
+    monkeypatch.setattr(process_watch, "_windows_parent_pids", lambda: {100: 50, 50: 4})
+    monkeypatch.setattr(sys, "executable", scripts + r"\python.exe")
+    monkeypatch.setattr(sys, "argv", [r"C:\env\Lib\site-packages\vanth\server.py"])
+    assert process_watch._skip_own_launchers(100) == 50
+    # Some other program's vanth-mcp.exe is not one of our layers.
+    images[100] = r"C:\elsewhere\vanth-mcp.exe"
+    assert process_watch._skip_own_launchers(100) == 100
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shim waits for its child only on Windows")
+def test_parent_pid_steps_over_the_uv_tool_shim_copy(monkeypatch):
+    """uv copies vanth-mcp.exe away from the env's Scripts dir; the shim
+    reports its own path in VANTH_MCP_SHIM so the watchdog still steps over it."""
+    from vanth import process_watch
+
+    scripts = r"C:\env\Scripts"
+    uvbin = r"C:\Users\me\.local\bin"
+    images = {
+        os.getpid(): r"C:\base\python.exe",
+        100: uvbin + r"\vanth-mcp.exe",
+        50: r"C:\clients\agent.exe",
+    }
+    monkeypatch.setattr(process_watch, "_windows_image", images.get)
+    monkeypatch.setattr(process_watch, "_windows_parent_pids", lambda: {100: 50, 50: 4})
+    monkeypatch.setattr(sys, "executable", scripts + r"\python.exe")
+    monkeypatch.setattr(sys, "argv", [r"C:\env\Lib\site-packages\vanth\server.py"])
+    monkeypatch.setenv("VANTH_MCP_SHIM", uvbin + r"\vanth-mcp.exe")
+    assert process_watch._skip_own_launchers(100) == 50
+    # The explicit value passed from the server works too (env already gone).
+    monkeypatch.delenv("VANTH_MCP_SHIM")
+    assert process_watch._skip_own_launchers(100, uvbin + r"\vanth-mcp.exe") == 50
+    # A parent that is some other vanth-mcp.exe is not one of our layers.
+    images[100] = r"C:\elsewhere\vanth-mcp.exe"
+    assert process_watch._skip_own_launchers(100, uvbin + r"\vanth-mcp.exe") == 100
+    # Our own image is never a layer, even when the shim env names it.
+    images[100] = r"C:\base\python.exe"
+    assert process_watch._skip_own_launchers(100, r"C:\base\python.exe") == 100
+
+
+def test_mcp_server_takes_the_shim_path_out_of_the_environment(monkeypatch):
+    """The server pops VANTH_MCP_SHIM so the daemon and jobs never inherit it."""
+    from vanth import server
+
+    monkeypatch.setenv("VANTH_MCP_SHIM", r"C:\bin\vanth-mcp.exe")
+    assert server._take_shim_env() == r"C:\bin\vanth-mcp.exe"
+    assert "VANTH_MCP_SHIM" not in os.environ
+    assert server._take_shim_env() == ""
+
+@pytest.mark.skipif(sys.platform != "win32", reason="the shim waits for its child only on Windows")
+def test_parent_pid_steps_over_the_sibling_console_trampoline(monkeypatch):
+    """The sibling-fallback chain is client -> vanth.exe -> vanth-mcp.exe ->
+    python. Both Windows launchers must be stepped over."""
+    from vanth import process_watch
+
+    uvbin = r"C:\Users\me\.local\bin"
+    images = {
+        os.getpid(): r"C:\base\python.exe",
+        100: uvbin + r"\vanth.exe",
+        101: uvbin + r"\vanth-mcp.exe",
+        50: r"C:\clients\agent.exe",
+    }
+    monkeypatch.setattr(process_watch, "_windows_image", images.get)
+    monkeypatch.setattr(process_watch, "_windows_parent_pids", lambda: {100: 101, 101: 50, 50: 4})
+    monkeypatch.setattr(sys, "executable", r"C:\env\Scripts\python.exe")
+    monkeypatch.setattr(sys, "argv", ["-c"])
+    monkeypatch.setenv("VANTH_MCP_SHIM", uvbin + r"\vanth-mcp.exe")
+    assert process_watch._skip_own_launchers(100) == 50
+
+def test_run_mcp_server_passes_the_shim_and_pops_it(monkeypatch):
+    """The server hands the shim to the watchdog and removes it from os.environ
+    before starting the daemon/relay, so children cannot inherit it."""
+    import vanth.process_watch as pw
+    from vanth import server
+
+    captured = {}
+
+    def fake_start_watchdog(**kwargs):
+        captured.update(kwargs)
+        return None, pw._InFlight()
+
+    monkeypatch.setattr(pw, "start_watchdog", fake_start_watchdog)
+    monkeypatch.setattr(server.mcp, "run", lambda: None)
+    monkeypatch.setenv("VANTH_MCP_SHIM", r"C:\bin\vanth-mcp.exe")
+    original = server.mcp.call_tool
+    try:
+        server._run_mcp_server()
+    finally:
+        server.mcp.call_tool = original
+    assert captured["shim"] == r"C:\bin\vanth-mcp.exe"
+    assert "VANTH_MCP_SHIM" not in os.environ

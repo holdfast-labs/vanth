@@ -90,7 +90,7 @@ jobs:
           mkdir -p dist
           exe=""
           [ "$GOOS" = "windows" ] && exe=".exe"
-          go build -trimpath -ldflags "-X vanth/internal/config.Version=${{ github.ref_name }}" -o "dist/vanth-monitor-${{ matrix.target }}${exe}" ./cmd/vanth
+          go build -trimpath -ldflags "-s -w -X vanth/internal/config.Version=${{ github.ref_name }}" -o "dist/vanth-monitor-${{ matrix.target }}${exe}" ./cmd/vanth
       - uses: actions/upload-artifact@v7
         with:
           name: monitor-${{ matrix.target }}

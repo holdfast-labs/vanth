@@ -1,8 +1,17 @@
-"""Hatchling build hook that bundles the native Go monitor into the wheel.
+"""Hatchling build hook that bundles the native Go binary into the wheel.
 
-Runs ``go build`` for the host platform and injects the resulting binary into
-the wheel under ``vanth/monitor-bin/`` so the ``vanth-monitor`` console script
-can locate it without requiring a Go toolchain at runtime.
+Runs ``go build`` for the host platform and ships the resulting multi-call
+binary as two wheel *scripts* (``<name>.data/scripts/``), which installers put
+in the env's ``Scripts``/``bin`` directory next to the Python console scripts:
+
+- ``vanth-monitor`` — the terminal monitor (selected by the program name), and
+- ``vanth-mcp`` — the MCP launcher shim, which starts ``python -m vanth.server``
+  for the env it is installed in with one process fewer than the ``vanth``
+  console script.
+
+No Go toolchain is needed at runtime. The binary is built with ``-s -w``
+(no symbol/DWARF tables; panics still print stack traces) because it ships
+twice.
 
 The hook runs only for the ``wheel`` target (not ``sdist``). ``go`` must be on
 PATH during the build; it is not required at install or run time.
@@ -148,10 +157,17 @@ class BundleMonitorBuildHook(BuildHookInterface):
             binary = self._compile(root, None, None)
             tag = tag_override or wheel_platform_tag()
 
-        rel = os.path.join("vanth", "monitor-bin", os.path.basename(binary))
-        build_data["force_include"] = {binary: rel}
+        # One multi-call binary, two names: wheels cannot hold links, so the
+        # shim is a copy. argv[0] selects the role at run time.
+        shim = os.path.join(os.path.dirname(binary), os.path.basename(binary).replace("vanth-monitor", "vanth-mcp"))
+        shutil.copyfile(binary, shim)
+        shutil.copymode(binary, shim)
+        build_data["shared_scripts"] = {
+            binary: os.path.basename(binary),
+            shim: os.path.basename(shim),
+        }
         build_data["tag"] = f"py3-none-{tag}"
-        self.app.display_success(f"Bundled monitor binary -> {rel}")
+        self.app.display_success(f"Bundled native scripts -> {os.path.basename(binary)}, {os.path.basename(shim)}")
 
     def _compile(self, root: str, goos: str | None, goarch: str | None) -> str:
         """Compile the monitor with the Go toolchain (host or cross target)."""
@@ -163,7 +179,7 @@ class BundleMonitorBuildHook(BuildHookInterface):
         binary = os.path.join(root, "dist", monitor_filename(goos))
         os.makedirs(os.path.dirname(binary), exist_ok=True)
 
-        ldflags = f"-X vanth/internal/config.Version={self.metadata.version}"
+        ldflags = f"-s -w -X vanth/internal/config.Version={self.metadata.version}"
         cmd = [
             "go",
             "build",

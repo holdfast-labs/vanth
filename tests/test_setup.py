@@ -359,3 +359,46 @@ def test_register_codex_desktop_fails_closed_without_capability(tmp_path, monkey
     assert changed is False
     assert "unavailable" in summary
     assert not (home / "codex_desktop.json").exists()
+
+
+def test_mcp_command_uses_native_shim_only_when_it_is_this_installs(tmp_path, monkeypatch):
+    import sysconfig
+
+    name = "vanth-mcp.exe" if os.name == "nt" else "vanth-mcp"
+    scripts = tmp_path / "env" / "Scripts"
+    scripts.mkdir(parents=True)
+    monkeypatch.setattr(sysconfig, "get_path", lambda key: str(scripts))
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "env"))
+    # No shim installed: the console script, as before.
+    monkeypatch.setattr(setup.shutil, "which", lambda cmd: None)
+    assert setup.mcp_command() == "vanth"
+    shim = scripts / name
+    shim.write_bytes(b"native")
+    monkeypatch.setattr(setup.shutil, "which", lambda cmd: str(shim))
+    assert setup.mcp_command() == "vanth-mcp"
+    # PATH finds some other install's shim: keep `vanth`.
+    other = tmp_path / "other" / name
+    other.parent.mkdir()
+    other.write_bytes(b"native")
+    monkeypatch.setattr(setup.shutil, "which", lambda cmd: str(other))
+    assert setup.mcp_command() == "vanth"
+    # ... unless this env's uv tool receipt says that copy is ours (Windows
+    # `uv tool install` copies entry points into its bin dir).
+    (tmp_path / "env" / "uv-receipt.toml").write_text(
+        '[tool]\nentrypoints = [\n    { name = "vanth-mcp", install-path = "%s", from = "vanth" },\n]\n'
+        % other.as_posix(), encoding="utf-8")
+    assert setup.mcp_command() == "vanth-mcp"
+
+
+def test_rerunning_setup_upgrades_vanth_entries_to_the_shim(tmp_path, monkeypatch):
+    monkeypatch.setattr("sys.stdin", None)
+    opencode_path, codex_path, claude_path = _scratch_configs(tmp_path, monkeypatch)
+    home = canonical_home()
+    assert setup.run_setup(None, home=home, assume_yes=True) == 0
+    monkeypatch.setattr(setup, "mcp_command", lambda: "vanth-mcp")
+    assert setup.run_setup(None, home=home, assume_yes=True) == 0
+    import tomllib
+
+    assert json.loads(opencode_path.read_text(encoding="utf-8"))["mcp"]["vanth"]["command"] == ["vanth-mcp"]
+    assert tomllib.loads(codex_path.read_text(encoding="utf-8"))["mcp_servers"]["vanth"]["command"] == "vanth-mcp"
+    assert json.loads(claude_path.read_text(encoding="utf-8"))["mcpServers"]["vanth"]["command"] == "vanth-mcp"

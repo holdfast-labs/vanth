@@ -9471,7 +9471,7 @@ def job_cleanup_preview(older_than_seconds: int) -> dict[str, Any]:
 # name a command, so the dispatch gate must look past them. The routing sets
 # live in vanth.cli (imported at the top of this module for compatibility);
 # _is_vanth_mcp_command below is the only remaining user here.
-_VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw"}
+_VANTH_SCRIPT_NAMES = {"vanth", "vanth.exe", "vanth-script.py", "vanth-script.pyw", "vanth-mcp", "vanth-mcp.exe"}
 
 
 def _is_vanth_script_name(base: str) -> bool:
@@ -9700,6 +9700,11 @@ def __getattr__(name: str) -> Any:
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+def _take_shim_env() -> str:
+    """Remove and return VANTH_MCP_SHIM, which only the native shim sets."""
+    return os.environ.pop("VANTH_MCP_SHIM", "")
+
+
 def _run_mcp_server() -> None:
     """Run the MCP stdio server under a parent-liveness + idle watchdog.
 
@@ -9712,7 +9717,12 @@ def _run_mcp_server() -> None:
     """
     from .process_watch import start_watchdog
 
-    thread, tracker = start_watchdog()
+    # Set only by the native vanth-mcp shim. Take it out of the environment so
+    # the daemon, runners, and wake adapters this server starts never inherit
+    # it, and hand it to the watchdog so it steps over the shim layer (which a
+    # uv tool install copies away from the env's Scripts dir).
+    shim = _take_shim_env()
+    thread, tracker = start_watchdog(shim=shim)
 
     # Review rc36 P0: start the client-side Desktop wake relay (a separate
     # localhost subscription to the daemon, never MCP stdio). It only runs when

@@ -149,8 +149,13 @@ def process_alive(pid: int | None) -> bool:
         return False
 
 
-def parent_pid() -> int | None:
-    """Return the PID this process was launched by, if known and meaningful."""
+def parent_pid(shim: str | None = None) -> int | None:
+    """Return the PID this process was launched by, if known and meaningful.
+
+    ``shim`` is the native ``vanth-mcp`` shim path reported by the shim itself
+    (or read from ``VANTH_MCP_SHIM`` when None). It is a launcher layer even
+    when the shim is a uv-tool copy in a bin dir away from the env.
+    """
     explicit = os.environ.get(_PARENT_ENV)
     if explicit:
         try:
@@ -166,7 +171,7 @@ def parent_pid() -> int | None:
     if ppid and ppid not in _NULL_PIDS:
         if sys.platform == "win32":
             try:
-                return _skip_own_launchers(ppid)
+                return _skip_own_launchers(ppid, shim)
             except Exception:
                 return ppid
         return ppid
@@ -230,16 +235,22 @@ def _windows_parent_pids() -> dict[int, int]:
     return table
 
 
-def _skip_own_launchers(ppid: int) -> int:
+def _skip_own_launchers(ppid: int, shim: str | None = None) -> int:
     """Return the first ancestor that is not one of this server's launchers.
 
     ``vanth.exe`` (console-script trampoline) -> venv ``Scripts\\python.exe``
-    (launcher) -> real interpreter: both launchers wait for their child and
+    (launcher) -> real interpreter, or ``vanth-mcp.exe`` (native shim) -> real
+    interpreter: these launchers wait for their child and
     outlive a dead client, so watching the direct parent never saw the client
     die and orphaned servers lingered until the idle timeout. A layer is only
-    skipped when its image is exactly this process's venv launcher
-    (``sys.executable``) or trampoline (``sys.argv[0]``) and differs from our
-    own image, so a client that is itself Python is never stepped over.
+    skipped when its image is exactly one of this process's launcher paths and
+    differs from our own image, so a client that is itself Python is never
+    stepped over.
+
+    The native shim is the env's ``Scripts\\vanth-mcp.exe`` when it runs the
+    interpreter directly, but a uv-tool install COPIES it into a bin dir away
+    from the env. That copy reports its own absolute path through
+    ``VANTH_MCP_SHIM``; both paths are layers.
     """
     own = _windows_image(os.getpid())
     if not own:
@@ -250,7 +261,16 @@ def _skip_own_launchers(ppid: int) -> int:
     # Console-script __main__ strips ".exe" from argv[0]; the trampoline has it.
     if argv0 and os.path.splitext(argv0)[1] == "":
         argv0 += ".exe"
-    for path in (sys.executable, argv0):
+    # The native vanth-mcp shim starts the interpreter directly and waits for
+    # it, so it is a launcher layer too.
+    env_shim = shim if shim is not None else os.environ.get("VANTH_MCP_SHIM", "")
+    script_shim = os.path.join(os.path.dirname(sys.executable), "vanth-mcp.exe") if sys.executable else ""
+    # When the shim falls back to the sibling `vanth` console script, that
+    # trampoline is another layer in the chain. It sits next to the shim.
+    console_shim = ""
+    if env_shim and env_shim.lower().endswith(".exe"):
+        console_shim = os.path.join(os.path.dirname(env_shim), "vanth.exe")
+    for path in (sys.executable, argv0, script_shim, env_shim, console_shim):
         if path and path.lower().endswith(".exe"):
             path = os.path.normcase(os.path.abspath(path))
             if path != own:
@@ -369,6 +389,7 @@ def start_watchdog(
     idle: float | None = None,
     on_exit: callable = _exiting,  # type: ignore[assignment]
     in_flight: _InFlight | None = None,
+    shim: str | None = None,
 ) -> tuple[threading.Thread | None, _InFlight]:
     """Start a daemon watchdog thread; returns (thread, in_flight tracker).
 
@@ -396,7 +417,9 @@ def start_watchdog(
     if not (grace >= 0) or grace == float("inf"):
         grace = _DEFAULT_GRACE
     tracker = in_flight or _InFlight()
-    parent = parent_pid()
+    # Callers that do not know the shim keep the original zero-argument call
+    # (and _skip_own_launchers then reads VANTH_MCP_SHIM itself).
+    parent = parent_pid(shim) if shim is not None else parent_pid()
     if parent is None:
         return None, tracker
     # A tiny idle is unsafe in production (could reap a live session mid-think),

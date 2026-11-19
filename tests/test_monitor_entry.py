@@ -1,6 +1,7 @@
 import os
 import shutil
 import sys
+import sysconfig
 
 import pytest
 
@@ -23,7 +24,21 @@ def _fake_bundled(tmp_path, monkeypatch):
         bin.write_bytes(b"#!/bin/sh\n")
         bin.chmod(0o755)
     monkeypatch.setattr(vanth, "__file__", str(pkg / "__init__.py"))
+    # Keep the real env's scripts dir (which holds the native monitor) out.
+    monkeypatch.setattr(sysconfig, "get_path", lambda key: str(tmp_path / "scripts"))
     return pkg
+
+
+def test_native_script_in_env_scripts_dir_wins(tmp_path, monkeypatch):
+    """Wheels install the native vanth-monitor next to the console scripts."""
+    _fake_bundled(tmp_path, monkeypatch)
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    (scripts / _binary_name()).write_bytes(b"native")
+    assert find_monitor_binary() == scripts / _binary_name()
+    # A frozen build is itself vanth-monitor: never re-exec the scripts dir.
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    assert find_monitor_binary() == tmp_path / "vanth" / "monitor-bin" / _binary_name()
 
 
 def test_bundled_binary_found(tmp_path, monkeypatch):

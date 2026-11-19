@@ -51,6 +51,11 @@ def _make_hook(root: str, target_name: str = "wheel") -> BundleMonitorBuildHook:
     return hook
 
 
+def _fake_go_output(cmd) -> None:
+    with open(cmd[cmd.index("-o") + 1], "wb") as out:
+        out.write(b"built")
+
+
 @pytest.mark.parametrize(
     ("goos", "goarch", "expected"),
     [
@@ -91,11 +96,13 @@ def test_prebuilt_bin_injection(tmp_path, monkeypatch) -> None:
     assert "go" not in calls
     exe = ".exe" if os.name == "nt" else ""
     binary = str(tmp_path / "dist" / f"vanth-monitor{exe}")
-    assert build_data["force_include"] == {
-        binary: os.path.join("vanth", "monitor-bin", f"vanth-monitor{exe}")
-    }
+    shim = str(tmp_path / "dist" / f"vanth-mcp{exe}")
+    # One multi-call binary shipped as two native scripts (no monitor-bin copy).
+    assert build_data["shared_scripts"] == {binary: f"vanth-monitor{exe}", shim: f"vanth-mcp{exe}"}
+    assert "force_include" not in build_data
     assert build_data["tag"] == "py3-none-win_amd64"
     assert os.path.isfile(binary)
+    assert open(shim, "rb").read() == b"fake monitor binary"
 
 
 def test_prebuilt_injection_names_binary_for_target_goos(tmp_path, monkeypatch) -> None:
@@ -121,8 +128,8 @@ def test_prebuilt_injection_names_binary_for_target_goos(tmp_path, monkeypatch) 
     hook.initialize("1.2.1", build_data)
 
     binary = str(tmp_path / "dist" / "vanth-monitor.exe")
-    assert build_data["force_include"] == {
-        binary: os.path.join("vanth", "monitor-bin", "vanth-monitor.exe")
+    assert build_data["shared_scripts"] == {
+        binary: "vanth-monitor.exe", str(tmp_path / "dist" / "vanth-mcp.exe"): "vanth-mcp.exe"
     }
     assert os.path.isfile(binary)
 
@@ -142,8 +149,8 @@ def test_prebuilt_injection_names_binary_for_target_posix(tmp_path, monkeypatch)
     hook.initialize("1.2.1", build_data)
 
     binary = str(tmp_path / "dist" / "vanth-monitor")
-    assert build_data["force_include"] == {
-        binary: os.path.join("vanth", "monitor-bin", "vanth-monitor")
+    assert build_data["shared_scripts"] == {
+        binary: "vanth-monitor", str(tmp_path / "dist" / "vanth-mcp"): "vanth-mcp"
     }
     assert os.path.isfile(binary)
 
@@ -223,7 +230,7 @@ def test_prebuilt_injection_falls_back_to_target_tag(tmp_path, monkeypatch) -> N
     binary = str(tmp_path / "dist" / "vanth-monitor.exe")
     assert build_data["tag"] == "py3-none-win_amd64"
     assert os.path.isfile(binary)
-    assert "monitor-bin" in build_data["force_include"][binary]
+    assert build_data["shared_scripts"][binary] == "vanth-monitor.exe"
 
 
 def test_prebuilt_missing_raises(tmp_path, monkeypatch) -> None:
@@ -246,6 +253,7 @@ def test_host_build_fallback(tmp_path, monkeypatch) -> None:
         calls["cmd"] = cmd
         calls["cwd"] = kwargs.get("cwd")
         calls["env"] = kwargs.get("env")
+        _fake_go_output(cmd)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr("bundle_monitor.wheel_platform_tag", lambda: "win_amd64")
@@ -274,6 +282,7 @@ def test_cross_build_uses_goos_goarch(tmp_path, monkeypatch) -> None:
     def fake_run(cmd, **kwargs):
         calls["cmd"] = cmd
         calls["env"] = kwargs.get("env")
+        _fake_go_output(cmd)
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr("bundle_monitor.wheel_platform_tag", lambda: "win_amd64")

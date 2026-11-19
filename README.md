@@ -68,9 +68,10 @@ Install with `uv` (Python 3.11+):
 uv tool install vanth
 ```
 
-This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, and
-the ops CLI as standalone tools (the wheel bundles the native Go monitor, so
-no Go toolchain is needed). Wheels are published for Windows x86_64, Linux
+This installs the `vanth` MCP server, `vanthd` daemon, `vanth-monitor`, the
+`vanth-mcp` MCP launcher, and the ops CLI as standalone tools (`vanth-monitor`
+and `vanth-mcp` are native executables shipped in the wheel, so no Go
+toolchain is needed). Wheels are published for Windows x86_64, Linux
 x86_64/arm64, and macOS x86_64/arm64.
 
 **No Python toolchain?** Download the self-contained binary for your platform
@@ -200,8 +201,22 @@ vanth-monitor
 |---|---|---|
 | `vanth` | `uv run vanth` | MCP stdio server and human CLI |
 | `vanthd` | `uv run vanthd` | Background HTTP daemon |
-| `vanth-monitor` | `uv run vanth-monitor` | Live terminal dashboard (Go binary, bundled in the wheel) |
+| `vanth-mcp` | `uv run vanth-mcp` | MCP stdio server via a native launcher (fewer processes; what `vanth setup` registers) |
+| `vanth-monitor` | `uv run vanth-monitor` | Live terminal dashboard (native Go executable installed by the wheel) |
 | `vanth-codex-notify` | `uv run vanth-codex-notify` | Delivery adapter: reads a wake payload on stdin and dispatches it to Codex |
+
+`vanth-mcp` and `vanth` (with no subcommand) run the same MCP server. On
+Windows the `vanth` console script costs three processes per agent (uv
+trampoline, venv launcher, interpreter); `vanth-mcp` is a native launcher that
+finds its env at run time (its own directory, or the env named by the uv tool
+receipt for `uv tool install`'s bin-dir copy), then starts the env's base
+interpreter directly with `__PYVENV_LAUNCHER__` set, so the server loads the
+env's packages exactly as the venv launcher would: two processes, and the
+server is killed with the launcher (job object) without taking the daemon down.
+On Linux/macOS it `exec`s the env's `python`: one process. If it cannot
+resolve the env it falls back to the env's own `python`, then `python` on
+`PATH`, and says so on stderr. No interpreter path is ever written to a client
+config.
 
 The MCP stdio server exits when its launching client closes stdin or dies, and
 reaps itself after `VANTH_WATCH_IDLE` seconds of idle (default 1800; `0`
@@ -404,6 +419,11 @@ vanth setup --remove
 By default setup detects clients and prompts before applying changes. `--yes`
 skips prompts, client names limit the targets, `--json` prints machine-readable
 output, and `--remove` unregisters Vanth.
+
+Setup registers the bare command `vanth-mcp` when the native launcher is
+installed with this Vanth and is what `PATH` finds, else `vanth`. Re-running
+setup after an upgrade rewrites existing `vanth` entries to `vanth-mcp`. The
+manual examples below use `vanth`; `vanth-mcp` works in the same place.
 
 Configs it manages:
 
@@ -1364,17 +1384,15 @@ a mission-control view:
 vanth-monitor
 ```
 
-Published platform wheels include the native Go binary, so `vanth-monitor`
-runs without a Go toolchain. In a source checkout on Windows, build it once
-from the repo root using `cmd.exe` (requires Go on `PATH`), then run the
-generated executable:
+Published platform wheels install `vanth-monitor` as a native executable, so
+it runs without a Go toolchain (one process; it used to be a Python console
+script that re-launched the Go binary). In a source checkout, `uv sync` builds
+it into `.venv` with the same build hook (Go on `PATH`), so `uv run
+vanth-monitor` works. To build it by hand on Windows with `cmd.exe`:
 
 ```cmd
 mkdir dist 2>nul & go build -o dist\vanth-monitor.exe .\cmd\vanth && dist\vanth-monitor.exe monitor
 ```
-
-The source checkout's `vanth-monitor` wrapper does not build or discover that
-output automatically; run the executable produced by `go build` directly.
 
 Keys: `up/down`, `left/right` or `j/k` select a job (cards, then the rail) ·
 `tab`/`shift+tab` focus a chart · `[`/`]` page the charts · `+`/`-` or the
@@ -1419,6 +1437,7 @@ Environment variables (defaults live in `src/vanth/server.py`,
 | `VANTH_LOG_MAX_BYTES` | `5 MiB` | Rotating daemon log size |
 | `VANTH_LOG_BACKUP_COUNT` | `3` | Daemon log rotation count |
 | `VANTH_BUSY_TIMEOUT_MS` | `30000` | SQLite write-lock wait |
+| `VANTH_SQLITE_SYNCHRONOUS` | `FULL` | `PRAGMA synchronous` for every connection: `NORMAL`, `FULL`, `EXTRA`; any other value (including `OFF`) uses `FULL` |
 
 Key knobs in one glance:
 
@@ -1438,6 +1457,94 @@ Key knobs in one glance:
 | `VANTH_ALERT_WEBHOOK` | Edge-triggered operator alert destination |
 | `VANTH_ALERT_DISK_FREE_BYTES` | Free-disk threshold that raises a `disk_low` alert |
 | `VANTH_ALERT_INTERVAL` | Alert evaluation cadence in seconds (default 30) |
+
+### SQLite durability and synchronization
+
+`jobs.sqlite` uses WAL. Every connection applies
+`VANTH_SQLITE_SYNCHRONOUS` to `PRAGMA synchronous`. Valid values are `NORMAL`,
+`FULL`, and `EXTRA`; an unknown value falls back to `FULL`. `OFF` is rejected
+and falls back to `FULL` because it can corrupt the database on a power loss,
+not just lose recent writes. The default is `FULL`. Set the variable on the
+daemon; runners inherit it. Other processes that open the database need it in
+their own environment.
+
+- `FULL` syncs the WAL at every commit. A commit that returns survives a power
+  loss.
+- `NORMAL` does not sync at commit. The WAL is synced by a checkpoint: the
+  1000-page automatic checkpoint, the daemon's PASSIVE checkpoint every
+  `VANTH_WAL_CHECKPOINT_SECONDS` (default 300 s), or close. A process crash
+  loses nothing acknowledged: SQLite rolls a torn tail back. A power loss can
+  drop the writes since the last checkpoint.
+- `EXTRA` behaves like `FULL` in WAL mode (the extra directory sync applies to
+  rollback journals).
+
+Measured on Windows 11, local SSD, 19 Nov 2026, with
+`scripts/sqlite_durability.py` (the real `JobManager` write paths and
+throwaway `VANTH_HOME` directories). Throughput is the median of 3 runs of
+20,000 metric events.
+
+| Metric | `FULL` | `NORMAL` |
+|---|---|---|
+| Capture throughput | 5,577 events/s | 6,307 events/s |
+| Capture range (3 runs) | 5,428-5,666 | 5,971-6,541 |
+| Full `_emit` p50 / p95 | 2.09 / 2.98 ms | 0.64 / 1.00 ms |
+| SQLite commit only p50 / p95 | 1.55 / 2.13 ms | 0.18 / 0.30 ms |
+| Heartbeat commit p50 / p95 | 1.31 / 1.64 ms | 0.049 / 0.080 ms |
+| Hard kills, 100 per level | 0 failures | 0 failures |
+| Acknowledged commits lost | 0 | 0 |
+| Rows written in the 100 kills (capture / transition) | 307,239 / 20,075 | 614,961 / 46,799 |
+| Steady-state WAL frames per event | 2.22-2.30 | 2.24-2.28 |
+| Events per 1000-page checkpoint | 435-450 | 438-447 |
+
+An independent re-run measured 6,275 events/s for `FULL` and 6,501 for
+`NORMAL` (median of 3), so the throughput difference is within run-to-run
+noise: +4 % to +13 % across runs. The latency gain reproduced closely (full
+`_emit` p50 2.11 -> 0.59 ms, commit p50 1.58 -> 0.17 ms, heartbeat p50
+1.33 -> 0.05 ms). The crash column is not a throughput number: `NORMAL`
+completes more capture batches in the same fixed kill window, so it writes
+more rows. A second crash run (40 hard kills per level) also had 0 failures
+and 0 acknowledged commits lost.
+
+Exposure under `NORMAL`:
+
+- A chatty 20,000-event capture showed 32 WAL resets in 2.7-3.7 s, about one
+  sync per 0.08-0.11 s. At 2.2-2.3 WAL frames per event, one 1000-page
+  checkpoint covers about 440-450 events (about 0.06 s at 7k events/s, 0.08 s
+  at 5.5k events/s).
+- An idle heartbeat writes one WAL frame. Without another checkpoint, about
+  1000 heartbeats (about 1000 s at the 1 s default) pass between syncs.
+- The daemon is the tighter bound. It runs `PRAGMA wal_checkpoint(PASSIVE)`
+  every `VANTH_WAL_CHECKPOINT_SECONDS` (default 300 s). SQLite documents that
+  with `synchronous=NORMAL` a checkpoint is the only operation that issues a
+  sync, and that it syncs the WAL before moving frames into the database.
+  Measured: a PASSIVE checkpoint under `NORMAL` checkpointed all 1563
+  pending frames, and a copy of the database file alone (no WAL) held all
+  20,640 events and the latest heartbeat. So with the daemon running, idle
+  exposure is at most about 300 s, not 1000 s. This assumes the daemon runs
+  and the checkpoint interval is not raised; without the daemon, the 1000-page
+  automatic checkpoint applies.
+- `torn` opened 200 of 200 truncated or out-of-order WAL variants with
+  `integrity_check=ok` and a gap-free event prefix; a complete WAL recovered
+  all 5039 rows. This does not cover a power loss during a checkpoint, a torn
+  write to the database file, or hardware that ignores flush requests.
+- `crash` hard-killed two writers 100 times per level: 0 acknowledged commits
+  lost, 0 integrity failures, and no gaps or duplicates.
+
+Decision: keep `FULL` as the default. The capture throughput difference is
+within noise; the firm gain is latency, about 8.5x on a commit (about 27x on a
+heartbeat). `NORMAL` widens the power-loss window from one commit to up to
+1000 WAL pages or the 300 s daemon checkpoint. That trade is poor for a job
+tracker whose acknowledged jobs and events must survive a power cut. The knob
+remains available for an operator who accepts that risk.
+
+Reproduce:
+
+```cmd
+uv run python scripts/sqlite_durability.py bench
+uv run python scripts/sqlite_durability.py crash --iterations 100
+uv run python scripts/sqlite_durability.py exposure
+uv run python scripts/sqlite_durability.py torn
+```
 
 ---
 
@@ -1736,8 +1843,9 @@ go test ./...
 `uv build` produces the sdist and wheel; the wheel bundles the Go monitor.
 
 The wheel build runs a hatchling build hook (`build-hooks/bundle_monitor.py`)
-that compiles the Go monitor for the host platform and bundles it under
-`vanth/monitor-bin/` so `vanth-monitor` needs no Go toolchain at runtime. `go`
+that compiles the multi-call Go binary (`cmd/vanth`) for the host platform and
+ships it as two wheel scripts, `vanth-monitor` and `vanth-mcp` (the program
+name selects the role), so neither needs a Go toolchain at runtime. `go`
 must be on PATH when building the wheel; it is not needed to install or run it.
 Wheels are platform-tagged (`py3-none-<platform>`) because they contain the
 native binary.

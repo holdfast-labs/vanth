@@ -168,10 +168,46 @@ def _merge_json(path: Path, merge_fn) -> tuple[bool, str]:
     return True, "updated"
 
 
+def mcp_command() -> str:
+    """The bare command MCP clients should launch (never a path).
+
+    ``vanth-mcp`` is the native launcher shim installed next to the Python
+    console scripts: it starts the env's interpreter directly, one process
+    fewer than the ``vanth`` console script. Used only when it is installed in
+    this env and is what PATH resolves (directly, or as the copy `uv tool
+    install` puts in its bin dir on Windows), so the entry runs this install.
+    """
+    import sysconfig
+
+    name = "vanth-mcp.exe" if os.name == "nt" else "vanth-mcp"
+    shim = Path(sysconfig.get_path("scripts")) / name
+    found = shutil.which("vanth-mcp")
+    if not shim.is_file() or not found:
+        return "vanth"
+    if os.path.samefile(found, shim) or _uv_tool_installed(Path(found)):
+        return "vanth-mcp"
+    return "vanth"
+
+
+def _uv_tool_installed(path: Path) -> bool:
+    """Whether this env's uv tool receipt lists ``path`` as its vanth-mcp."""
+    import tomllib
+
+    try:
+        receipt = tomllib.loads((Path(sys.prefix) / "uv-receipt.toml").read_text(encoding="utf-8"))
+        entries = receipt["tool"]["entrypoints"]
+        return any(
+            entry.get("name") == "vanth-mcp" and os.path.samefile(entry.get("install-path", ""), path)
+            for entry in entries
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _mcp_vanth_entry(home: Path) -> dict[str, Any]:
     """The MCP entry used for mcpServers-style clients."""
     return {
-        "command": "vanth",
+        "command": mcp_command(),
         "env": {"VANTH_HOME": str(home)},
     }
 
@@ -181,7 +217,7 @@ def register_opencode(path: Path, home: Path) -> tuple[bool, str]:
         mcp = data.setdefault("mcp", {})
         mcp[SETUP_KEY] = {
             "type": "local",
-            "command": ["vanth"],
+            "command": [mcp_command()],
             "enabled": True,
             # 60 s matches the reference MCP client budget. Blocking tools
             # (job_wait, job_start_and_wait, job_stop, job_tail --follow) return
@@ -229,7 +265,7 @@ def register_codex(path: Path, home: Path) -> tuple[bool, str]:
     escaped_home = str(home).replace("\\", "\\\\")
     new_lines = [
         section,
-        f'command = "{SETUP_KEY}"',
+        f'command = "{mcp_command()}"',
         "",
         f"[mcp_servers.{SETUP_KEY}.env]",
         f'VANTH_HOME = "{escaped_home}"',

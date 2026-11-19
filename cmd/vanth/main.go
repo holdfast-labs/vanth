@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
+	"strings"
 
 	tea "charm.land/bubbletea/v2"
 
@@ -40,7 +42,35 @@ func runMonitor(home string) int {
 	return 0
 }
 
+// programName is argv[0]'s basename without .exe, lowercased: the binary is
+// multi-call and the name it was installed under selects its role.
+func programName(argv0 string) string {
+	base := strings.ToLower(filepath.Base(strings.ReplaceAll(argv0, "\\", "/")))
+	return strings.TrimSuffix(base, ".exe")
+}
+
+// dispatchArgs maps the program name onto the subcommand form: `vanth-mcp`
+// is the MCP launcher (every arg forwarded to the server); `vanth-monitor`
+// defaults to the monitor subcommand, as its former Python wrapper did.
+func dispatchArgs(argv []string) (mcp bool, args []string) {
+	args = argv[1:]
+	switch programName(argv[0]) {
+	case "vanth-mcp":
+		return true, args
+	case "vanth-monitor":
+		if len(args) == 0 || (args[0] != "monitor" && args[0] != "--version") {
+			args = append([]string{"monitor"}, args...)
+		}
+	}
+	return false, args
+}
+
 func main() {
+	mcp, args := dispatchArgs(os.Args)
+	if mcp {
+		os.Exit(runMCP(args))
+	}
+	os.Args = append([]string{os.Args[0]}, args...)
 	if len(os.Args) > 1 && os.Args[1] == "--version" {
 		asJSON := len(os.Args) > 2 && os.Args[2] == "--json"
 		if asJSON {

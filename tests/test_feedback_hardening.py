@@ -104,7 +104,8 @@ def wait_status(client, job_id, statuses, timeout=10):
 
 
 def http_get(port, path, token=None):
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    # Generous: relay polls long-poll for up to 5 s, and loaded CI runners add more.
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
@@ -118,7 +119,7 @@ def http_get(port, path, token=None):
 def http_post(port, path, payload, token=None):
     """POST raw JSON and return (status, decoded body). Used where the status
     code or a field-level error message matters."""
-    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = f"Bearer {token}"

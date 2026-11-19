@@ -2573,7 +2573,7 @@ class JobManager:
             else:  # pragma: no cover - loop always breaks
                 raise RuntimeError("event write failed")
         if event is not None and event.get("persisted") is not False:
-            self._append_event_mirror(event, job_id)
+            self._append_event_mirror([event], job_id)
         with self._condition(job_id):
             self._condition(job_id).notify_all()
         return event
@@ -2590,6 +2590,8 @@ class JobManager:
         mutate: Callable[[sqlite3.Connection], None] | None = None,
         exempt_from_cap: bool = False,
         transaction: bool = True,
+        known_count: int | None = None,
+        known_seq: int | None = None,
     ) -> dict[str, Any]:
         """Persist a state mutation and its event + deliveries in ONE transaction.
 
@@ -2599,12 +2601,16 @@ class JobManager:
         leave a resolved decision with no event, which a retry could not
         repair). ``mutate`` may raise ``_DecisionNoOp`` to abort cleanly.
         ``exempt_from_cap`` is set only by authoritative decision transitions.
+        ``known_count``/``known_seq`` let a batch that already holds the write
+        lock skip the per-event COUNT(*) (a scan that grows with the job) and
+        MAX(seq) lookups.
         """
         if transaction:
             self.db.execute("BEGIN IMMEDIATE")
         try:
             if event_type not in TERMINAL_STATUSES and not exempt_from_cap:
-                count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                count = known_count if known_count is not None else self.db.execute(
+                    "SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
                 if count >= self.max_events_per_job:
                     if transaction:
                         self.db.rollback()
@@ -2641,8 +2647,11 @@ class JobManager:
                         "persisted": False,
                         "noop": True,
                     }
-            row = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,)).fetchone()
-            seq = int(row["seq"])
+            if known_seq is not None:
+                seq = known_seq
+            else:
+                row = self.db.execute("SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM events WHERE job_id=?", (job_id,)).fetchone()
+                seq = int(row["seq"])
             created_at = now_iso()
             event_id = "evt_" + uuid.uuid4().hex[:16]
             self.db.execute(
@@ -2698,10 +2707,21 @@ class JobManager:
                 with self.db_lock:
                     self.db.execute("BEGIN IMMEDIATE")
                     try:
-                        events = [self._emit_transactional(
-                            job_id, payload, encoded, payload["type"], payload["level"], source,
-                            payload["message"], transaction=False,
-                        ) for payload, encoded in prepared[offset:offset + 64]]
+                        # The write lock is held for the whole batch, so the
+                        # job's event count and next seq can be tracked here.
+                        count = self.db.execute("SELECT COUNT(*) FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                        seq = self.db.execute(
+                            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE job_id=?", (job_id,)).fetchone()[0]
+                        events = []
+                        for payload, encoded in prepared[offset:offset + 64]:
+                            event = self._emit_transactional(
+                                job_id, payload, encoded, payload["type"], payload["level"], source,
+                                payload["message"], transaction=False, known_count=count, known_seq=seq,
+                            )
+                            if event.get("persisted") is not False:
+                                count += 1
+                                seq += 1
+                            events.append(event)
                         self.db.commit()
                         return events
                     except BaseException:
@@ -2711,9 +2731,7 @@ class JobManager:
             contentions = self.event_contentions_by_job.get(job_id, 0)
             events = self._retry_locked(persist, event_job=job_id)
             elapsed = time.monotonic() - started
-            for event in events:
-                if event.get("persisted") is not False:
-                    self._append_event_mirror(event, job_id)
+            self._append_event_mirror([event for event in events if event.get("persisted") is not False], job_id)
             with self._condition(job_id):
                 self._condition(job_id).notify_all()
             with self.db_lock:
@@ -2731,15 +2749,19 @@ class JobManager:
             elif elapsed > 1:
                 self.logger.warning("event capture slow job_id=%s stream=%s seconds=%.3f", job_id, source, elapsed)
 
-    def _append_event_mirror(self, event: dict[str, Any], job_id: str) -> None:
+    def _append_event_mirror(self, events: list[dict[str, Any]], job_id: str) -> None:
+        if not events:
+            return
         try:
             row = self._row("SELECT events_path FROM jobs WHERE job_id=?", (job_id,))
             if not row:
                 return
+            # One open per batch: an open/close per event dominated capture of
+            # chatty jobs on Windows.
             with Path(row["events_path"]).open("a", encoding="utf-8") as f:
-                f.write(json.dumps(event, separators=(",", ":")) + "\n")
+                f.write("".join(json.dumps(event, separators=(",", ":")) + "\n" for event in events))
         except OSError:
-            self.logger.exception("event mirror write failed job_id=%s event_id=%s", job_id, event.get("event_id"))
+            self.logger.exception("event mirror write failed job_id=%s event_id=%s", job_id, events[0].get("event_id"))
         except (sqlite3.Error, RuntimeError):
             self.logger.exception("event mirror path lookup failed job_id=%s", job_id)
 

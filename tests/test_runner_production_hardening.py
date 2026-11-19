@@ -376,3 +376,36 @@ def test_plain_windows_command_runs_without_cmd_wrapper(tmp_path):
         assert int(manager.tail(shelled["job_id"])["content"].strip()) != manager.status(shelled["job_id"])["worker_pid"]
     finally:
         manager.close()
+
+
+def test_capture_batches_persist_consecutive_seqs_and_one_mirror_open_per_batch(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from vanth.server import now_iso
+
+    manager = JobManager(tmp_path, recover=False)
+    stamp = now_iso()
+    events_path = manager.events_dir / "chatty.jsonl"
+    manager.db.execute(
+        "INSERT INTO jobs(job_id,command,status,created_at,updated_at,stdout_path,stderr_path,events_path) "
+        "VALUES ('chatty','x','running',?,?,?,?,?)",
+        (stamp, stamp, str(manager.logs / "c.out"), str(manager.logs / "c.err"), str(events_path)))
+    manager.db.commit()
+    manager._emit("chatty", "started")
+    opens = []
+    original = Path.open
+
+    def counting_open(path, *args, **kwargs):
+        if path == events_path:
+            opens.append(1)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counting_open)
+    lines = b"".join(b'AGENT_EVENT {"type":"metric","data":{"_step":%d,"loss":1}}\n' % i for i in range(300))
+    manager._read_stream("chatty", ChunkStream([lines[:9000], lines[9000:]]), tmp_path / "out", "stdout")
+    seqs = [row[0] for row in manager.db.execute("SELECT seq FROM events WHERE job_id='chatty' ORDER BY seq")]
+    assert seqs == list(range(1, 302))
+    mirrored = [json.loads(line)["seq"] for line in events_path.read_text(encoding="utf-8").splitlines()]
+    assert mirrored == seqs
+    assert len(opens) <= 8  # a few 64-event batches, not one open per event
+    manager.close()

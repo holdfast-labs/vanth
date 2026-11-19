@@ -9,6 +9,8 @@ from pathlib import Path
 
 LATEST_SCHEMA_VERSION = 20
 DEFAULT_BUSY_TIMEOUT_MS = 30000
+DEFAULT_SYNCHRONOUS = "FULL"
+VALID_SYNCHRONOUS = frozenset({"OFF", "NORMAL", "FULL", "EXTRA"})
 
 
 def busy_timeout_ms() -> int:
@@ -18,10 +20,19 @@ def busy_timeout_ms() -> int:
         return DEFAULT_BUSY_TIMEOUT_MS
 
 
+def synchronous_level() -> str:
+    """Resolve VANTH_SQLITE_SYNCHRONOUS; unknown or unset keeps FULL."""
+    level = os.environ.get("VANTH_SQLITE_SYNCHRONOUS", "").strip().upper()
+    return level if level in VALID_SYNCHRONOUS else DEFAULT_SYNCHRONOUS
+
+
 def configure_connection(db: sqlite3.Connection) -> None:
     db.execute(f"PRAGMA busy_timeout={busy_timeout_ms()}")
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA foreign_keys=ON")
+    # Per-connection and explicit, so an invalid knob value can never fall back
+    # to a compile-time default that differs from FULL.
+    db.execute(f"PRAGMA synchronous={synchronous_level()}")
 
 
 def _column_names(db: sqlite3.Connection, table: str) -> set[str]:

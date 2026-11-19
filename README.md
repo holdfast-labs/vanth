@@ -1437,7 +1437,7 @@ Environment variables (defaults live in `src/vanth/server.py`,
 | `VANTH_LOG_MAX_BYTES` | `5 MiB` | Rotating daemon log size |
 | `VANTH_LOG_BACKUP_COUNT` | `3` | Daemon log rotation count |
 | `VANTH_BUSY_TIMEOUT_MS` | `30000` | SQLite write-lock wait |
-| `VANTH_SQLITE_SYNCHRONOUS` | `FULL` | `PRAGMA synchronous` for every connection: `OFF`, `NORMAL`, `FULL`, `EXTRA`; any other value uses `FULL` |
+| `VANTH_SQLITE_SYNCHRONOUS` | `FULL` | `PRAGMA synchronous` for every connection: `NORMAL`, `FULL`, `EXTRA`; any other value (including `OFF`) uses `FULL` |
 
 Key knobs in one glance:
 
@@ -1461,18 +1461,22 @@ Key knobs in one glance:
 ### SQLite durability and synchronization
 
 `jobs.sqlite` uses WAL. Every connection applies
-`VANTH_SQLITE_SYNCHRONOUS` to `PRAGMA synchronous`. Valid values are `OFF`,
-`NORMAL`, `FULL`, and `EXTRA`; an unknown value falls back to `FULL`. The
-default is `FULL`. Set the variable on the daemon; runners inherit it. Other
-processes that open the database need it in their own environment.
+`VANTH_SQLITE_SYNCHRONOUS` to `PRAGMA synchronous`. Valid values are `NORMAL`,
+`FULL`, and `EXTRA`; an unknown value falls back to `FULL`. `OFF` is rejected
+and falls back to `FULL` because it can corrupt the database on a power loss,
+not just lose recent writes. The default is `FULL`. Set the variable on the
+daemon; runners inherit it. Other processes that open the database need it in
+their own environment.
 
 - `FULL` syncs the WAL at every commit. A commit that returns survives a power
   loss.
-- `NORMAL` does not sync at commit; the WAL is synced by the 1000-page
-  auto-checkpoint and on close. A process crash loses nothing acknowledged:
-  SQLite rolls a torn tail back. A power loss can drop the writes since the
-  last checkpoint.
-- `OFF` and `EXTRA` exist for completeness. Do not use `OFF` for real data.
+- `NORMAL` does not sync at commit. The WAL is synced by a checkpoint: the
+  1000-page automatic checkpoint, the daemon's PASSIVE checkpoint every
+  `VANTH_WAL_CHECKPOINT_SECONDS` (default 300 s), or close. A process crash
+  loses nothing acknowledged: SQLite rolls a torn tail back. A power loss can
+  drop the writes since the last checkpoint.
+- `EXTRA` behaves like `FULL` in WAL mode (the extra directory sync applies to
+  rollback journals).
 
 Measured on Windows 11, local SSD, 19 Nov 2026, with
 `scripts/sqlite_durability.py` (the real `JobManager` write paths and
@@ -1489,19 +1493,36 @@ throwaway `VANTH_HOME` directories). Throughput is the median of 3 runs of
 | Hard kills, 100 per level | 0 failures | 0 failures |
 | Acknowledged commits lost | 0 | 0 |
 | Rows written in the 100 kills (capture / transition) | 307,239 / 20,075 | 614,961 / 46,799 |
-| Steady-state WAL frames per event | 2.30 | 2.24 |
-| Events per 1000-page checkpoint | 435 | 447 |
+| Steady-state WAL frames per event | 2.22-2.30 | 2.24-2.28 |
+| Events per 1000-page checkpoint | 435-450 | 438-447 |
 
-The crash column is not a throughput number: `NORMAL` completes more capture
-batches in the same fixed kill window, so it writes more rows.
+An independent re-run measured 6,275 events/s for `FULL` and 6,501 for
+`NORMAL` (median of 3), so the throughput difference is within run-to-run
+noise: +4 % to +13 % across runs. The latency gain reproduced closely (full
+`_emit` p50 2.11 -> 0.59 ms, commit p50 1.58 -> 0.17 ms, heartbeat p50
+1.33 -> 0.05 ms). The crash column is not a throughput number: `NORMAL`
+completes more capture batches in the same fixed kill window, so it writes
+more rows. A second crash run (40 hard kills per level) also had 0 failures
+and 0 acknowledged commits lost.
 
 Exposure under `NORMAL`:
 
-- A chatty 20,000-event capture showed 32 WAL resets in 3.65 s, about one
-  sync per 0.11 s. At the measured 2.24 WAL frames per event, one 1000-page
-  checkpoint covers about 450 events (about 0.08 s at 5.5k events/s).
-- An idle heartbeat writes one WAL frame, so about 1000 heartbeats (about
-  1000 s at the 1 s default) pass between syncs.
+- A chatty 20,000-event capture showed 32 WAL resets in 2.7-3.7 s, about one
+  sync per 0.08-0.11 s. At 2.2-2.3 WAL frames per event, one 1000-page
+  checkpoint covers about 440-450 events (about 0.06 s at 7k events/s, 0.08 s
+  at 5.5k events/s).
+- An idle heartbeat writes one WAL frame. Without another checkpoint, about
+  1000 heartbeats (about 1000 s at the 1 s default) pass between syncs.
+- The daemon is the tighter bound. It runs `PRAGMA wal_checkpoint(PASSIVE)`
+  every `VANTH_WAL_CHECKPOINT_SECONDS` (default 300 s). SQLite documents that
+  with `synchronous=NORMAL` a checkpoint is the only operation that issues a
+  sync, and that it syncs the WAL before moving frames into the database.
+  Measured: a PASSIVE checkpoint under `NORMAL` checkpointed all 1563
+  pending frames, and a copy of the database file alone (no WAL) held all
+  20,640 events and the latest heartbeat. So with the daemon running, idle
+  exposure is at most about 300 s, not 1000 s. This assumes the daemon runs
+  and the checkpoint interval is not raised; without the daemon, the 1000-page
+  automatic checkpoint applies.
 - `torn` opened 200 of 200 truncated or out-of-order WAL variants with
   `integrity_check=ok` and a gap-free event prefix; a complete WAL recovered
   all 5039 rows. This does not cover a power loss during a checkpoint, a torn
@@ -1509,12 +1530,12 @@ Exposure under `NORMAL`:
 - `crash` hard-killed two writers 100 times per level: 0 acknowledged commits
   lost, 0 integrity failures, and no gaps or duplicates.
 
-Decision: keep `FULL` as the default. `NORMAL` buys about 13 % more capture
-throughput and cuts commit latency about 8.5x (heartbeat latency about 27x),
-but it widens the power-loss window from one commit to up to 1000 WAL pages.
-That trade is poor for a job tracker whose acknowledged jobs and events must
-survive a power cut. The knob remains available for an operator who accepts
-that risk.
+Decision: keep `FULL` as the default. The capture throughput difference is
+within noise; the firm gain is latency, about 8.5x on a commit (about 27x on a
+heartbeat). `NORMAL` widens the power-loss window from one commit to up to
+1000 WAL pages or the 300 s daemon checkpoint. That trade is poor for a job
+tracker whose acknowledged jobs and events must survive a power cut. The knob
+remains available for an operator who accepts that risk.
 
 Reproduce:
 

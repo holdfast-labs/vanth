@@ -10,7 +10,9 @@ from pathlib import Path
 LATEST_SCHEMA_VERSION = 20
 DEFAULT_BUSY_TIMEOUT_MS = 30000
 DEFAULT_SYNCHRONOUS = "FULL"
-VALID_SYNCHRONOUS = frozenset({"OFF", "NORMAL", "FULL", "EXTRA"})
+# OFF is deliberately excluded: it can corrupt the database on power loss, not
+# just lose recent writes. It falls back to FULL like any unknown value.
+VALID_SYNCHRONOUS = frozenset({"NORMAL", "FULL", "EXTRA"})
 
 
 def busy_timeout_ms() -> int:

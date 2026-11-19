@@ -25,7 +25,10 @@ exposure  how often the WAL is actually fsynced under NORMAL: counts WAL
           resets (header checkpoint-sequence changes, which happen after a
           full auto-checkpoint) during a chatty job, and measures WAL frames
           per event / per idle heartbeat with auto-checkpoint off, which bound
-          what a power loss can take.
+          what a power loss can take. It then runs the daemon's PASSIVE
+          checkpoint from a second connection and verifies that the main
+          database file alone (copied without the WAL) holds every frame; with
+          NORMAL a checkpoint is the only operation that syncs.
 torn      a power loss under NORMAL: the WAL tail never reached disk. A chatty
           job runs with auto-checkpoint off after an initial TRUNCATE, so the
           database file is a complete checkpointed state and the WAL only holds
@@ -57,7 +60,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-LEVELS = ("OFF", "NORMAL", "FULL", "EXTRA")
+LEVELS = ("NORMAL", "FULL", "EXTRA")
 
 
 def _manager(home: Path):
@@ -380,12 +383,44 @@ def cmd_exposure(args) -> None:
                                        (str(i), str(i)))
                     manager.db.commit()
             size2 = wal.stat().st_size
+            # Simulate the daemon's periodic PASSIVE checkpoint from a second
+            # connection (VANTH_WAL_CHECKPOINT_SECONDS, default 300). Under WAL
+            # + NORMAL this is the only operation that syncs, so it bounds the
+            # idle exposure. Prove it copies every frame into the main DB file:
+            # copy the DB alone (no WAL) and read it back.
+            expected_events = manager.db.execute("SELECT COUNT(*) FROM events WHERE job_id='chatty'").fetchone()[0]
+            last_beat = f"passive-{time.time_ns()}"
+            with manager.db_lock:
+                manager.db.execute("UPDATE jobs SET runner_heartbeat_at=?, updated_at=? WHERE job_id='chatty'",
+                                   (last_beat, last_beat))
+                manager.db.commit()
+            daemon = sqlite3.connect(home / "jobs.sqlite", timeout=5)
+            try:
+                daemon.execute(f"PRAGMA synchronous={level}")
+                passive = daemon.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            finally:
+                daemon.close()
+            db_copy_dir = Path(tempfile.mkdtemp(prefix="vanth-exp-db-"))
+            try:
+                shutil.copyfile(home / "jobs.sqlite", db_copy_dir / "jobs.sqlite")
+                copy = sqlite3.connect(db_copy_dir / "jobs.sqlite", timeout=5)
+                try:
+                    db_only_rows = copy.execute("SELECT COUNT(*) FROM events WHERE job_id='chatty'").fetchone()[0]
+                    db_only_beat = copy.execute(
+                        "SELECT runner_heartbeat_at FROM jobs WHERE job_id='chatty'").fetchone()[0]
+                finally:
+                    copy.close()
+            finally:
+                shutil.rmtree(db_copy_dir, ignore_errors=True)
             frame = 24 + page
             per_event = (size1 - size0) / frame / 640
             per_beat = (size2 - size1) / frame / 100
             rate = args.events / elapsed
             events_per_checkpoint = round(1000 / per_event) if per_event else None
             beats_per_checkpoint = round(1000 / per_beat) if per_beat else None
+            daemon_seconds = float(os.environ.get("VANTH_WAL_CHECKPOINT_SECONDS", "300"))
+            if not (daemon_seconds > 0):
+                daemon_seconds = 300.0
             print(json.dumps({
                 "level": level, "events": args.events, "capture_seconds": round(elapsed, 2),
                 "events_per_s": round(rate),
@@ -403,6 +438,17 @@ def cmd_exposure(args) -> None:
                 "idle_seconds_between_fsyncs": round(beats_per_checkpoint *
                                                      float(os.environ.get("VANTH_RUNNER_HEARTBEAT_INTERVAL", "1")), 1)
                 if beats_per_checkpoint else None,
+                # The daemon's PASSIVE checkpoint is the other (usually tighter)
+                # bound while the daemon runs.
+                "daemon_checkpoint_seconds": daemon_seconds,
+                "idle_seconds_with_daemon_checkpoint": round(min(
+                    beats_per_checkpoint * float(os.environ.get("VANTH_RUNNER_HEARTBEAT_INTERVAL", "1")),
+                    daemon_seconds), 1) if beats_per_checkpoint else round(daemon_seconds, 1),
+                "passive_checkpoint": list(passive) if passive else None,
+                "passive_checkpoint_full": bool(passive and passive[0] == 0 and passive[1] == passive[2]),
+                "db_only_event_rows": db_only_rows,
+                "db_only_expected_event_rows": expected_events,
+                "db_only_heartbeat_matches": db_only_beat == last_beat,
             }))
         finally:
             manager.close()

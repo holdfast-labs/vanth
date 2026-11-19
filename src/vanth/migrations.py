@@ -156,6 +156,7 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
     if not has_jobs:
         _create_latest_schema(db)
         db.commit()
+        _ensure_poll_indexes(db)
         return None
 
     backup = None
@@ -376,4 +377,26 @@ def migrate(db: sqlite3.Connection, home: str | Path) -> Path | None:
         except Exception:
             db.rollback()
             raise
+    _ensure_poll_indexes(db)
     return backup
+
+
+# Indexes for the daemon's 5 Hz maintenance polls (running/queued/launching
+# jobs, policy watches). Without them each poll scans every job ever run
+# (~23ms per tick at 20k jobs). Deliberately unversioned: an extra index is
+# invisible to older binaries, whereas a new user_version would make them
+# refuse this home.
+_POLL_INDEXES = {
+    "idx_jobs_status": "CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)",
+    "idx_jobs_policy": "CREATE INDEX IF NOT EXISTS idx_jobs_policy ON jobs(policy_disabled) WHERE policy_json IS NOT NULL",
+}
+
+
+def _ensure_poll_indexes(db: sqlite3.Connection) -> None:
+    """Create missing poll indexes; a read first keeps runners off the write lock."""
+    present = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    missing = [sql for name, sql in _POLL_INDEXES.items() if name not in present]
+    for sql in missing:
+        db.execute(sql)
+    if missing:
+        db.commit()

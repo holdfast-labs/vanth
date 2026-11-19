@@ -322,3 +322,14 @@ def test_orphaned_mcp_detection_empty_when_no_orphans():
         assert isinstance(result, list)
     except Exception as exc:  # wmic/ps unavailable in some sandboxes
         pytest.skip(f"process enumeration unavailable: {exc}")
+
+
+def test_parent_pid_steps_over_this_interpreters_own_launcher():
+    """A venv/uv launcher waits for its child and outlives a dead client, so
+    the watchdog must watch the process that started the launcher."""
+    out = subprocess.run(
+        [sys.executable, "-c", "from vanth.process_watch import parent_pid; print(parent_pid())"],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 0, out.stderr
+    assert int(out.stdout) == os.getpid()

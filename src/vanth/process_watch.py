@@ -164,8 +164,112 @@ def parent_pid() -> int | None:
     except (AttributeError, OSError):
         return None
     if ppid and ppid not in _NULL_PIDS:
+        if sys.platform == "win32":
+            try:
+                return _skip_own_launchers(ppid)
+            except Exception:
+                return ppid
         return ppid
     return None
+
+
+def _windows_image(pid: int) -> str | None:
+    """Full image path of a process, or None if it cannot be queried."""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return None
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return None
+        return buffer.value
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _windows_parent_pids() -> dict[int, int]:
+    """Map pid -> parent pid for every process (one Toolhelp snapshot)."""
+    import ctypes
+    from ctypes import wintypes
+
+    class ProcessEntry(ctypes.Structure):
+        _fields_ = [("size", wintypes.DWORD), ("usage", wintypes.DWORD), ("pid", wintypes.DWORD),
+                    ("heap", ctypes.c_size_t), ("module", wintypes.DWORD), ("threads", wintypes.DWORD),
+                    ("ppid", wintypes.DWORD), ("priority", ctypes.c_long), ("flags", wintypes.DWORD),
+                    ("exe", ctypes.c_wchar * 260)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32FirstW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
+    kernel32.Process32NextW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ProcessEntry)]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
+        return {}
+    table: dict[int, int] = {}
+    try:
+        entry = ProcessEntry()
+        entry.size = ctypes.sizeof(ProcessEntry)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            table[entry.pid] = entry.ppid
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return table
+
+
+def _skip_own_launchers(ppid: int) -> int:
+    """Return the first ancestor that is not one of this server's launchers.
+
+    ``vanth.exe`` (console-script trampoline) -> venv ``Scripts\\python.exe``
+    (launcher) -> real interpreter: both launchers wait for their child and
+    outlive a dead client, so watching the direct parent never saw the client
+    die and orphaned servers lingered until the idle timeout. A layer is only
+    skipped when its image is exactly this process's venv launcher
+    (``sys.executable``) or trampoline (``sys.argv[0]``) and differs from our
+    own image, so a client that is itself Python is never stepped over.
+    """
+    own = _windows_image(os.getpid())
+    if not own:
+        return ppid
+    own = os.path.normcase(own)
+    layers = set()
+    argv0 = sys.argv[0] if sys.argv else ""
+    # Console-script __main__ strips ".exe" from argv[0]; the trampoline has it.
+    if argv0 and os.path.splitext(argv0)[1] == "":
+        argv0 += ".exe"
+    for path in (sys.executable, argv0):
+        if path and path.lower().endswith(".exe"):
+            path = os.path.normcase(os.path.abspath(path))
+            if path != own:
+                layers.add(path)
+    if not layers:
+        return ppid
+    parents = None
+    pid = ppid
+    for _ in range(4):
+        image = _windows_image(pid)
+        if not image or os.path.normcase(image) not in layers:
+            break
+        if parents is None:
+            parents = _windows_parent_pids()
+        grandparent = parents.get(pid)
+        if not grandparent or grandparent in _NULL_PIDS:
+            break
+        pid = grandparent
+    return pid
 
 
 def _exiting() -> None:

@@ -11,8 +11,9 @@ import (
 )
 
 // largeHome copies the schema fixture and fills it with jobs x eventsPerJob
-// metric/progress events, the size of a long-lived real home.
-func largeHome(b *testing.B, jobs, eventsPerJob int) (string, []string) {
+// metric/progress events, the size of a long-lived real home. It accepts
+// testing.TB so both benchmarks and allocation-budget tests can build one.
+func largeHome(b testing.TB, jobs, eventsPerJob int) (string, []string) {
 	b.Helper()
 	data, err := os.ReadFile(filepath.Join("..", "..", "testdata", "state", "jobs.sqlite"))
 	if err != nil {

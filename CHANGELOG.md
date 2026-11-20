@@ -2,6 +2,95 @@
 
 All notable changes to Vanth are documented here.
 
+## 1.15.0 - 2026-11-20
+
+### Monitor: mission control
+
+- `vanth-monitor` is redesigned as a "mission control" view: status pills in
+  the header, a hero card per running job (big gradient percentage or elapsed
+  time, time left, rate, a gradient bar and the current step), a braille chart
+  grid of the running jobs' metrics in each job's colour, and a rail with
+  recent failures first. Stalled jobs get a thick red card and a
+  `✕ STALLED 9m` pill but keep their place and colour. Cards reflow from 4-5
+  across at 160 columns to one line per job below 90 columns; NO_COLOR and
+  ascii terminals stay readable. Built with Bloom (`bloomfx.dev/bloom`).
+- Jobs can declare what their card shows by printing one line:
+  `AGENT_EVENT {"type":"panels","panels":[...]}` with `gauge`, `line`, `stat`
+  and `text` panels. Specs are validated at ingest; invalid ones are dropped
+  with a warning event.
+- Keys: `[`/`]` page charts (was `←`/`→`, which now select jobs), `+`/`-` or
+  the mouse wheel zoom, `e`/`l`/`s` open events, logs and slowest runs. The old
+  stat-tile dashboard and its `v` toggle are removed. "Attention" now counts
+  failed, orphaned, timed-out and stalled jobs.
+- `scripts/demo_jobs.py` starts realistic demo jobs to watch the monitor;
+  `scripts/monitor_screenshots.py` renders monitor frames to PNG.
+
+### Fewer processes
+
+- `vanth-monitor` is now the native Go binary installed directly (1 process,
+  was 4 on Windows).
+- New `vanth-mcp` command: a native MCP launcher that finds its Python env at
+  run time (no interpreter paths in client configs). An agent's MCP server is
+  2 processes on Windows (was 3) and 1 on Linux/macOS. `vanth setup` now
+  registers `vanth-mcp` and upgrades existing `vanth` entries.
+- Windows jobs: the runner starts on the base interpreter and plain commands
+  run without a `cmd.exe` wrapper, so a job costs 1 vanth process (was 3).
+  Commands that need the shell still get `cmd.exe`.
+- Orphaned MCP servers exit within seconds when their client dies (they
+  lingered up to the 30-minute idle timeout behind vanth's launcher layers).
+
+### Performance
+
+- `vanth stop` 10.4 s → 0.45 s on Windows (escalates when a graceful taskkill
+  is refused).
+- Event capture: 20k events 19.3 s → 3.4 s (one mirror open and one COUNT/MAX
+  per batch).
+- Idle daemon on a 20k-job home: 114 → 2 ms CPU/s (indexes for the
+  maintenance polls, created without a schema bump).
+- Monitor refresh on 1.2k jobs / 120k events: 26 → 3.7 ms.
+- CLI and runner import cost cut (lazy FastMCP, `urllib`, version lookup);
+  `vanth --version` ~300 → ~115 ms; batched status reads replace per-job N+1
+  queries.
+- New performance regression tests pin import graphs, SQL statement counts,
+  query plans, process counts and monitor allocations.
+
+### SQLite durability knob
+
+- `VANTH_SQLITE_SYNCHRONOUS` accepts `NORMAL`, `FULL` (default) and `EXTRA`;
+  anything else, including `OFF`, applies `FULL`. The trade-off is measured
+  and documented in the README (`scripts/sqlite_durability.py`).
+
+### Fixes
+
+- MCP `job_stop` (and local rerun) failed with an `idempotency_key`
+  TypeError on every local call.
+- `vanth setup` registered OpenCode with a 15 s MCP timeout, shorter than the
+  25 s wait slice, so `job_wait` timed out; now 60 s.
+- `wake_me` resolved the OpenCode session from the job's cwd instead of the
+  caller's, failing for jobs in worktrees or temp dirs; clearer error when no
+  relay is registered.
+- `vanth doctor` reported unhealthy for the first 5 minutes after boot on
+  Linux/macOS (empty integrity cache treated as fresh).
+- Relative `--cwd` (CLI and MCP) resolved against the daemon's directory.
+- Artifact restore accepted a non-Vanth SQLite file and wiped the catalog;
+  zero-byte artifact transfers failed; two remote error codes were rejected
+  as malformed; remote store/journal writes now roll back on failure.
+- The relay thread died on a malformed poll response; the watchdog died on
+  NaN/inf/huge intervals; `python -m vanth.server` exited without serving;
+  `autostart` without a TTY and an unreadable token crashed.
+- `cleanup()` now sweeps metric series, artifacts and local start requests;
+  Windows autostart disable removed the wrong file; relay polls release on
+  shutdown.
+- `GET /jobs/resolve` resolves job ids server-side over the full history.
+- Go monitor: slowest-runs table was empty (fractional-second timestamps),
+  y-axis labels clipped, tilde homes false-conflicted.
+
+### Build
+
+- Go 1.27.3 is required to build the monitor (Bloom); CI and release use Go
+  1.27. The wheel ships the Go binary as native `vanth-monitor` and
+  `vanth-mcp` scripts (hatchling >= 1.27).
+
 ## 1.14.0 - 2026-10-05
 
 ### Language-neutral jobs

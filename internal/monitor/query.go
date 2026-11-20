@@ -162,8 +162,9 @@ func (q *Querier) Refresh(ctx context.Context, req RefreshRequest) RefreshResult
 	return res
 }
 
-func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) error {
-	const query = `
+// jobListQuery is the monitor's bounded job list. Package-level so the
+// query-plan regression test EXPLAINs the exact statement the monitor runs.
+const jobListQuery = `
 		SELECT j.job_id, j.name, j.command, j.status, j.pid, j.worker_pid, j.stop_requested_at,
 		       j.created_at, j.updated_at, j.exit_code, j.started_at, j.ended_at,
 		       j.tags_json, j.notes, j.run_json,
@@ -174,7 +175,15 @@ func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) 
 		    ORDER BY CASE WHEN status IN ('running', 'orphaned') THEN 0 ELSE 1 END, updated_at DESC, created_at DESC
 		    LIMIT ?)
 		ORDER BY CASE WHEN j.status IN ('running', 'orphaned') THEN 0 ELSE 1 END, j.updated_at DESC, j.created_at DESC`
-	rows, err := db.QueryContext(ctx, query, q.cfg.JobLimit)
+
+// eventsQuery loads one job's incremental event window. Package-level so the
+// query-plan regression test can assert it uses idx_events_job_seq.
+const eventsQuery = `
+		SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at
+		FROM events WHERE job_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`
+
+func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) error {
+	rows, err := db.QueryContext(ctx, jobListQuery, q.cfg.JobLimit)
 	if err != nil {
 		return err
 	}
@@ -234,12 +243,9 @@ func (q *Querier) loadJobs(ctx context.Context, db *sql.DB, res *RefreshResult) 
 }
 
 func (q *Querier) loadEvents(ctx context.Context, db *sql.DB, req RefreshRequest, res *RefreshResult) error {
-	const query = `
-		SELECT event_id, job_id, seq, type, level, message, data_json, source, created_at
-		FROM events WHERE job_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`
 	store := NewSeriesStore()
 	for _, jobID := range req.Targets {
-		rows, err := db.QueryContext(ctx, query, jobID, req.LastSeq[jobID], q.cfg.EventBatchLimit)
+		rows, err := db.QueryContext(ctx, eventsQuery, jobID, req.LastSeq[jobID], q.cfg.EventBatchLimit)
 		if err != nil {
 			return err
 		}

@@ -77,3 +77,35 @@ def test_server_import_avoids_urllib_request():
         "print(vanth.server._no_redirect_opener.cache_info().currsize)"
     )
     assert out.splitlines() == ["False", "False", "0"]
+
+
+# Heavy modules the perf pass made lazy: urllib.request/http.client (~30ms),
+# the MCP/FastMCP stack (~1s with pydantic) and httpx (when installed). Each
+# short-lived runner, CLI invocation and MCP launcher pays the import graph
+# before doing any work, so a regression here slows every command.
+_HEAVY_IMPORTS = (
+    "urllib.request",
+    "http.client",
+    "mcp",
+    "pydantic",
+    "pydantic_settings",
+    "httpx",
+)
+
+
+@pytest.mark.parametrize(
+    "module",
+    ["vanth.runner", "vanth.client", "vanth.cli", "vanth.server"],
+)
+def test_hot_modules_import_without_heavy_dependencies(module):
+    """Guard every hot entry point against re-adding an eager heavy import.
+
+    ``vanth.runner`` is paid once per job, ``vanth.client`` and ``vanth.cli``
+    once per CLI command, and ``vanth.server`` once per daemon/MCP process.
+    Assert on ``sys.modules`` in a fresh interpreter, never on wall-clock time.
+    """
+    out = _run(
+        f"import {module}, sys; "
+        f"print('\\n'.join(name for name in {_HEAVY_IMPORTS!r} if name in sys.modules))"
+    )
+    assert out == "", f"{module} eagerly imported heavy module(s): {out}"
